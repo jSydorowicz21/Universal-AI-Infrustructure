@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -22,6 +22,38 @@ const sourceOmp = import.meta.dir;
 const sourceLifeos = dirname(sourceOmp);
 const sourceHooks = join(sourceLifeos, "..", "hooks");
 const lifeosRoot = dirname(dirname(sourceLifeos));
+const rootEnvironmentVariables = ["UAI_DATA_DIR", "PAI_DATA_DIR", "UAI_CONFIG_DIR", "PAI_CONFIG_DIR"] as const;
+const inheritedRootEnvironment: Record<(typeof rootEnvironmentVariables)[number], string | undefined> = {
+	UAI_DATA_DIR: process.env.UAI_DATA_DIR,
+	PAI_DATA_DIR: process.env.PAI_DATA_DIR,
+	UAI_CONFIG_DIR: process.env.UAI_CONFIG_DIR,
+	PAI_CONFIG_DIR: process.env.PAI_CONFIG_DIR,
+};
+
+function clearRootEnvironment(): void {
+	for (const name of rootEnvironmentVariables) delete process.env[name];
+}
+
+function restoreRootEnvironment(): void {
+	for (const name of rootEnvironmentVariables) {
+		const value = inheritedRootEnvironment[name];
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
+}
+
+function fixtureEnv(home: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+	return {
+		...process.env,
+		HOME: home,
+		USERPROFILE: home,
+		UAI_DATA_DIR: join(home, ".pai"),
+		PAI_DATA_DIR: join(home, ".pai"),
+		UAI_CONFIG_DIR: join(home, ".claude"),
+		PAI_CONFIG_DIR: join(home, ".claude"),
+		...overrides,
+	};
+}
 
 function temp(prefix: string): string {
 	const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -48,11 +80,16 @@ function manager(home: string, injectFailureAt?: "after-link" | "after-config"):
 	});
 }
 
+beforeEach(() => {
+	clearRootEnvironment();
+});
+
 afterEach(() => {
 	resetOmpSessionIdentitiesForTests();
 	delete process.env.LIFEOS_TEST_FAIL_INSTALL_HOOKS;
 	resetPulseAvailabilityForTests();
 	for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
+	restoreRootEnvironment();
 });
 
 describe("transactional OMP installation", () => {
@@ -180,6 +217,11 @@ describe("transactional OMP installation", () => {
 		const m = manager(home);
 		expect((await m.install()).ok).toBe(true);
 		const append = join(home, ".omp", "agent", "APPEND_SYSTEM.md");
+		const appliedBytes = readFileSync(append);
+		const ownership = JSON.parse(readFileSync(m.paths.manifestPath, "utf8")) as OwnershipManifest;
+		const applied = ownership.artifacts.find((artifact) => artifact.path === append)?.applied;
+		if (!applied || applied.kind !== "file") throw new Error("OMP ownership manifest did not record the applied constitution");
+		if (process.platform !== "win32") expect(statSync(append).mode & 0o777).toBe(applied.mode);
 		unlinkSync(append);
 		writeFileSync(append, "foreign edit\n");
 		const conflicted = await m.uninstall();
@@ -188,7 +230,8 @@ describe("transactional OMP installation", () => {
 		expect(readFileSync(append, "utf8")).toBe("foreign edit\n");
 		expect(existsSync(m.paths.manifestPath)).toBe(true);
 
-		writeFileSync(append, readFileSync(join(sourceOmp, "APPEND_SYSTEM.md")));
+		writeFileSync(append, appliedBytes);
+		if (process.platform !== "win32" && applied.mode !== undefined) chmodSync(append, applied.mode & 0o777);
 		const retried = await m.uninstall();
 		expect(retried.ok, retried.problems.join("\n")).toBe(true);
 		expect(existsSync(m.paths.manifestPath)).toBe(false);
@@ -586,7 +629,7 @@ describe("runtime dependency merge", () => {
 		expect(manifest.name).toBe("foreign-profile");
 		expect(manifest.extensions.keep).toBe(true);
 		expect(manifest.dependencies["uai-fixture-dep"]).toBe("1.0.0");
-		expect(Bun.resolveSync("uai-fixture-dep", configRoot)).toBe(join(dependencyRoot, "index.ts"));
+		expect(realpathSync(Bun.resolveSync("uai-fixture-dep", configRoot))).toBe(realpathSync(join(dependencyRoot, "index.ts")));
 	});
 
 	test("malformed existing package manifest blocks byte-identically", async () => {
@@ -841,14 +884,12 @@ describe("native Windows and session isolation primitives", () => {
 			["omp", { PI_CODING_AGENT_DIR: join(root, "detected-omp") }],
 		] as const) {
 			mkdirSync(Object.values(adapterEnv)[0], { recursive: true });
-			const detected = detectEnv({
-				...process.env,
-				HOME: root,
-				USERPROFILE: root,
+			const detected = detectEnv(fixtureEnv(root, {
 				UAI_HARNESS: harness,
 				UAI_CONFIG_DIR: selectedRoot,
+				PAI_CONFIG_DIR: undefined,
 				...adapterEnv,
-			});
+			}));
 			expect(detected.harness.name).toBe(harness);
 			expect(detected.configRoot).toBe(selectedRoot);
 			expect(detected.harness.configRoot).toBe(selectedRoot);
@@ -865,14 +906,16 @@ describe("native Windows and session isolation primitives", () => {
 		writeFileSync(join(configRoot, "settings.json"), "{}\n");
 		const identity = join(sourceHooks, "lib", "identity.ts");
 		const child = Bun.spawn([process.execPath, "-e", `await import(${JSON.stringify(pathToFileURL(identity).href)}); console.log(\"loaded\")`], {
-			env: {
-				...process.env,
+			env: fixtureEnv(root, {
 				HOME: undefined,
 				USERPROFILE: root,
-				CLAUDE_CONFIG_DIR: configRoot,
 				UAI_DATA_DIR: dataRoot,
+				PAI_DATA_DIR: undefined,
+				UAI_CONFIG_DIR: undefined,
+				PAI_CONFIG_DIR: undefined,
+				CLAUDE_CONFIG_DIR: configRoot,
 				LIFEOS_DIR: join(configRoot, "LIFEOS"),
-			},
+			}),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -947,7 +990,7 @@ describe("memory review transcript provenance", () => {
 		const hook = join(sourceHooks, "MemoryReviewFire.hook.ts");
 		const run = async (sessionId: string, transcript: string): Promise<void> => {
 			const child = Bun.spawn([process.execPath, hook], {
-				env: { ...process.env, HOME: root, USERPROFILE: root, LIFEOS_DIR: lifeosDir, UAI_DATA_DIR: dataRoot },
+				env: fixtureEnv(root, { LIFEOS_DIR: lifeosDir, UAI_DATA_DIR: dataRoot, PAI_DATA_DIR: dataRoot }),
 				stdin: "pipe",
 				stdout: "pipe",
 				stderr: "pipe",
@@ -973,7 +1016,7 @@ describe("memory review transcript provenance", () => {
 		writeFileSync(join(dataRoot, "USER", "CONFIG", "memory-review.json"), JSON.stringify({ turn_threshold: 1, min_minutes_between: 0 }));
 		const hook = join(sourceHooks, "MemoryReviewFire.hook.ts");
 		const child = Bun.spawn([process.execPath, hook], {
-			env: { ...process.env, HOME: root, USERPROFILE: root, LIFEOS_DIR: lifeosDir, UAI_DATA_DIR: dataRoot },
+			env: fixtureEnv(root, { LIFEOS_DIR: lifeosDir, UAI_DATA_DIR: dataRoot, PAI_DATA_DIR: dataRoot }),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -999,7 +1042,7 @@ describe("memory review transcript provenance", () => {
 		writeFileSync(join(dataRoot, "USER", "CONFIG", "memory-review.json"), JSON.stringify({ turn_threshold: 1, min_minutes_between: 0 }));
 		writeFileSync(join(lifeosDir, "TOOLS", "MemoryReviewer.ts"), "await Bun.sleep(1200); process.exit(0);\n");
 		const hook = join(sourceHooks, "MemoryReviewFire.hook.ts");
-		const env = { ...process.env, HOME: root, USERPROFILE: root, LIFEOS_DIR: lifeosDir, UAI_DATA_DIR: dataRoot };
+		const env = fixtureEnv(root, { LIFEOS_DIR: lifeosDir, UAI_DATA_DIR: dataRoot, PAI_DATA_DIR: dataRoot });
 		const start = (sessionId: string) => {
 			const child = Bun.spawn([process.execPath, hook], { env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 			child.stdin.write(JSON.stringify({ session_id: sessionId, uai_session_id: sessionId }));
@@ -1046,7 +1089,7 @@ describe("memory review transcript provenance", () => {
 		writeFileSync(lockPath, JSON.stringify({ owner: "dead-owner", pid: 999999, createdAt: "2000-01-01T00:00:00.000Z" }));
 		const hook = join(sourceHooks, "MemoryReviewFire.hook.ts");
 		const child = Bun.spawn([process.execPath, hook], {
-			env: { ...process.env, HOME: root, USERPROFILE: root, LIFEOS_DIR: lifeosDir, UAI_DATA_DIR: dataRoot },
+			env: fixtureEnv(root, { LIFEOS_DIR: lifeosDir, UAI_DATA_DIR: dataRoot, PAI_DATA_DIR: dataRoot }),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -1073,7 +1116,7 @@ describe("memory review transcript provenance", () => {
 			"console.log(JSON.stringify({ targets, message }));",
 		].join("\n");
 		const child = Bun.spawn([process.execPath, "--eval", probe], {
-			env: { ...process.env, HOME: undefined, USERPROFILE: root, UAI_DATA_DIR: dataRoot, LIFEOS_DIR: lifeosDir },
+			env: fixtureEnv(root, { HOME: undefined, USERPROFILE: root, UAI_DATA_DIR: dataRoot, PAI_DATA_DIR: dataRoot, LIFEOS_DIR: lifeosDir }),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1109,14 +1152,16 @@ describe("reviewer proposal security", () => {
 		mkdirSync(join(dataRoot, "USER"), { recursive: true });
 		mkdirSync(outside, { recursive: true });
 		const memorySystem = join(sourceLifeos, "TOOLS", "MemorySystem.ts");
-		const env = {
-			...process.env,
+		const env = fixtureEnv(root, {
 			HOME: undefined,
 			USERPROFILE: root,
-			CLAUDE_CONFIG_DIR: configRoot,
 			UAI_DATA_DIR: dataRoot,
+			PAI_DATA_DIR: undefined,
+			UAI_CONFIG_DIR: undefined,
+			PAI_CONFIG_DIR: undefined,
+			CLAUDE_CONFIG_DIR: configRoot,
 			LIFEOS_DIR: join(configRoot, "LIFEOS"),
-		};
+		});
 		const run = async (target: string) => {
 			const item = { type: "proposal", target_kind: "identity", target_file: target, edit: "SECRET_SENTINEL", confidence: 1, rationale: "tainted model output" };
 			// The subprocess intentionally tests a runtime-selected installed module under isolated roots.
@@ -1182,7 +1227,7 @@ describe("canonical Pulse memory roots", () => {
 			"console.log(JSON.stringify({ memory: await memoryResponse.json(), menubar: await menubarResponse.json() }));",
 		].join("\n");
 		const child = Bun.spawn([process.execPath, "--eval", probe], {
-			env: { ...process.env, HOME: join(root, "wrong-home"), USERPROFILE: join(root, "wrong-home"), UAI_DATA_DIR: dataRoot, LIFEOS_DIR: lifeosDir },
+			env: fixtureEnv(join(root, "wrong-home"), { UAI_DATA_DIR: dataRoot, PAI_DATA_DIR: dataRoot, LIFEOS_DIR: lifeosDir }),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1212,7 +1257,7 @@ describe("installer root and platform separation", () => {
 		const configRoot = join(root, "profile");
 		const deploy = join(lifeosRoot, "Tools", "DeployComponents.ts");
 		const child = Bun.spawn([process.execPath, deploy, "--components", "pulse", "--config-root", configRoot, "--skill-root", lifeosRoot, "--apply"], {
-			env: { ...process.env, HOME: root, USERPROFILE: root },
+			env: fixtureEnv(root),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1233,8 +1278,14 @@ describe("setup tool HOME fallback", () => {
 		mkdirSync(join(configRoot, "LIFEOS", "TOOLS"), { recursive: true });
 		writeFileSync(join(configRoot, "CLAUDE.md"), "# fixture\n");
 		writeFileSync(join(configRoot, "LIFEOS", "TOOLS", "GenerateTelosSummary.ts"), "export {};\n");
-		const env = { ...process.env, USERPROFILE: home };
-		delete env.HOME;
+		const env = fixtureEnv(home, {
+			HOME: undefined,
+			USERPROFILE: home,
+			UAI_DATA_DIR: undefined,
+			PAI_DATA_DIR: undefined,
+			UAI_CONFIG_DIR: undefined,
+			PAI_CONFIG_DIR: undefined,
+		});
 		delete env.CLAUDE_CONFIG_DIR;
 		delete env.LIFEOS_CONFIG_DIR;
 		for (const tool of ["ActivateImports", "LinkUser", "SeedPulse"]) {
@@ -1360,7 +1411,7 @@ describe("component deployment lifecycle", () => {
 			"--components", "agents",
 			"--apply",
 		], {
-			env: { ...process.env, LIFEOS_TEST_FAIL_DEPLOY_COMPONENT: "agents" },
+			env: fixtureEnv(root, { LIFEOS_TEST_FAIL_DEPLOY_COMPONENT: "agents" }),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1383,7 +1434,7 @@ describe("component deployment lifecycle", () => {
 			"--config-root", configRoot,
 			"--components", "statusline",
 			"--apply",
-		], { stdout: "pipe", stderr: "pipe" });
+		], { env: fixtureEnv(root), stdout: "pipe", stderr: "pipe" });
 		const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
 		expect(exitCode).toBe(1);
 		expect(stdout).toContain("unsupported on native Windows");
@@ -1413,7 +1464,7 @@ describe("OMP inference preference ownership", () => {
 	test("custom data roots are canonical and foreign preferences are never deleted", async () => {
 		const home = temp("uai-omp-inference-");
 		const dataRoot = join(home, "selected-data");
-		const env = { ...process.env, HOME: home, USERPROFILE: home, UAI_DATA_DIR: dataRoot };
+		const env = fixtureEnv(home, { UAI_DATA_DIR: dataRoot, PAI_DATA_DIR: dataRoot });
 		const managePath = join(sourceOmp, "manage.ts");
 		const set = Bun.spawnSync([process.execPath, managePath, "inference", "omp"], { env, stdout: "pipe", stderr: "pipe" });
 		expect(set.exitCode, set.stderr.toString()).toBe(0);

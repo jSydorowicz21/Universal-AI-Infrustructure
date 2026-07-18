@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, cpSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,9 +6,47 @@ import { pathToFileURL } from "node:url";
 import { hookEnv } from "./index";
 
 const tempDirs: string[] = [];
+const rootEnvironmentVariables = ["UAI_DATA_DIR", "PAI_DATA_DIR", "UAI_CONFIG_DIR", "PAI_CONFIG_DIR"] as const;
+const inheritedRootEnvironment: Record<(typeof rootEnvironmentVariables)[number], string | undefined> = {
+	UAI_DATA_DIR: process.env.UAI_DATA_DIR,
+	PAI_DATA_DIR: process.env.PAI_DATA_DIR,
+	UAI_CONFIG_DIR: process.env.UAI_CONFIG_DIR,
+	PAI_CONFIG_DIR: process.env.PAI_CONFIG_DIR,
+};
+
+function clearRootEnvironment(): void {
+	for (const name of rootEnvironmentVariables) delete process.env[name];
+}
+
+function restoreRootEnvironment(): void {
+	for (const name of rootEnvironmentVariables) {
+		const value = inheritedRootEnvironment[name];
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
+}
+
+function fixtureEnv(home: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+	return {
+		...process.env,
+		HOME: home,
+		USERPROFILE: home,
+		UAI_DATA_DIR: join(home, ".pai"),
+		PAI_DATA_DIR: join(home, ".pai"),
+		UAI_CONFIG_DIR: join(home, ".claude"),
+		PAI_CONFIG_DIR: join(home, ".claude"),
+		...overrides,
+	};
+}
+
+beforeEach(() => {
+	clearRootEnvironment();
+});
+
 
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+	restoreRootEnvironment();
 });
 
 function writeFakeTool(binDir: string, name: string, body: string): string {
@@ -49,14 +87,11 @@ async function invokeSystemFileGuard(options: {
 		"console.log(JSON.stringify(result ?? null));",
 	].join("\n");
 	const child = Bun.spawn([process.execPath, "--eval", script], {
-		env: {
-			...process.env,
-			HOME: home,
-			USERPROFILE: home,
+		env: fixtureEnv(home, {
 			LIFEOS_HOOKS_DIR: hooksDir,
 			LIFEOS_HOOK_EXECUTABLE: options.executable ?? process.execPath,
 			LIFEOS_HOOK_TIMEOUT_MS: String(options.timeoutMs ?? 10_000),
-		},
+		}),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -138,13 +173,10 @@ describe("session stop critical path", () => {
 			"process.exit(0);",
 		].join("\n");
 		const child = Bun.spawn([process.execPath, "--eval", probe], {
-			env: {
-				...process.env,
-				HOME: home,
-				USERPROFILE: home,
+			env: fixtureEnv(home, {
 				LIFEOS_HOOKS_DIR: hooksDir,
 				LIFEOS_HOOK_EXECUTABLE: process.execPath,
-			},
+			}),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -183,13 +215,9 @@ describe("Claude-free OMP inference", () => {
 			"console.log(JSON.stringify(result));",
 			"if (!result.success) process.exit(1);",
 		].join("\n");
-		const childEnv: Record<string, string | undefined> = { ...process.env };
+		const childEnv: NodeJS.ProcessEnv = fixtureEnv(home);
 		for (const key of Object.keys(childEnv)) if (key.toLowerCase() === "path") delete childEnv[key];
 		Object.assign(childEnv, {
-			HOME: home,
-			USERPROFILE: home,
-			UAI_DATA_DIR: join(home, ".pai"),
-			PAI_DATA_DIR: join(home, ".pai"),
 			PATH: binDir,
 			PATHEXT: ".COM;.EXE;.BAT;.CMD",
 			LIFEOS_HARNESS: "omp",
@@ -220,14 +248,9 @@ describe("Claude-free OMP inference", () => {
 		const configPath = join(home, ".pai/USER/CONFIG/inference-backend");
 		const runManage = async (...args: string[]) => {
 			const child = Bun.spawn([process.execPath, managePath, "inference", ...args], {
-				env: {
-					...process.env,
-					HOME: home,
-					USERPROFILE: home,
-					UAI_DATA_DIR: join(home, ".pai"),
-					PAI_DATA_DIR: join(home, ".pai"),
+				env: fixtureEnv(home, {
 					PI_CODING_AGENT_DIR: join(home, "agent"),
-				},
+				}),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -264,7 +287,7 @@ describe("Claude-free OMP inference", () => {
 		const ompExecutable = writeFakeTool(binDir, "omp", "echo omp 1.2.3");
 		const agentDir = join(home, ".omp/agent");
 		const managePath = join(import.meta.dir, "../../manage.ts");
-		const env = { ...process.env, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: agentDir, OMP_EXECUTABLE: ompExecutable };
+		const env = fixtureEnv(home, { PI_CODING_AGENT_DIR: agentDir, OMP_EXECUTABLE: ompExecutable });
 
 		const install = Bun.spawn([process.execPath, managePath, "install"], {
 			env,

@@ -66,12 +66,12 @@ permissions:
 
 env:
   UAI_RUNTIME_DIR: LifeOS/install/LIFEOS/UNIVERSAL
-  HOME: ${{ runner.temp }}/uai-home
-  USERPROFILE: ${{ runner.temp }}/uai-home
-  UAI_DATA_DIR: ${{ runner.temp }}/uai-data
-  PAI_DATA_DIR: ${{ runner.temp }}/uai-data
-  UAI_CONFIG_DIR: ${{ runner.temp }}/uai-config
-  PAI_CONFIG_DIR: ${{ runner.temp }}/uai-config
+  HOME: ${{ github.workspace }}/.uai-ci/home
+  USERPROFILE: ${{ github.workspace }}/.uai-ci/home
+  UAI_DATA_DIR: ${{ github.workspace }}/.uai-ci/data
+  PAI_DATA_DIR: ${{ github.workspace }}/.uai-ci/data
+  UAI_CONFIG_DIR: ${{ github.workspace }}/.uai-ci/config
+  PAI_CONFIG_DIR: ${{ github.workspace }}/.uai-ci/config
 
 jobs:
   compile:

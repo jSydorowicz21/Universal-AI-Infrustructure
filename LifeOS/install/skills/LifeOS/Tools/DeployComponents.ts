@@ -33,9 +33,10 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { copyMissing, detectDevTree } from "./InstallEngine";
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { detectDevTree, resolveInstallRoots } from "./InstallEngine";
+import { pathToFileURL } from "node:url";
 
 // Enhancement components are the à-la-carte half of setup. The "LifeOS Core"
 // (skills + system prompt + base settings + CLAUDE.md) is installed by Setup's
@@ -103,35 +104,12 @@ function resolveLifeosDir(configRoot: string): string {
   return join(configRoot, "LIFEOS");
 }
 
-const stamp = (): string => String(Date.now());
-
-/** Back up a file aside as <file>.lifeos-backup-<ts> (only if it exists). */
-function backup(path: string): string | undefined {
-  if (!existsSync(path)) return undefined;
-  const dst = `${path}.lifeos-backup-${stamp()}`;
-  copyFileSync(path, dst);
-  return dst;
-}
 
 /** Where a component's path can be sourced from. */
 function availability(rel: string, ctx: Ctx): { inLive: boolean; inPayload: boolean } {
   return { inLive: existsSync(join(ctx.lifeosDir, rel)), inPayload: existsSync(join(ctx.payloadRoot, rel)) };
 }
 
-/**
- * Ensure a component path exists in the live tree, copying from the shipped
- * payload only when ABSENT (never overwrites a populated target — idempotent).
- * Returns whether the path is present after the call.
- */
-function ensurePresent(rel: string, ctx: Ctx): boolean {
-  const dst = join(ctx.lifeosDir, rel);
-  if (existsSync(dst)) return true;
-  const src = join(ctx.payloadRoot, rel);
-  if (!existsSync(src)) return false;
-  mkdirSync(dirname(dst), { recursive: true });
-  cpSync(src, dst, { recursive: true });
-  return true;
-}
 
 const uid = (): string => execFileSync("id", ["-u"]).toString().trim();
 
@@ -144,62 +122,171 @@ function launchctl(args: string[]): { ok: boolean; out: string } {
   }
 }
 
+function lifecycleModulePath(): string {
+  const candidates = [
+    join(import.meta.dir, "..", "UNIVERSAL", "lifecycle.ts"),
+    join(import.meta.dir, "..", "install", "LIFEOS", "UNIVERSAL", "lifecycle.ts"),
+    join(import.meta.dir, "..", "..", "..", "LIFEOS", "UNIVERSAL", "lifecycle.ts"),
+  ];
+  const path = candidates.find((candidate) => existsSync(candidate));
+  if (!path) throw new Error(`universal lifecycle module not found from ${import.meta.dir}`);
+  return path;
+}
+
+async function applyComponentMutations(ctx: Ctx, component: Component, mutations: Array<Record<string, unknown>>): Promise<void> {
+  if (mutations.length === 0) return;
+  const lifecycle = await import(pathToFileURL(lifecycleModulePath()).href);
+  const journalDir = join(ctx.configRoot, ".uai-journal");
+  if (existsSync(journalDir)) {
+    const journalMetadata = lstatSync(journalDir);
+    if (journalMetadata.isSymbolicLink() || !journalMetadata.isDirectory()) {
+      throw new Error(`component journal directory must be a physical directory: ${journalDir}`);
+    }
+    const journals = readdirSync(journalDir).filter((name) => name.startsWith(`claude-component-${component}-`) && name.endsWith(".json")).sort();
+    if (journals.length > 1) throw new Error(`component recovery is ambiguous across journals: ${journals.join(", ")}`);
+    for (const file of journals) {
+      const journal = join(journalDir, file);
+      const metadata = lstatSync(journal);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error(`component journal must be a physical regular file: ${journal}`);
+      const recovery = await lifecycle.recoverJournal(journal);
+      if (recovery.status === "rollback-conflict") throw new Error(`component recovery conflict: ${recovery.conflicts.map((item) => item.path).join(", ")}`);
+    }
+  }
+  const plan = await lifecycle.createInstallPlan({
+    id: `claude-component-${component}`,
+    root: ctx.configRoot,
+    mutations: mutations as never,
+  });
+  await lifecycle.applyInstallPlan(plan, {
+    injectFailureAfter: process.env.LIFEOS_TEST_FAIL_DEPLOY_COMPONENT === component ? plan.mutations.length : undefined,
+  });
+}
+
+function requirePhysicalRegularFile(path: string, label: string): void {
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error(`${label} must be a physical regular file: ${path}`);
+}
+
+function requirePhysicalContainedFile(path: string, root: string, label: string): void {
+  const rootMetadata = lstatSync(root);
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new Error(`${label} root must be a physical directory: ${root}`);
+  requirePhysicalRegularFile(path, label);
+  const canonicalRoot = realpathSync(root);
+  const canonicalFile = realpathSync(path);
+  const delta = relative(canonicalRoot, canonicalFile);
+  if (delta === ".." || delta.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
+    throw new Error(`${label} escapes its selected runtime root: ${path}`);
+  }
+}
+
+function missingTreeMutations(src: string, dst: string, prefix: string): Array<Record<string, unknown>> {
+  const rootMetadata = lstatSync(src);
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new Error(`component payload root must be a physical directory: ${src}`);
+  const canonicalRoot = realpathSync(src);
+  const mutations: Array<Record<string, unknown>> = [];
+  const visit = (directory: string): void => {
+    const canonicalDirectory = realpathSync(directory);
+    if (canonicalDirectory !== canonicalRoot && !canonicalDirectory.startsWith(`${canonicalRoot}${process.platform === "win32" ? "\\" : "/"}`)) {
+      throw new Error(`component payload escapes its source root: ${directory}`);
+    }
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const source = join(directory, entry.name);
+      const metadata = lstatSync(source);
+      if (metadata.isSymbolicLink()) throw new Error(`component payload links are not allowed: ${source}`);
+      if (metadata.isDirectory()) visit(source);
+      else if (metadata.isFile()) {
+        const canonicalFile = realpathSync(source);
+        if (!canonicalFile.startsWith(`${canonicalRoot}${process.platform === "win32" ? "\\" : "/"}`)) {
+          throw new Error(`component payload escapes its source root: ${source}`);
+        }
+        const target = join(dst, relative(src, source));
+        if (!existsSync(target)) mutations.push({
+          id: `${prefix}:${relative(src, source).replaceAll("\\", "/")}`,
+          kind: "write",
+          path: target,
+          bytes: readFileSync(source),
+          mode: metadata.mode & 0o777,
+          ownership: "owned",
+        });
+      } else {
+        throw new Error(`component payload contains an unsupported artifact: ${source}`);
+      }
+    }
+  };
+  visit(src);
+  return mutations;
+}
+
 // ── component deployers ──────────────────────────────────────────────
 
-/** Statusline: place the script, chmod +x, wire settings.json statusLine. */
-function deployStatusline(ctx: Ctx): ComponentResult {
+/** Statusline: lifecycle-manage the script and settings binding where Bash is supported. */
+async function deployStatusline(ctx: Ctx): Promise<ComponentResult> {
   const r: ComponentResult = { component: "statusline", ready: false, actions: [], blockers: [] };
   const av = availability("LIFEOS_StatusLine.sh", ctx);
   const scriptPath = join(ctx.lifeosDir, "LIFEOS_StatusLine.sh");
   const settingsPath = join(ctx.configRoot, "settings.json");
-  // Build the settings.json command from the ACTUAL install root (ctx.lifeosDir),
-  // not a hardcoded ~/.claude — a custom --config-root (e.g. ~/.claude-fable) places
-  // the script under its own LIFEOS/, and the old literal pointed at the wrong tree.
   const command = scriptPath.startsWith(`${ctx.home}/`)
     ? `$HOME/${scriptPath.slice(ctx.home.length + 1)}`
     : scriptPath;
-
+  if (process.platform === "win32") {
+    r.blockers.push("statusline panel is unsupported on native Windows because the shipped executable is Bash; no settings wiring was written");
+    return r;
+  }
   if (!av.inLive && !av.inPayload) {
     r.blockers.push(`LIFEOS_StatusLine.sh not in live tree (${scriptPath}) or payload`);
     return r;
   }
+  let settings: Record<string, unknown> = {};
+  try { requirePhysicalSettings(settingsPath); }
+  catch (error) { r.blockers.push(error instanceof Error ? error.message : String(error)); return r; }
+  if (existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    } catch {
+      r.blockers.push("settings.json exists but is not valid JSON — refusing to rewrite");
+      return r;
+    }
+  }
+  const current = settings.statusLine as Record<string, unknown> | undefined;
+  const alreadyWired = current?.command === command;
   r.ready = true;
   if (!ctx.apply) {
-    if (!av.inLive) r.actions.push(`copy LIFEOS_StatusLine.sh from payload → ${scriptPath}`);
-    r.actions.push(`chmod +x ${scriptPath}`, `wire settings.json statusLine → ${command}`);
+    if (!av.inLive) r.actions.push(`lifecycle copy LIFEOS_StatusLine.sh → ${scriptPath}`);
+    r.actions.push(`lifecycle wire settings.json statusLine → ${command}`);
     return r;
   }
-
   try {
-    ensurePresent("LIFEOS_StatusLine.sh", ctx);
-    chmodSync(scriptPath, 0o755);
-
-    // A populated-but-unparseable settings.json must NOT be rewritten from {} —
-    // that would silently drop the user's whole config. Abort with a blocker.
-    let settings: Record<string, unknown> = {};
-    if (existsSync(settingsPath)) {
-      try {
-        settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-      } catch {
-        r.blockers.push(`settings.json exists but is not valid JSON — refusing to rewrite (would drop your config). Fix it, then re-run.`);
-        return r;
-      }
-    }
-    const current = settings.statusLine as Record<string, unknown> | undefined;
-    const alreadyWired = current?.command === command;
+    const source = av.inLive ? scriptPath : join(ctx.payloadRoot, "LIFEOS_StatusLine.sh");
+    requirePhysicalContainedFile(source, av.inLive ? ctx.lifeosDir : ctx.payloadRoot, "statusline source");
+    const mutations: Array<Record<string, unknown>> = [{
+      id: "statusline:script",
+      kind: "write",
+      path: scriptPath,
+      bytes: readFileSync(source),
+      mode: 0o755,
+      ownership: av.inLive ? "adopted" : "owned",
+    }];
     if (!alreadyWired) {
-      backup(settingsPath);
       settings.statusLine = { type: "command", command, refreshInterval: 1 };
-      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+      mutations.push({
+        id: "statusline:settings",
+        kind: "write",
+        path: settingsPath,
+        bytes: Buffer.from(`${JSON.stringify(settings, null, 2)}\n`),
+        mode: existsSync(settingsPath) ? statSync(settingsPath).mode & 0o777 : 0o600,
+        ownership: existsSync(settingsPath) ? "adopted" : "owned",
+        structured: "json",
+      });
     }
-    r.applied = !alreadyWired;
+    await applyComponentMutations(ctx, "statusline", mutations);
+    r.applied = true;
     const reread = JSON.parse(readFileSync(settingsPath, "utf-8"));
     const wired = (reread.statusLine as Record<string, unknown> | undefined)?.command === command;
     let executable = false;
     try { execFileSync("test", ["-x", scriptPath]); executable = true; } catch { executable = false; }
-    r.probe = { name: "statusline-wired", passed: wired && executable, detail: `wired=${wired} executable=${executable}${alreadyWired ? " (idempotent)" : ""}` };
-  } catch (err) {
-    r.error = err instanceof Error ? err.message : String(err);
+    r.probe = { name: "statusline-wired", passed: wired && executable, detail: `wired=${wired} executable=${executable}` };
+  } catch (error) {
+    r.error = error instanceof Error ? error.message : String(error);
   }
   return r;
 }
@@ -210,106 +297,91 @@ function deployStatusline(ctx: Ctx): ComponentResult {
  * settings.json — set-the-key semantics (these are whole-object settings, like
  * statusLine). Idempotent (deep-equal → skip), backup-before-write, parse-abort.
  */
-function deploySettingsKey(component: Component, key: string, ctx: Ctx): ComponentResult {
+async function deploySettingsKey(component: Component, key: string, ctx: Ctx): Promise<ComponentResult> {
   const r: ComponentResult = { component, ready: false, actions: [], blockers: [] };
   const enhPath = join(ctx.installRoot, "settings.enhancements.json");
   if (!existsSync(enhPath)) {
-    r.blockers.push(`settings.enhancements.json not in payload (${enhPath}) — runtime not staged`);
+    r.blockers.push(`valid physical settings.enhancements.json not in payload (${enhPath})`);
     return r;
   }
+  try { requirePhysicalContainedFile(enhPath, ctx.installRoot, "settings.enhancements.json"); }
+  catch (error) { r.blockers.push(error instanceof Error ? error.message : String(error)); return r; }
   let enh: Record<string, unknown>;
   try { enh = JSON.parse(readFileSync(enhPath, "utf-8")); } catch { r.blockers.push(`${enhPath} is not valid JSON`); return r; }
   if (!(key in enh)) {
     r.blockers.push(`${key} not present in settings.enhancements.json`);
     return r;
   }
-  r.ready = true;
   const settingsPath = join(ctx.configRoot, "settings.json");
+  try { requirePhysicalSettings(settingsPath); }
+  catch (error) { r.blockers.push(error instanceof Error ? error.message : String(error)); return r; }
+  let settings: Record<string, unknown> = {};
+  if (existsSync(settingsPath)) {
+    try { settings = JSON.parse(readFileSync(settingsPath, "utf-8")); }
+    catch { r.blockers.push("settings.json exists but is not valid JSON — refusing to rewrite"); return r; }
+  }
+  const already = JSON.stringify(settings[key]) === JSON.stringify(enh[key]);
+  r.ready = true;
   if (!ctx.apply) {
-    r.actions.push(`merge settings.${key} into ${settingsPath} (backup-first, idempotent)`);
+    r.actions.push(`lifecycle merge settings.${key} into ${settingsPath}`);
     return r;
   }
   try {
-    let settings: Record<string, unknown> = {};
-    if (existsSync(settingsPath)) {
-      try { settings = JSON.parse(readFileSync(settingsPath, "utf-8")); }
-      catch { r.blockers.push(`settings.json exists but is not valid JSON — refusing to rewrite (would drop your config).`); return r; }
-    }
-    const already = JSON.stringify(settings[key]) === JSON.stringify(enh[key]);
     if (!already) {
-      backup(settingsPath);
       settings[key] = enh[key];
-      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+      await applyComponentMutations(ctx, component, [{
+        id: `${component}:settings`,
+        kind: "write",
+        path: settingsPath,
+        bytes: Buffer.from(`${JSON.stringify(settings, null, 2)}\n`),
+        mode: existsSync(settingsPath) ? statSync(settingsPath).mode & 0o777 : 0o600,
+        ownership: existsSync(settingsPath) ? "adopted" : "owned",
+        structured: "json",
+      }]);
     }
     r.applied = !already;
     const reread = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
-    const passed = JSON.stringify(reread[key]) === JSON.stringify(enh[key]);
-    r.probe = { name: `${component}-merged`, passed, detail: `settings.${key} set${already ? " (idempotent)" : ""}` };
-  } catch (err) {
-    r.error = err instanceof Error ? err.message : String(err);
+    r.probe = { name: `${component}-merged`, passed: JSON.stringify(reread[key]) === JSON.stringify(enh[key]), detail: `settings.${key} set${already ? " (idempotent)" : ""}` };
+  } catch (error) {
+    r.error = error instanceof Error ? error.message : String(error);
   }
   return r;
 }
 
-/** Agents: copyMissing the shipped agents tree into the harness agents dir (never overwrites). */
-function deployAgents(ctx: Ctx): ComponentResult {
-  const r: ComponentResult = { component: "agents", ready: false, actions: [], blockers: [] };
-  const src = join(ctx.installRoot, "agents");
-  const dst = join(ctx.configRoot, "agents");
+async function deployMissingTree(component: "agents" | "commands", ctx: Ctx): Promise<ComponentResult> {
+  const r: ComponentResult = { component, ready: false, actions: [], blockers: [] };
+  const src = join(ctx.installRoot, component);
+  const dst = join(ctx.configRoot, component);
   if (!existsSync(src) && !existsSync(dst)) {
-    r.blockers.push(`agents not in payload (${src}) and not already installed (${dst})`);
+    r.blockers.push(`${component} not in payload (${src}) and not already installed (${dst})`);
     return r;
   }
   r.ready = true;
   if (!ctx.apply) {
-    r.actions.push(existsSync(src) ? `copyMissing agents → ${dst} (never overwrites existing)` : `agents already present at ${dst} — no-op`);
+    r.actions.push(existsSync(src) ? `lifecycle copy missing ${component} → ${dst}` : `${component} already present at ${dst} — no-op`);
     return r;
   }
   try {
     if (!existsSync(src)) {
-      r.applied = false;
-      r.probe = { name: "agents-present", passed: true, detail: `already present at ${dst} (no payload to copy)` };
+      r.probe = { name: `${component}-present`, passed: true, detail: `already present at ${dst}` };
       return r;
     }
-    const { copied, failures } = copyMissing(src, dst);
-    r.applied = copied > 0;
-    r.probe = { name: "agents-copied", passed: failures.length === 0 && existsSync(dst), detail: `${copied} agent file(s) copied${failures.length ? `, ${failures.length} failed` : ""}` };
-  } catch (err) {
-    r.error = err instanceof Error ? err.message : String(err);
+    const mutations = missingTreeMutations(src, dst, component);
+    await applyComponentMutations(ctx, component, mutations);
+    r.applied = mutations.length > 0;
+    r.probe = { name: `${component}-copied`, passed: existsSync(dst), detail: `${mutations.length} file(s) copied through lifecycle` };
+  } catch (error) {
+    r.error = error instanceof Error ? error.message : String(error);
   }
   return r;
 }
 
-// commands mirrors agents exactly: copy the payload's install/commands/ into the
-// user's ~/.claude/commands/, never overwriting. The payload is already filtered
-// at emit time to public commands only (a command ships iff its target skill
-// ships), so there is nothing private-pointing to guard against here.
-function deployCommands(ctx: Ctx): ComponentResult {
-  const r: ComponentResult = { component: "commands", ready: false, actions: [], blockers: [] };
-  const src = join(ctx.installRoot, "commands");
-  const dst = join(ctx.configRoot, "commands");
-  if (!existsSync(src) && !existsSync(dst)) {
-    r.blockers.push(`commands not in payload (${src}) and not already installed (${dst})`);
-    return r;
-  }
-  r.ready = true;
-  if (!ctx.apply) {
-    r.actions.push(existsSync(src) ? `copyMissing commands → ${dst} (never overwrites existing)` : `commands already present at ${dst} — no-op`);
-    return r;
-  }
-  try {
-    if (!existsSync(src)) {
-      r.applied = false;
-      r.probe = { name: "commands-present", passed: true, detail: `already present at ${dst} (no payload to copy)` };
-      return r;
-    }
-    const { copied, failures } = copyMissing(src, dst);
-    r.applied = copied > 0;
-    r.probe = { name: "commands-copied", passed: failures.length === 0 && existsSync(dst), detail: `${copied} command file(s) copied${failures.length ? `, ${failures.length} failed` : ""}` };
-  } catch (err) {
-    r.error = err instanceof Error ? err.message : String(err);
-  }
-  return r;
+function deployAgents(ctx: Ctx): Promise<ComponentResult> {
+  return deployMissingTree("agents", ctx);
+}
+
+function deployCommands(ctx: Ctx): Promise<ComponentResult> {
+  return deployMissingTree("commands", ctx);
 }
 
 /**
@@ -317,45 +389,45 @@ function deployCommands(ctx: Ctx): ComponentResult {
  * This keeps DeployComponents focused on non-launchd components (settings merges, file copies)
  * while Services.ts owns the full launchd machinery.
  */
-function deployViaServices(component: LaunchdComponent, ctx: Ctx): ComponentResult {
+async function deployViaServices(component: LaunchdComponent, ctx: Ctx): Promise<ComponentResult> {
   const r: ComponentResult = { component, ready: false, actions: [], blockers: [] };
+  if (process.platform !== "darwin") {
+    r.blockers.push(`launchd services are unsupported on ${process.platform}; no runtime files or service mutations were staged`);
+    return r;
+  }
   const servicesTs = join(ctx.lifeosDir, "TOOLS", "Services.ts");
-
-  // Services.ts must be present (either in live tree or staged from payload)
   const av = availability("TOOLS", ctx);
   if (!av.inLive && !av.inPayload) {
     r.blockers.push(`TOOLS not in live tree (${join(ctx.lifeosDir, "TOOLS")}) or payload`);
     return r;
   }
   r.ready = true;
-
-  // Build the label — Services.ts accepts short form (pulse) or full (com.lifeos.pulse)
   const label = component.startsWith("com.lifeos.") ? component : `com.lifeos.${component}`;
-
   if (!ctx.apply) {
-    if (!av.inLive) r.actions.push(`stage TOOLS from payload → ${join(ctx.lifeosDir, "TOOLS")}`);
+    if (!av.inLive) r.actions.push(`lifecycle stage TOOLS → ${join(ctx.lifeosDir, "TOOLS")}`);
     r.actions.push(`bun ${servicesTs.replace(ctx.home, "~")} install --only ${component} --yes`);
     return r;
   }
-
   try {
-    ensurePresent("TOOLS", ctx);
+    if (av.inPayload) {
+      const mutations = missingTreeMutations(join(ctx.payloadRoot, "TOOLS"), join(ctx.lifeosDir, "TOOLS"), `tools:${component}`);
+      await applyComponentMutations(ctx, component, mutations);
+    }
     if (!existsSync(servicesTs)) {
-      r.blockers.push(`Services.ts still missing after staging: ${servicesTs}`);
+      r.blockers.push(`Services.ts still missing after lifecycle staging: ${servicesTs}`);
       return r;
     }
-    // Delegate to Services.ts
+    requirePhysicalContainedFile(servicesTs, join(ctx.lifeosDir, "TOOLS"), "Services.ts");
     const out = execFileSync("bun", [servicesTs, "install", "--only", component, "--yes"], {
       stdio: ["pipe", "pipe", "pipe"],
-      timeout: 120000, // some services take longer (e.g. Pulse waits for healthz)
+      timeout: 120000,
       cwd: dirname(servicesTs),
     }).toString();
     r.applied = true;
-    // Confirm the job actually loaded
     const loaded = launchctl(["print", `gui/${uid()}/${label}`]).ok;
     r.probe = { name: `${component}-loaded`, passed: loaded, detail: loaded ? `${label} loaded via Services.ts` : `Services.ts exit 0 but ${label} not loaded: ${out.trim().split("\n").slice(-1)[0]}` };
-  } catch (err) {
-    r.error = err instanceof Error ? err.message : String(err);
+  } catch (error) {
+    r.error = error instanceof Error ? error.message : String(error);
   }
   return r;
 }
@@ -364,8 +436,7 @@ function isLaunchdComponent(c: Component): c is LaunchdComponent {
   return (LAUNCHD_COMPONENTS as readonly string[]).includes(c);
 }
 
-function deploy(component: Component, ctx: Ctx): ComponentResult {
-  // Non-launchd components: handled directly
+async function deploy(component: Component, ctx: Ctx): Promise<ComponentResult> {
   switch (component) {
     case "statusline": return deployStatusline(ctx);
     case "tooltips": return deploySettingsKey("tooltips", "spinnerTipsOverride", ctx);
@@ -373,20 +444,17 @@ function deploy(component: Component, ctx: Ctx): ComponentResult {
     case "agents": return deployAgents(ctx);
     case "commands": return deployCommands(ctx);
   }
-  // Launchd components: delegate to Services.ts
-  if (isLaunchdComponent(component)) {
-    return deployViaServices(component, ctx);
-  }
-  // Fallback (shouldn't reach here with proper types, but TypeScript wants exhaustiveness)
+  if (isLaunchdComponent(component)) return deployViaServices(component, ctx);
   return { component, ready: false, actions: [], blockers: [`unknown component: ${component}`] };
 }
 
 // ── main ─────────────────────────────────────────────────────────────
 
-function main(): void {
+async function main(): Promise<void> {
   const a = process.argv.slice(2);
-  const home = process.env.HOME || "";
-  const configRoot = arg(a, "--config-root") || process.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
+  const roots = resolveInstallRoots();
+  const home = roots.home;
+  const configRoot = arg(a, "--config-root") || roots.configRoot;
   const skillRoot = arg(a, "--skill-root") || join(import.meta.dir, "..");
   const apply = a.includes("--apply");
   const allowDev = a.includes("--allow-dev");
@@ -433,7 +501,8 @@ function main(): void {
     apply,
   };
 
-  const results = selected.map((c) => deploy(c, ctx));
+  const results: ComponentResult[] = [];
+  for (const component of selected) results.push(await deploy(component, ctx));
   // A blocked component (prereq absent, nothing written) is a FAILURE, not a
   // silent success — `ok` factors in blockers, error, AND probe in both modes.
   const ok = results.every((r) => r.blockers.length === 0 && !r.error && (!r.probe || r.probe.passed));
@@ -451,4 +520,4 @@ function main(): void {
   process.exit(ok ? 0 : 1);
 }
 
-main();
+void main();

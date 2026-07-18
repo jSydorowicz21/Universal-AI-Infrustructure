@@ -28,19 +28,20 @@ import {
   statSync,
 } from "node:fs";
 import { join } from "node:path";
+import { resolveDataRoot, resolveLifeosRoot } from "../../UNIVERSAL/platform";
 
-const HOME = process.env.HOME || "";
-const CLAUDE = join(HOME, ".claude");
-const OBS_DIR = join(CLAUDE, "LIFEOS/MEMORY/OBSERVABILITY");
+const LIFEOS_ROOT = resolveLifeosRoot(process.env, "claude");
+const USER_ROOT = join(resolveDataRoot(process.env), "USER");
+const OBS_DIR = join(LIFEOS_ROOT, "MEMORY", "OBSERVABILITY");
 
 const REVIEW_STATE = join(OBS_DIR, "review-state.json");
 const HEALTH_LOG = join(OBS_DIR, "memory-health.jsonl");
 const FIRES_LOG = join(OBS_DIR, "reviewer-fires.jsonl");
 const PROPOSALS_LOG = join(OBS_DIR, "pending-proposals.jsonl");
 const REVIEWER_RUNS = join(OBS_DIR, "reviewer-runs");
-const PRINCIPAL_MEMORY = join(CLAUDE, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md");
-const DA_MEMORY = join(CLAUDE, "LIFEOS/USER/DIGITAL_ASSISTANT/DA_MEMORY.md");
-const CADENCE_CONFIG = join(CLAUDE, "LIFEOS/USER/CONFIG/memory-review.json");
+const PRINCIPAL_MEMORY = join(USER_ROOT, "PRINCIPAL", "PRINCIPAL_MEMORY.md");
+const DA_MEMORY = join(USER_ROOT, "DIGITAL_ASSISTANT", "DA_MEMORY.md");
+const CADENCE_CONFIG = join(USER_ROOT, "CONFIG", "memory-review.json");
 
 interface ModuleState {
   running: boolean;

@@ -14,14 +14,13 @@
  * Read-only. No capture, no mutation. Register in pulse.ts like the conduit module.
  */
 import { existsSync, readFileSync, statSync } from "node:fs"
-import { homedir } from "node:os"
 import { join } from "node:path"
+import { resolveLifeosRoot } from "../../UNIVERSAL/platform"
 
 const MODULE_NAME = "menubar"
 const state = { running: false, startedAt: null as Date | null }
 
-const CLAUDE = join(homedir(), ".claude")
-const LIFEOS = join(CLAUDE, "LIFEOS")
+const LIFEOS = resolveLifeosRoot(process.env, "claude")
 const OBS = join(LIFEOS, "MEMORY", "OBSERVABILITY")
 const STATE_DIR = join(LIFEOS, "PULSE", "state")
 const WORK_JSON = join(LIFEOS, "MEMORY", "STATE", "work.json")

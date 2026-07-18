@@ -114,3 +114,9 @@ export function getSkillsDir(): string {
 export function getMemoryDir(): string {
   return paiPath('MEMORY');
 }
+
+
+/** Get a path relative to the canonical MEMORY directory. */
+export function memoryPath(...segments: string[]): string {
+  return join(getMemoryDir(), ...segments);
+}

@@ -482,7 +482,7 @@ async function handleProposalReply(chatId: number, reply: ProposalReply, ctx: { 
   }
 
   if (reply.kind === "yes") {
-    const result = applyProposalEdit(row.target_file, row.edit)
+    const result = applyProposalEdit(row.target_file, row.edit, row.target_kind)
     if (result.ok) {
       markProposal(row.id, { status: "accepted", resolved_at: new Date().toISOString(), applied_edit: row.edit })
       logProposalEvent({ id: row.id, file: row.target_file, edit: row.edit, confidence: row.confidence, status: "accepted" })
@@ -509,7 +509,7 @@ async function handleProposalReply(chatId: number, reply: ProposalReply, ctx: { 
     await ctx.reply(`✏️ Provide the edited text: \`edit #${reply.id} <your text>\``).catch(() => {})
     return "handled"
   }
-  const result = applyProposalEdit(row.target_file, reply.editText)
+  const result = applyProposalEdit(row.target_file, reply.editText, row.target_kind)
   if (result.ok) {
     markProposal(row.id, { status: "edited", resolved_at: new Date().toISOString(), applied_edit: reply.editText })
     logProposalEvent({ id: row.id, file: row.target_file, edit: reply.editText, confidence: row.confidence, status: "edited" })

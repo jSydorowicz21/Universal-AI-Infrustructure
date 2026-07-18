@@ -1,0 +1,11 @@
+{
+  "contract": "uai.adapter.v1",
+  "adapter": { "id": "codex", "version": "1.0.0", "class": "compatibility" },
+  "discovery": { "state": "detected", "confidence": 1, "cliVersion": "fixture-0.9.0", "roots": ["fixture://codex"] },
+  "capabilities": {
+    "lifecycleBlocking": { "critical": true, "state": "degraded", "failMode": "fail-visible-open", "losses": ["trusted managed hooks not observed"] },
+    "mcp": { "state": "wired", "losses": ["MCP does not prove lifecycle parity"] }
+  },
+  "certification": "C2",
+  "losses": ["native lifecycle blocking requires trusted managed hooks"]
+}

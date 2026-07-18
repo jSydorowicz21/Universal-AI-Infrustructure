@@ -15,7 +15,6 @@
 
 import { readFile } from "fs/promises";
 import { join } from "path";
-import { parse as parseYaml } from "yaml";
 
 const ACTIONS_DIR = join(import.meta.dir, "..", "ACTIONS");
 const PIPELINES_DIR = join(import.meta.dir, "..", "PIPELINES");
@@ -77,7 +76,7 @@ async function reportStep(executionId: string, stepId: string, status: string, o
 async function loadPipeline(name: string): Promise<Pipeline> {
   const path = join(PIPELINES_DIR, `${name}.pipeline.yaml`);
   const content = await readFile(path, "utf-8");
-  return parseYaml(content) as Pipeline;
+  return Bun.YAML.parse(content) as Pipeline;
 }
 
 // Template interpolation

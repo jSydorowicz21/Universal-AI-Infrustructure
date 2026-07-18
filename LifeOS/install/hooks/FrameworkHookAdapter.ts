@@ -7,11 +7,14 @@
  */
 
 import { spawnSync } from "child_process";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { appendFileSync, existsSync, mkdirSync } from "fs";
-import { basename, dirname, extname, join, resolve } from "path";
+import { basename, dirname, extname, join, normalize as normalizePath, resolve } from "path";
 import { blockEmissionForFramework, shouldExitCleanlyOnBlock } from "./lib/framework-hook-contract";
-import { homeDir } from "./lib/paths";
 import { isSubagentSession } from "./lib/session";
+const HOME = process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+
 
 type JsonObject = Record<string, any>;
 type CapturedOutput = {
@@ -84,7 +87,7 @@ function payloadSummary(input: JsonObject): JsonObject {
   const rawToolResult = input.tool_result || input.toolResult || input.tool_response || input.result;
   return {
     framework: input.framework,
-    session_id: input.session_id || "pai-framework-session",
+    session_id: input.session_id || "unknown-session",
     hook_event_name: input.hook_event_name || input.event_name || input.event || "unknown",
     cwd: input.cwd || input.workingDirectory,
     tool_name: input.tool_name || input.toolName || input.tool?.name || "Unknown",
@@ -114,7 +117,7 @@ function runLogForTargetStart(runId: string, framework: string, input: JsonObjec
     event: "start",
     timestamp: new Date().toISOString(),
     hookEventName: eventName,
-    sessionId: input.session_id || input.sessionId || input.session?.id || "pai-framework-session",
+    sessionId: input.session_id || input.sessionId || input.session?.id || "unknown-session",
     target: `${index + 1}/${total}:${basename(target)}`,
     timeoutMs: timeout,
     startEpochMs: Date.now(),
@@ -141,7 +144,7 @@ function runLogForTargetEnd(runId: string, framework: string, input: JsonObject,
     event: statusReason || "completed",
     timestamp: new Date(endEpoch).toISOString(),
     hookEventName: eventName,
-    sessionId: input.session_id || input.sessionId || input.session?.id || "pai-framework-session",
+    sessionId: input.session_id || input.sessionId || input.session?.id || "unknown-session",
     target: `${index + 1}/${total}:${basename(target)}`,
     timeoutMs: result.timeoutMs,
     startEpochMs: result.startEpochMs,
@@ -167,7 +170,7 @@ function runLogForTargetSkip(runId: string, framework: string, input: JsonObject
     event: "skip",
     timestamp: new Date().toISOString(),
     hookEventName: eventName,
-    sessionId: input.session_id || input.sessionId || input.session?.id || "pai-framework-session",
+    sessionId: input.session_id || input.sessionId || input.session?.id || "unknown-session",
     target: `${index + 1}/${total}:${basename(target)}`,
     timeoutMs: timeoutMs(),
     startEpochMs: Date.now(),
@@ -214,11 +217,11 @@ function existingEnvPath(name: string): string {
 }
 
 function fallbackDataDir(): string {
-  return existingEnvPath("PAI_DATA_DIR") || join(homeDir(), ".pai");
+  return existingEnvPath("UAI_DATA_DIR") || existingEnvPath("PAI_DATA_DIR") || join(HOME, ".pai");
 }
 
 function fallbackConfigDir(): string {
-  return existingEnvPath("PAI_CONFIG_DIR") || join(homeDir(), ".config", "PAI");
+  return existingEnvPath("PAI_CONFIG_DIR") || join(HOME, ".config", "PAI");
 }
 
 const RECURSION_GUARDED_HOOKS = new Set([
@@ -350,19 +353,53 @@ function lastAssistantMessage(input: JsonObject): string {
   return last?.content || "";
 }
 
+export function frameworkSessionIdentity(input: JsonObject, framework: string): {
+  uaiSessionId: string;
+  nativeSessionId: string;
+  profileRoot: string;
+} {
+  const profileRoot = normalizePath(
+    process.env.UAI_PROFILE_ROOT ||
+    process.env.CLAUDE_CONFIG_DIR ||
+    process.env.CODEX_HOME ||
+    process.env.OPENCODE_CONFIG_DIR ||
+    HOME,
+  );
+  const nativeSessionId = String(
+    input.native_session_id ||
+    input.session_id ||
+    input.sessionId ||
+    input.session?.id ||
+    process.env.CODEX_SESSION_ID ||
+    process.env.OPENCODE_SESSION_ID ||
+    transcriptPath(input) ||
+    `${framework}-ppid-${process.ppid}`,
+  );
+  const configuredUaiId = input.uai_session_id || process.env.UAI_SESSION_ID;
+  const digest = createHash("sha256")
+    .update(`${framework}\0${profileRoot}\0${nativeSessionId}\0${transcriptPath(input) || "no-transcript"}`)
+    .digest("hex")
+    .slice(0, 24);
+  return {
+    uaiSessionId: typeof configuredUaiId === "string" && configuredUaiId.length > 0
+      ? configuredUaiId
+      : `uai-${framework}-${digest}`,
+    nativeSessionId,
+    profileRoot,
+  };
+}
+
 function normalize(input: JsonObject, framework: string): JsonObject {
   const normalizedCwd = cwd(input);
   const normalizedToolResult = toolResult(input);
+  const identity = frameworkSessionIdentity(input, framework);
   return {
     ...input,
     framework,
-    session_id:
-      input.session_id ||
-      input.sessionId ||
-      input.session?.id ||
-      process.env.CODEX_SESSION_ID ||
-      process.env.OPENCODE_SESSION_ID ||
-      "pai-framework-session",
+    session_id: identity.uaiSessionId,
+    uai_session_id: identity.uaiSessionId,
+    native_session_id: identity.nativeSessionId,
+    uai_profile_root: identity.profileRoot,
     cwd: normalizedCwd,
     transcript_path: transcriptPath(input),
     last_assistant_message: lastAssistantMessage(input),
@@ -639,7 +676,9 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error(`[PAI FrameworkHookAdapter] ${err?.message || err}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(`[PAI FrameworkHookAdapter] ${err?.message || err}`);
+    process.exit(1);
+  });
+}

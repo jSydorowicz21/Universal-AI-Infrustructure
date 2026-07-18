@@ -1,10 +1,4 @@
 #!/usr/bin/env bun
-// Normalize env path vars Claude Code may inject unexpanded — literal $HOME/${HOME}
-// in LIFEOS_DIR/LIFEOS_CONFIG_DIR/PROJECTS_DIR resolves to a shadow dir (#1404 / PR #1451, author jbmml).
-for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
-  const __v = process.env[__k];
-  if (__v && /^\$\{?HOME\}?(\/|$)/.test(__v)) process.env[__k] = __v.replace(/^\$\{?HOME\}?/, process.env.HOME ?? "~");
-}
 
 /**
  * SeedPulse — Interview final step. Seeds the Pulse data plane from the now-
@@ -18,15 +12,10 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { detectDevTree } from "./InstallEngine";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { join, relative } from "node:path";
+import { detectDevTree, resolveInstallRoots } from "./InstallEngine";
 
-// Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
-for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
-  const v = process.env[k];
-  if (v && /^\$\{?HOME\}?(\/|$)/.test(v)) process.env[k] = v.replace(/^\$\{?HOME\}?/, process.env.HOME ?? "~");
-}
 
 
 const GENERATORS = ["GenerateTelosSummary.ts", "UpdateLifeosState.ts"];
@@ -37,9 +26,10 @@ function main(): void {
     const i = a.indexOf(f);
     return i >= 0 && a[i + 1] && !a[i + 1].startsWith("--") ? a[i + 1] : undefined;
   };
-  const home = process.env.HOME || "";
-  const configRoot = get("--config-root") || process.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
-  const configDir = get("--config-dir") || process.env.LIFEOS_CONFIG_DIR || join(home, ".config", "LIFEOS");
+  const roots = resolveInstallRoots();
+  const configRoot = get("--config-root") || roots.configRoot;
+  const configDir = get("--config-dir") || roots.dataRoot;
+  const lifeosRoot = process.env.LIFEOS_DIR ? roots.lifeosRoot : join(configRoot, "LIFEOS");
   const apply = a.includes("--apply");
   const allowDev = a.includes("--allow-dev");
 
@@ -48,9 +38,26 @@ function main(): void {
     process.exit(2);
   }
 
-  const toolsDir = join(configRoot, "LIFEOS", "TOOLS");
-  const present = GENERATORS.filter((g) => existsSync(join(toolsDir, g)));
-  const missing = GENERATORS.filter((g) => !existsSync(join(toolsDir, g)));
+  const toolsDir = join(lifeosRoot, "TOOLS");
+  const toolsMetadata = existsSync(toolsDir) ? lstatSync(toolsDir) : undefined;
+  const lifeosMetadata = existsSync(lifeosRoot) ? lstatSync(lifeosRoot) : undefined;
+  const physicalToolsRoot = !!toolsMetadata
+    && !!lifeosMetadata
+    && !lifeosMetadata.isSymbolicLink()
+    && lifeosMetadata.isDirectory()
+    && !toolsMetadata.isSymbolicLink()
+    && toolsMetadata.isDirectory();
+  const physicalGenerator = (generator: string): boolean => {
+    if (!physicalToolsRoot) return false;
+    const path = join(toolsDir, generator);
+    if (!existsSync(path)) return false;
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) return false;
+    const delta = relative(realpathSync(toolsDir), realpathSync(path));
+    return !delta.startsWith("..");
+  };
+  const present = GENERATORS.filter(physicalGenerator);
+  const missing = GENERATORS.filter((generator) => !physicalGenerator(generator));
 
   if (!apply) {
     // Dry-run must ALSO fail LOUD when no generators are present: a Setup driver that
@@ -71,12 +78,12 @@ function main(): void {
         env: {
           ...process.env,
           LIFEOS_CONFIG_DIR: configDir,
-          LIFEOS_DIR: join(configRoot, "LIFEOS"),
+          LIFEOS_DIR: lifeosRoot,
           // GenerateTelosSummary resolves its TELOS dir via LifeosConfig.paiUserDir(),
           // which reads LIFEOS_CONFIG_PATH (NOT LIFEOS_DIR). UpdateLifeosState resolves via
           // LIFEOS_DIR. Pass BOTH so both generators target the same install root —
           // otherwise a non-default config root mis-targets ~/.claude.
-          LIFEOS_CONFIG_PATH: join(configRoot, "LIFEOS", "USER", "CONFIG", "LIFEOS_CONFIG.toml"),
+          LIFEOS_CONFIG_PATH: join(lifeosRoot, "USER", "CONFIG", "LIFEOS_CONFIG.toml"),
         },
         timeout: 60000,
       });

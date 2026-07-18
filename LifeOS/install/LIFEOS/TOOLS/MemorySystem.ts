@@ -37,11 +37,13 @@
  *   bun MemorySystem.ts test                (smoke test)
  */
 
+import { randomUUID } from "node:crypto";
 import {
   appendFileSync,
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -56,7 +58,9 @@ import {
   TYPE_REGISTRY,
   isKnownType,
   resolveStoragePath,
-  inferProposalKind,
+  PROPOSAL_KIND_TO_FILES,
+  USER_ROOT,
+  isKnownProposalKind,
   ALL_TYPES,
   TIER_B_AUDIT_PATH,
   PRINCIPAL_MEMORY_PATH,
@@ -64,6 +68,7 @@ import {
   type MemoryTypeName,
   type Tier,
   type RelatedLink,
+  type ProposalTargetKind,
 } from "./MemoryTypes";
 
 import { setEntries as memoryWriterSetEntries, read as memoryWriterRead } from "./MemoryWriter";
@@ -141,25 +146,62 @@ function appendToTierBFile(filePath: string, content: string): { ok: true; bytes
     return { ok: false, code: "EWRITE_FAILED", message: `Failed to acquire lock: ${e?.message}` };
   }
 
+  let tmpPath: string | undefined;
   try {
-    const tmpPath = `${filePath}.tmp`;
+    tmpPath = pathJoin(dirname(filePath), `.${randomUUID()}.uai-tmp`);
     const existing = existsSync(filePath) ? readFileSync(filePath, "utf8") : "";
     const newContent = existing.length > 0 && !existing.endsWith("\n")
       ? existing + "\n" + content
       : existing + content;
-
-    writeFileSync(tmpPath, newContent, "utf8");
-    const fdSync = openSync(tmpPath, "r+");
-    try { fsyncSync(fdSync); } finally { closeSync(fdSync); }
+    const tmpDescriptor = openSync(tmpPath, "wx", 0o600);
+    try {
+      writeFileSync(tmpDescriptor, newContent, "utf8");
+      fsyncSync(tmpDescriptor);
+    } finally {
+      closeSync(tmpDescriptor);
+    }
     renameSync(tmpPath, filePath);
 
     return { ok: true, bytes: Buffer.byteLength(content, "utf8") };
-  } catch (e: any) {
-    return { ok: false, code: "EWRITE_FAILED", message: `Append failed: ${e?.message}`, underlying: e };
+  } catch (error: unknown) {
+    if (tmpPath) try { unlinkSync(tmpPath); } catch { /* only our temporary */ }
+    return { ok: false, code: "EWRITE_FAILED", message: `Append failed: ${error instanceof Error ? error.message : String(error)}`, underlying: error };
   } finally {
     try { if (fd !== null) closeSync(fd); } catch { /* ignore */ }
     try { unlinkSync(lockPath); } catch { /* ignore */ }
   }
+}
+
+export type ProposalTargetValidation = { ok: true; kind: ProposalTargetKind } | AddError;
+
+export function validateProposalTargetBinding(targetFile: string, targetKind: string | undefined): ProposalTargetValidation {
+  if (!targetKind || !isKnownProposalKind(targetKind)) {
+    return { ok: false, code: "EINVAL_ITEM", message: "Proposal target_kind is required and must be recognized" };
+  }
+  const target = pathResolve(targetFile);
+  const allowed = PROPOSAL_KIND_TO_FILES[targetKind].some((file) => pathResolve(file) === target);
+  if (!allowed) {
+    return { ok: false, code: "EINVAL_ITEM", message: `Proposal target is not allowed for kind '${targetKind}'` };
+  }
+  const root = pathResolve(USER_ROOT);
+  let cursor = target;
+  while (cursor !== root) {
+    if (dirname(cursor) === cursor) {
+      return { ok: false, code: "EINVAL_ITEM", message: "Proposal target escapes the selected USER root" };
+    }
+    if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) {
+      return { ok: false, code: "EINVAL_ITEM", message: `Proposal target crosses a symbolic link: ${cursor}` };
+    }
+    cursor = dirname(cursor);
+  }
+  if (existsSync(root) && lstatSync(root).isSymbolicLink()) {
+    return { ok: false, code: "EINVAL_ITEM", message: `Selected USER root is a symbolic link: ${root}` };
+  }
+  return { ok: true, kind: targetKind };
+}
+
+function validateProposalTarget(item: TypedItem & { type: "proposal" }): ProposalTargetValidation {
+  return validateProposalTargetBinding(item.target_file, item.target_kind);
 }
 
 // ── Proposal queue ──
@@ -167,10 +209,11 @@ function appendToTierBFile(filePath: string, content: string): { ok: true; bytes
 function enqueueProposal(item: TypedItem & { type: "proposal" }): { ok: true; id: string } | AddError {
   const id = generateProposalId();
   const path = resolveStoragePath(item);
-  // P1 2026-05-25: persist the subtype discriminator onto the queue row so
-  // the Telegram surfacer can render the [kind] badge. Falls back to the
-  // path-based inference when the reviewer omits target_kind (legacy compat).
-  const targetKind = item.target_kind ?? inferProposalKind(item.target_file);
+  // Persist the validated subtype discriminator so every later apply can
+  // revalidate the same closed target binding.
+  const validation = validateProposalTarget(item);
+  if (!validation.ok) return validation;
+  const targetKind = validation.kind;
   try {
     mkdirSync(dirname(path), { recursive: true });
     appendFileSync(

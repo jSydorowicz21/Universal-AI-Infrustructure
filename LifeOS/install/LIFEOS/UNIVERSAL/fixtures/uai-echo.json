@@ -1,0 +1,11 @@
+{
+  "id": "uai-echo-fixture",
+  "command": "uai-echo",
+  "tools": ["uai_echo"],
+  "env": { "MODE": "fixture", "UAI_ECHO_TOKEN": "fixture-secret-never-log" },
+  "allowedEnv": ["MODE"],
+  "auth": "none",
+  "approvals": "required",
+  "sandbox": "preferred",
+  "toolFilter": ["uai_echo"]
+}

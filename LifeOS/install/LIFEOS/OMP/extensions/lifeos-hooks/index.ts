@@ -38,10 +38,12 @@
  * the constitution's ONE unified format (upstream 7.0.0 retired the mode system).
  */
 
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { join, normalize } from "node:path";
+import { boundedAuditRow } from "../../../UNIVERSAL/canonical";
+import { spawn, type ChildProcess } from "node:child_process";
+import { getOmpSessionIdentity } from "../../session";
 
 type OmpEvent =
 	| "session_start"
@@ -59,6 +61,7 @@ interface HookSpec {
 	matcher?: RegExp;
 	timeoutMs?: number;
 	gate?: "pulse";
+	failMode: "fail-closed" | "fail-visible-open" | "advisory";
 	once?: boolean;
 	/** CC settings.json `async: true` parity — fire-and-forget, output ignored, never blocks the turn. */
 	fireAndForget?: boolean;
@@ -82,11 +85,12 @@ interface ExtensionApi {
 	setLabel?: (label: string) => void;
 }
 
-const HOME = homedir();
-const CLAUDE_ROOT = join(HOME, ".claude");
-const HOOKS_DIR = join(CLAUDE_ROOT, "hooks");
-const LIFEOS_DIR = process.env.LIFEOS_DIR ?? join(CLAUDE_ROOT, "LIFEOS");
-const BUN = existsSync(join(HOME, ".bun/bin/bun")) ? join(HOME, ".bun/bin/bun") : "bun";
+const HOME = normalize(process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir());
+const CLAUDE_ROOT = normalize(process.env.CLAUDE_CONFIG_DIR ?? join(HOME, ".claude"));
+const HOOKS_DIR = normalize(process.env.LIFEOS_HOOKS_DIR ?? join(CLAUDE_ROOT, "hooks"));
+const LIFEOS_DIR = normalize(process.env.LIFEOS_DIR ?? join(CLAUDE_ROOT, "LIFEOS"));
+const PROFILE_ROOT = normalize(process.env.PI_CODING_AGENT_DIR ?? join(HOME, ".omp", "agent"));
+const BUN = process.env.LIFEOS_HOOK_EXECUTABLE?.trim() || process.execPath;
 
 const TOOL_NAME_MAP: Record<string, string> = {
 	bash: "Bash",
@@ -106,37 +110,37 @@ const TOOL_NAME_MAP: Record<string, string> = {
 // successor — upstream 7.0.0 retired the whole mode system).
 const MANIFEST: HookSpec[] = [
 	// before_agent_start (CC UserPromptSubmit / SessionStart-once)
-	{ file: "LoadContext.hook.ts", ompEvent: "before_agent_start", ccEvent: "SessionStart", once: true, timeoutMs: 8000 },
-	{ file: "MemoryDeltaSurface.hook.ts", ompEvent: "before_agent_start", ccEvent: "UserPromptSubmit", timeoutMs: 8000 },
+	{ file: "LoadContext.hook.ts", ompEvent: "before_agent_start", ccEvent: "SessionStart", once: true, timeoutMs: 8000, failMode: "fail-visible-open" },
+	{ file: "MemoryDeltaSurface.hook.ts", ompEvent: "before_agent_start", ccEvent: "UserPromptSubmit", timeoutMs: 8000, failMode: "fail-visible-open" },
 	// MemoryReviewTrigger retired: MemoryReviewFire (session_stop, below) owns the whole cadence.
-	{ file: "SatisfactionCapture.hook.ts", ompEvent: "before_agent_start", ccEvent: "UserPromptSubmit", fireAndForget: true, timeoutMs: 20000 },
-	{ file: "ReminderRouter.hook.ts", ompEvent: "before_agent_start", ccEvent: "UserPromptSubmit", fireAndForget: true, timeoutMs: 5000 },
+	{ file: "SatisfactionCapture.hook.ts", ompEvent: "before_agent_start", ccEvent: "UserPromptSubmit", fireAndForget: true, timeoutMs: 20000, failMode: "advisory" },
+	{ file: "ReminderRouter.hook.ts", ompEvent: "before_agent_start", ccEvent: "UserPromptSubmit", fireAndForget: true, timeoutMs: 5000, failMode: "advisory" },
 	// tool_result (CC PostToolUse) — write/edit only; each self-gates on file path
-	{ file: "ISASync.hook.ts", ompEvent: "tool_result", ccEvent: "PostToolUse", matcher: /^(write|edit|multiedit)$/i, timeoutMs: 8000 },
+	{ file: "ISASync.hook.ts", ompEvent: "tool_result", ccEvent: "PostToolUse", matcher: /^(write|edit|multiedit)$/i, timeoutMs: 8000, failMode: "advisory" },
 	// TelosSummarySync retired upstream (no successor in this tree).
-	{ file: "CheckpointPerISC.hook.ts", ompEvent: "tool_result", ccEvent: "PostToolUse", matcher: /^(write|edit|multiedit)$/i, timeoutMs: 30000 },
+	{ file: "CheckpointPerISC.hook.ts", ompEvent: "tool_result", ccEvent: "PostToolUse", matcher: /^(write|edit|multiedit)$/i, timeoutMs: 30000, failMode: "advisory" },
 	// tool_call (CC PreToolUse) — guards that block via exit code 2 + stderr
-	{ file: "SystemFileGuard.hook.ts", ompEvent: "tool_call", ccEvent: "PreToolUse", matcher: /^(write|edit|multiedit)$/i, timeoutMs: 5000 },
+	{ file: "SystemFileGuard.hook.ts", ompEvent: "tool_call", ccEvent: "PreToolUse", matcher: /^(write|edit|multiedit)$/i, timeoutMs: 5000, failMode: "fail-closed" },
 	// ArtWorkflowGuard retired upstream (no successor in this tree).
 	// CC parity: Pulse HTTP-route guard (settings.json type:"http" on the Agent matcher).
 	// OMP has no Skill tool (skills load via read); agent spawns go through task.
-	{ url: "http://localhost:31337/hooks/agent-guard", ompEvent: "tool_call", ccEvent: "PreToolUse", matcher: /^task$/i, gate: "pulse", timeoutMs: 4000 },
+	{ url: "http://localhost:31337/hooks/agent-guard", ompEvent: "tool_call", ccEvent: "PreToolUse", matcher: /^task$/i, gate: "pulse", timeoutMs: 4000, failMode: "fail-visible-open" },
 	// session_stop (CC Stop)
-	{ file: "MemoryReviewFire.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 10000 },
-	{ file: "MemoryHealthGate.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 8000 },
-	{ file: "DocIntegrity.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 15000 },
-	{ file: "ISARenderOnStop.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 8000 },
-	{ file: "VoiceCompletion.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", gate: "pulse", timeoutMs: 6000 },
+	{ file: "MemoryReviewFire.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", fireAndForget: true, timeoutMs: 140000, failMode: "advisory" },
+	{ file: "MemoryHealthGate.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 8000, failMode: "fail-visible-open" },
+	{ file: "DocIntegrity.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 15000, failMode: "advisory" },
+	{ file: "ISARenderOnStop.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 8000, failMode: "advisory" },
+	{ file: "VoiceCompletion.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", gate: "pulse", timeoutMs: 6000, failMode: "advisory" },
 	// StopGates = FormatGate (banner telemetry) + VerificationGate (claim-vs-evidence teeth,
 	// successor of SuccessClaimGate) + WritingGate — upstream's ONE Stop-gate hook, ungated
 	// (FormatGate is telemetry-only — it records format compliance, never blocks).
-	{ file: "StopGates.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 15000 },
+	{ file: "StopGates.hook.ts", ompEvent: "session_stop", ccEvent: "Stop", timeoutMs: 15000, failMode: "fail-visible-open" },
 	// session_shutdown (CC SessionEnd)
-	{ file: "UpdateCounts.hook.ts", ompEvent: "session_shutdown", ccEvent: "SessionEnd", timeoutMs: 15000 },
-	{ file: "WorkCompletionLearning.hook.ts", ompEvent: "session_shutdown", ccEvent: "SessionEnd", timeoutMs: 20000 },
-	{ file: "SessionCleanup.hook.ts", ompEvent: "session_shutdown", ccEvent: "SessionEnd", timeoutMs: 8000 },
+	{ file: "UpdateCounts.hook.ts", ompEvent: "session_shutdown", ccEvent: "SessionEnd", timeoutMs: 15000, failMode: "advisory" },
+	{ file: "WorkCompletionLearning.hook.ts", ompEvent: "session_shutdown", ccEvent: "SessionEnd", timeoutMs: 20000, failMode: "advisory" },
+	{ file: "SessionCleanup.hook.ts", ompEvent: "session_shutdown", ccEvent: "SessionEnd", timeoutMs: 8000, failMode: "advisory" },
 	// RelationshipMemory retired upstream (no successor in this tree).
-	{ file: "IntegrityCheck.hook.ts", ompEvent: "session_shutdown", ccEvent: "SessionEnd", timeoutMs: 10000 },
+	{ file: "IntegrityCheck.hook.ts", ompEvent: "session_shutdown", ccEvent: "SessionEnd", timeoutMs: 10000, failMode: "fail-visible-open" },
 	// Format regime: ONE unified format per the constitution (upstream 7.0.0 retired the mode
 	// system entirely). StopGates' FormatGate (above) provides banner/format telemetry.
 ];
@@ -155,16 +159,22 @@ function isLikelySubagent(): boolean {
 	);
 }
 
-let pulseUp: boolean | undefined;
-async function pulseAvailable(): Promise<boolean> {
-	if (pulseUp !== undefined) return pulseUp;
+const PULSE_NEGATIVE_TTL_MS = 2_000;
+let pulseState: { available: boolean; checkedAt: number } | undefined;
+export async function pulseAvailable(now = Date.now()): Promise<boolean> {
+	if (pulseState?.available) return true;
+	if (pulseState && now - pulseState.checkedAt < PULSE_NEGATIVE_TTL_MS) return false;
 	try {
 		const res = await fetch("http://localhost:31337/", { signal: AbortSignal.timeout(1000) });
-		pulseUp = res.status >= 200 && res.status < 400;
+		pulseState = { available: res.status >= 200 && res.status < 400, checkedAt: now };
 	} catch {
-		pulseUp = false;
+		pulseState = { available: false, checkedAt: now };
 	}
-	return pulseUp;
+	return pulseState.available;
+}
+
+export function resetPulseAvailabilityForTests(): void {
+	pulseState = undefined;
 }
 
 function parseHookJson(out: string): HookOutcome {
@@ -194,20 +204,56 @@ function parseHookJson(out: string): HookOutcome {
 	return {};
 }
 
-async function runHttpHook(spec: HookSpec, ccStdin: Record<string, unknown>): Promise<HookOutcome> {
+function timeoutFor(spec: HookSpec): number {
+	const override = Number(process.env.LIFEOS_HOOK_TIMEOUT_MS);
+	return Number.isFinite(override) && override > 0 ? override : spec.timeoutMs ?? 5000;
+}
+
+function recordDegradedHook(reason: string, ctx: ExtensionCtx): void {
+	try {
+		const directory = join(LIFEOS_DIR, "MEMORY", "OBSERVABILITY");
+		mkdirSync(directory, { recursive: true });
+		const identity = getOmpSessionIdentity(ctx, PROFILE_ROOT);
+		const row = boundedAuditRow({
+			eventId: `omp-hook-degraded-${Date.now()}`,
+			occurredAt: new Date().toISOString(),
+			decision: "advisory",
+			adapterId: "omp",
+			uaiSessionId: identity.uaiSessionId,
+			details: { reason, failVisible: true },
+		});
+		appendFileSync(join(directory, "hook-degraded.jsonl"), `${JSON.stringify(row)}\n`, "utf8");
+	} catch {
+		// The native advisory remains visible even if durable evidence cannot be written.
+	}
+}
+
+function hookFailure(spec: HookSpec, ctx: ExtensionCtx, detail: string): HookOutcome {
+	const identity = spec.file ?? spec.url ?? spec.ccEvent;
+	const reason = `LifeOS hook ${identity} failed: ${detail}`;
+	if (spec.failMode === "fail-visible-open") recordDegradedHook(reason, ctx);
+	if (spec.failMode === "fail-closed") return { block: true, reason };
+	if (spec.failMode === "fail-visible-open") {
+		ctx.ui?.notify?.(reason, "warning");
+		return { additionalContext: reason };
+	}
+	return {};
+}
+
+async function runHttpHook(spec: HookSpec, ccStdin: Record<string, unknown>, ctx: ExtensionCtx): Promise<HookOutcome> {
 	try {
 		const res = await fetch(spec.url ?? "", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(ccStdin),
-			signal: AbortSignal.timeout(spec.timeoutMs ?? 4000),
+			signal: AbortSignal.timeout(timeoutFor(spec)),
 		});
-		if (!res.ok) return {};
+		if (!res.ok) return hookFailure(spec, ctx, `HTTP ${res.status}`);
 		const out = (await res.text()).trim();
 		if (out.length === 0) return {};
 		return out.startsWith("{") ? parseHookJson(out) : { additionalContext: out };
-	} catch {
-		return {};
+	} catch (error) {
+		return hookFailure(spec, ctx, error instanceof Error ? error.message : String(error));
 	}
 }
 
@@ -222,96 +268,154 @@ export function hookEnv(ctx: Pick<ExtensionCtx, "cwd">): Record<string, string |
 	};
 }
 
-interface SpawnResult {
+export interface SpawnResult {
 	status: number | null;
 	stdout: string;
 	stderr: string;
+	timedOut: boolean;
 }
 
-/**
- * Async subprocess runner — spawnSync replacement. spawnSync blocked OMP's shared
- * event loop for the full hook duration (TUI freeze); this awaits instead, with a
- * hard timeout that SIGKILLs the child.
- */
-function spawnHook(path: string, input: string, timeoutMs: number, env: Record<string, string | undefined>): Promise<SpawnResult> {
+export interface DetachedProcessControl {
+	exited: Promise<SpawnResult>;
+}
+
+function terminateProcessTree(child: ChildProcess): void {
+	if (child.pid === undefined) return;
+	try {
+		if (process.platform === "win32") {
+			child.kill();
+			const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+			killer.unref();
+		} else if (child.spawnargs.length > 0) {
+			try {
+				process.kill(-child.pid, "SIGKILL");
+			} catch {
+				child.kill("SIGKILL");
+			}
+		} else {
+			child.kill("SIGKILL");
+		}
+	} catch {
+		// The child already exited.
+	}
+}
+
+function collectChild(
+	child: ChildProcess,
+	input: string,
+	timeoutMs: number,
+): Promise<SpawnResult> {
 	const { promise, resolve } = Promise.withResolvers<SpawnResult>();
 	let stdout = "";
 	let stderr = "";
+	let timedOut = false;
 	let settled = false;
-	try {
-		const child = spawn(BUN, [path], { env, stdio: ["pipe", "pipe", "pipe"] });
-		const timer = setTimeout(() => {
-			if (!settled) {
-				settled = true;
-				try {
-					child.kill("SIGKILL");
-				} catch {
-					/* already dead */
-				}
-				resolve({ status: null, stdout, stderr });
-			}
-		}, timeoutMs);
-		child.stdout?.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString();
-		});
-		child.stderr?.on("data", (chunk: Buffer) => {
-			stderr += chunk.toString();
-		});
-		child.on("close", (code) => {
-			if (!settled) {
-				settled = true;
-				clearTimeout(timer);
-				resolve({ status: code, stdout, stderr });
-			}
-		});
-		child.on("error", () => {
-			if (!settled) {
-				settled = true;
-				clearTimeout(timer);
-				resolve({ status: null, stdout, stderr });
-			}
-		});
-		child.stdin?.write(input);
-		child.stdin?.end();
-	} catch {
-		if (!settled) {
-			settled = true;
-			resolve({ status: null, stdout, stderr });
-		}
-	}
+	const timer = setTimeout(() => {
+		timedOut = true;
+		terminateProcessTree(child);
+	}, timeoutMs);
+	child.stdout?.on("data", (chunk: Buffer) => {
+		stdout += chunk.toString();
+	});
+	child.stderr?.on("data", (chunk: Buffer) => {
+		stderr += chunk.toString();
+	});
+	const finish = (status: number | null): void => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		resolve({ status, stdout, stderr, timedOut });
+	};
+	child.on("close", finish);
+	child.on("error", () => finish(null));
+	child.stdin?.end(input);
 	return promise;
 }
 
-async function runHook(spec: HookSpec, ccStdin: Record<string, unknown>, ctx: ExtensionCtx): Promise<HookOutcome> {
-	if (spec.gate === "pulse" && !(await pulseAvailable())) return {};
-	if (spec.url) return runHttpHook(spec, ccStdin);
-	if (!spec.file) return {};
-	const path = join(HOOKS_DIR, spec.file);
-	if (!existsSync(path)) return {};
+export function runProcessWithTimeout(
+	command: string,
+	args: string[],
+	input: string,
+	timeoutMs: number,
+	env: NodeJS.ProcessEnv,
+): Promise<SpawnResult> {
+	try {
+		const child = spawn(command, args, {
+			env,
+			stdio: ["pipe", "pipe", "pipe"],
+			detached: process.platform !== "win32",
+			windowsHide: true,
+		});
+		return collectChild(child, input, timeoutMs);
+	} catch {
+		return Promise.resolve({ status: null, stdout: "", stderr: "", timedOut: false });
+	}
+}
 
-	// CC `async: true` parity: detached fire-and-forget. Output ignored by contract —
-	// these hooks write state files / observability, never additionalContext the model needs.
+export function startDetachedProcess(
+	command: string,
+	args: string[],
+	input: string,
+	timeoutMs: number,
+	env: NodeJS.ProcessEnv,
+): DetachedProcessControl {
+	try {
+		const child = spawn(command, args, {
+			env,
+			stdio: ["pipe", "ignore", "ignore"],
+			detached: process.platform !== "win32",
+			windowsHide: true,
+		});
+		const exited = collectChild(child, input, timeoutMs);
+		return { exited };
+	} catch {
+		return { exited: Promise.resolve({ status: null, stdout: "", stderr: "", timedOut: false }) };
+	}
+}
+
+async function runHook(spec: HookSpec, ccStdin: Record<string, unknown>, ctx: ExtensionCtx): Promise<HookOutcome> {
+	if (spec.gate === "pulse" && !(await pulseAvailable())) return hookFailure(spec, ctx, "Pulse is unavailable");
+	if (spec.url) return runHttpHook(spec, ccStdin, ctx);
+	if (!spec.file) return hookFailure(spec, ctx, "hook implementation is not configured");
+	const path = join(HOOKS_DIR, spec.file);
+	if (!existsSync(path)) return hookFailure(spec, ctx, `missing hook file ${path}`);
+
+	// Detached hooks cannot block their originating event, but fail-visible-open hooks
+	// still report process failures to the active OMP UI.
 	if (spec.fireAndForget) {
-		try {
-			const child = spawn(BUN, [path], { env: hookEnv(ctx), stdio: ["pipe", "ignore", "ignore"], detached: true });
-			child.stdin?.write(JSON.stringify(ccStdin));
-			child.stdin?.end();
-			child.unref();
-		} catch {
-			/* fail-open */
-		}
+		const control = startDetachedProcess(BUN, [path], JSON.stringify(ccStdin), timeoutFor(spec), hookEnv(ctx));
+		void control.exited.then((result) => {
+			if (result.timedOut) hookFailure(spec, ctx, `timed out after ${timeoutFor(spec)}ms`);
+			else if (result.status === null) hookFailure(spec, ctx, "hook process could not be spawned");
+			else if (result.status !== 0) hookFailure(spec, ctx, `hook process exited ${result.status}`);
+		});
 		return {};
 	}
 
-	const res = await spawnHook(path, JSON.stringify(ccStdin), spec.timeoutMs ?? 5000, hookEnv(ctx));
+	const res = await runProcessWithTimeout(BUN, [path], JSON.stringify(ccStdin), timeoutFor(spec), hookEnv(ctx));
+	if (res.timedOut) return hookFailure(spec, ctx, `timed out after ${timeoutFor(spec)}ms`);
+	if (res.status === null) return hookFailure(spec, ctx, "hook process could not be spawned");
 	if (res.status === 2) return { block: true, reason: res.stderr.trim() || "blocked by LifeOS guard" };
+	if (res.status !== 0) return hookFailure(spec, ctx, `hook process exited ${res.status}${res.stderr.trim() ? `: ${res.stderr.trim()}` : ""}`);
 	const out = res.stdout.trim();
 	if (out.length === 0) return {};
 	return out.startsWith("{") ? parseHookJson(out) : { additionalContext: out };
 }
 
 function buildStdin(spec: HookSpec, extra: Record<string, unknown>, ctx: ExtensionCtx): Record<string, unknown> {
-	return { hook_event_name: spec.ccEvent, session_id: "omp", cwd: ctx.cwd ?? process.cwd(), ...extra };
+	const identity = getOmpSessionIdentity(ctx, PROFILE_ROOT);
+	return {
+		hook_event_name: spec.ccEvent,
+		session_id: identity.uaiSessionId,
+		uai_session_id: identity.uaiSessionId,
+		native_session_id: identity.nativeSessionId,
+		uai_profile_root: identity.profileRoot,
+		cwd: ctx.cwd ?? process.cwd(),
+		...extra,
+	};
 }
 
 function readField(value: unknown, key: string): unknown {
@@ -390,9 +494,11 @@ export default function lifeosHooks(pi: ExtensionApi): void {
 		try {
 			const chunks: string[] = [];
 			for (const spec of MANIFEST.filter((s) => s.ompEvent === "before_agent_start")) {
-				if (spec.once && spec.file && firedOnce.has(spec.file)) continue;
+				const identity = getOmpSessionIdentity(ctx, PROFILE_ROOT);
+				const onceKey = spec.file ? `${identity.uaiSessionId}:${spec.file}` : "";
+				if (spec.once && onceKey !== "" && firedOnce.has(onceKey)) continue;
 				const outcome = await runHook(spec, buildStdin(spec, { prompt }, ctx), ctx);
-				if (spec.once && spec.file) firedOnce.add(spec.file);
+				if (spec.once && onceKey !== "") firedOnce.add(onceKey);
 				if (outcome.additionalContext) chunks.push(outcome.additionalContext);
 			}
 			if (chunks.length === 0) return undefined;

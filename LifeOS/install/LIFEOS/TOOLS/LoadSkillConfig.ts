@@ -17,7 +17,6 @@
 import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
 import { homedir } from 'os';
-import { parse as parseYaml } from 'yaml';
 
 // Types
 interface CustomizationMetadata {
@@ -120,7 +119,7 @@ function loadExtendManifest(skillName: string): ExtendManifest | null {
 
   try {
     const content = readFileSync(manifestPath, 'utf-8');
-    const manifest = parseYaml(content) as ExtendManifest;
+    const manifest = Bun.YAML.parse(content) as ExtendManifest;
 
     // Validate required fields
     if (!manifest.skill || !manifest.extends) {

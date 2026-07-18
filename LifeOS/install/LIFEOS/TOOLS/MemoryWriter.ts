@@ -35,6 +35,7 @@
  *   bun MemoryWriter.ts test    (runs built-in smoke test)
  */
 
+import { randomUUID } from "node:crypto";
 import {
   appendFileSync,
   closeSync,
@@ -369,24 +370,24 @@ function snapshotBeforeWrite(absPath: string, priorContent: string): void {
 }
 
 function atomicWrite(filePath: string, content: string): true | SetEntriesErrIO {
-  const tmpPath = `${filePath}.tmp`;
+  const tmpPath = pathResolve(dirname(filePath), `.${randomUUID()}.uai-tmp`);
+  let descriptor: number | undefined;
   try {
-    writeFileSync(tmpPath, content, "utf8");
-    // fsync the tmp file for durability before rename
-    const fd = openSync(tmpPath, "r+");
-    try {
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
+    descriptor = openSync(tmpPath, "wx", 0o600);
+    writeFileSync(descriptor, content, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
     renameSync(tmpPath, filePath);
     return true;
-  } catch (e: any) {
-    try { unlinkSync(tmpPath); } catch { /* ignore */ }
+  } catch (error: unknown) {
+    if (descriptor !== undefined) try { closeSync(descriptor); } catch { /* ignore */ }
+    try { unlinkSync(tmpPath); } catch { /* only our temporary */ }
+    const message = error instanceof Error ? error.message : String(error);
     return {
       ok: false,
       code: "EWRITE_FAILED",
-      message: `Atomic write failed: ${e?.message || String(e)}`,
+      message: `Atomic write failed: ${message}`,
     };
   }
 }

@@ -1,13 +1,13 @@
 # LifeOS ↔ OMP (Oh My Pi) Integration
 
-Runs LifeOS inside the [Oh My Pi](https://github.com/) harness (`omp`) using OMP's native
-extensibility, so a LifeOS install governs OMP sessions the way it governs Claude Code —
-without forking either system. LifeOS is harness-agnostic by design; this is a concrete
-second-harness adapter built on OMP's public extension API.
+Adds LifeOS surfaces to the [Oh My Pi](https://github.com/) harness (`omp`)
+through OMP's public extension API without forking either system. This is an
+additive adapter: checked-in fixtures prove isolated wiring and loadability,
+not Claude parity or live C3 enforcement.
 
-No Claude CLI, Anthropic account, or Claude subscription is required. The historical
-`~/.claude` directory is LifeOS's shared configuration root; it is a storage path, not a
-runtime dependency on Claude.
+No Claude CLI, Anthropic account, or Claude subscription is required. The deployed
+LifeOS source may live under a selected harness configuration root, while canonical
+durable USER/MEMORY data defaults to `~/.pai` and honors `UAI_DATA_DIR`/`PAI_DATA_DIR`.
 
 ## What it provides
 
@@ -15,28 +15,38 @@ runtime dependency on Claude.
 |---|---|
 | **Constitution** | `APPEND_SYSTEM.md` → `~/.omp/agent/APPEND_SYSTEM.md` symlink. One unified response format (upstream 7.0.0 retired the mode system). For byte-exact stock behavior, point the symlink at the deployed `LIFEOS/LIFEOS_SYSTEM_PROMPT.md`. |
 | **Memory** | `extensions/lifeos-memory` — injects the hot-layer `<pai-memory>` block + prompt-keyed KNOWLEDGE retrieval each turn (ports `LoadMemory` + `MemoryRetriever`). |
-| **Safety** | `extensions/lifeos-safety` — native in-process port of `Safety.hook.ts`: blocks dangerous-shape/injection/credential tool calls, tags external content as data. |
-| **Hook adapter** | `extensions/lifeos-hooks` — runs the *real* LifeOS Claude Code hooks against mapped OMP events (CC stdin/stdout protocol) with a `CLAUDE_*` env shim, tool-name mapping, and Pulse-availability gating. |
-| **Observability** | `extensions/lifeos-observability` — native ToolActivityTracker + ToolFailureTracker (CC jsonl schemas, so Pulse reads both harnesses), a compact statusline (`setStatus`) with a session-scoped depth indicator (`DIRECT` or `ALGO <phase> <effort>`), and the **full LifeOS statusline panel**: runs the real `LIFEOS_StatusLine.sh` with synthesized CC-shape stdin (model/context/harness from live OMP ctx) and renders it as a TUI widget below the editor each turn. Single-sourced — it IS the CC statusline, so it can never drift. `/statusline on\|off\|refresh`; separators distilled to fit the 10-line widget cap. |
-| **Commands** | `extensions/lifeos-commands` — `/e1`–`/e5` (native `setThinkingLevel`), `/interview`, `/cs`, `/context-search`, `/pu`. |
+| **Safety** | `extensions/lifeos-safety` — in-process OMP safety policy for mapped tool calls. Its wiring is bounded-load tested; behavioral certification still requires trusted live evidence. |
+| **Hook adapter** | `extensions/lifeos-hooks` — runs selected shared LifeOS hooks against mapped OMP events with a CC-shape stdin/stdout adapter, tool-name mapping, deadlines, and Pulse degradation reporting. |
+| **Observability** | `extensions/lifeos-observability` — additive tool/failure audit rows and compact OMP status. The Bash panel runs only where Bash is available; Windows and headless sessions emit a visible advisory plus durable degraded evidence instead of claiming a panel. |
+| **Commands** | `extensions/lifeos-commands` — compatible `/e1`–`/e5`, `/interview`, `/cs`, `/context-search`, and `/pu` surfaces where OMP exposes the required API. |
 
 Identity, TELOS, skills, and MCP servers already flow into OMP via its `claude` discovery
 provider. That provider only reads compatible local files; it does not invoke or authenticate
 the Claude CLI. This subsystem supplies the constitution, hooks, and memory injection.
 
-Full per-hook accounting — what is ported, what is not, why, and what makes this full possible parity: [PARITY.md](./PARITY.md).
+Per-hook accounting, including unsupported gaps, is documented in [PARITY.md](./PARITY.md). The filename is historical; it is not a parity claim.
 
 ## Install / uninstall
 
+Deploy the current LifeOS runtime and approved hook set first. The OMP manager
+refuses a core-only/partial source before touching the selected OMP profile.
+
 ```bash
-LIFEOS/OMP/install.sh      # wire into ~/.omp/agent (idempotent, YAML-safe, backs up config)
-LIFEOS/OMP/uninstall.sh    # remove wiring; leaves this tree + tool patches (harmless)
-bun LIFEOS/OMP/manage.ts status   # what's wired
+bun LIFEOS/OMP/manage.ts install
+bun LIFEOS/OMP/manage.ts status
+bun LIFEOS/OMP/manage.ts uninstall
 ```
 
-Respects `PI_CODING_AGENT_DIR` (works under `omp --profile`). Reversal removes the five
-`extensions:` entries from `config.yml` and the `APPEND_SYSTEM.md` symlink (plus any legacy
-mode-system marker left by a pre-7.x install).
+The TypeScript manager runs without an implicit Bash dependency and respects
+`PI_CODING_AGENT_DIR`. Installation parses YAML, performs bounded extension and
+hook load probes, writes through the ownership-aware lifecycle, and uses a
+constitution link or copy fallback. Uninstall removes only unchanged owned
+entries; conflicts retain ownership metadata for retry.
+
+`status` reports wiring and source loadability. The repository fixture suite
+keeps certification at C0; copied files and fixture probes never mean a control
+is live or C3-enforced.
+
 Inference backend: `bun LIFEOS/OMP/manage.ts inference default|claude|omp|auto|status`.
 With no override, OMP hook subprocesses automatically use bare `omp` on **OMP's own default
 model/auth**, so a fresh OMP user gets the complete intelligence layer without Claude.
@@ -59,8 +69,9 @@ the adapter continues a turn ONLY on an explicit `decision:block`. Hooks with no
 
 ## Three additive tool patches (harness-agnostic, CC-safe)
 
-- `LIFEOS/TOOLS/MemoryReviewer.ts` — `findMostRecentTranscript()` also scans
-  `~/.omp/agent/sessions`, so the autonomic memory loop reviews OMP sessions.
+- `LIFEOS/TOOLS/MemoryReviewer.ts` — reviews the Stop hook's exact
+  `transcript_path`; only a caller with no explicit input falls back to the
+  newest transcript across Claude and OMP stores.
 - `LIFEOS/TOOLS/TranscriptParser.ts` — `textMessageFromEntry()`/`isRealUserPrompt()` read OMP's
   nested `type:"message"` `{ message: { role, content } }` line shape alongside Claude Code's
   `type:"assistant"`, Codex's `response_item`, and OpenCode's top-level `type:"message"`.

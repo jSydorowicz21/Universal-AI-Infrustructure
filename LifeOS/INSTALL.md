@@ -6,21 +6,16 @@ LifeOS is AI-native, so the install is too. You hand this file (or its link) to 
 
 ---
 
-## For you (the human) — 10 seconds
+## For the human
 
-Paste this to your AI — Claude Code, Cursor, Cline, Codex, Gemini CLI, or any coding assistant that can read files and run commands:
+Give this checked-out file to an AI assistant with filesystem and command access:
 
-> **Read https://ourlifeos.ai/install and install LifeOS for me.**
+> **Read `LifeOS/INSTALL.md` from this checkout and install this LifeOS/UAI runtime for me.**
 
-That's the primary path. Your AI reads the rest of this page and installs LifeOS for you.
-
-Prefer a terminal? There's a shell shortcut for Claude Code on macOS/Linux:
-
-```
-curl -fsSL https://ourlifeos.ai/install.sh | bash
-```
-
-Everything below is written for the AI doing the install.
+There is no hosted UAI one-line installer. The upstream `ourlifeos.ai` script and
+the retired `Releases/v5.0.0` bundle do not deploy this repository's current
+runtime or OMP integration. Clone the current repository and use the Bun tools
+below on macOS, Linux, or native Windows.
 
 ---
 
@@ -43,15 +38,16 @@ Do not begin a partial install you can't finish.
   - Windows: `powershell -c "irm bun.sh/install.ps1 | iex"`
 - **git** and a network connection, to fetch the release. (Or use a local release directory if your human already has one.)
 
-### 2. Get the release and detect the environment
+### 2. Get the current checkout and detect the environment
 
-Fetch the pinned LifeOS release for the repo and version on the install page (the tag tarball over HTTPS, no auth), or use a local release directory if given one. Then, from the LifeOS skill directory, run:
+Clone the current UAI repository (or use the local checkout your human supplied).
+From its `LifeOS/` directory, run:
 
 ```
 bun Tools/DetectEnv.ts
 ```
 
-Read its output. It reports the OS (macOS / Linux / Windows), the harness (Claude Code / Cursor / Cline / Codex / Gemini / other), the config root, and whether LifeOS is already present. **Every path below comes from this — don't assume `~/.claude` or any single harness.**
+Read its output. It reports the OS (macOS / Linux / Windows), the detected harness (Claude Code / OMP / Codex / OpenCode / Hermes / Cursor / OpenClaw, or unknown), the config root, and whether LifeOS is already present. Unsupported adapters remain adapter-dependent. **Every path below comes from this — don't assume `~/.claude` or any single harness.**
 
 ### 3. Scan for conflicts (read-only)
 
@@ -61,33 +57,55 @@ bun Tools/ScanConflicts.ts
 
 Surfaces anything already sitting in the target directories. Show your human. Nothing has changed yet.
 
-### 4. Drop the skill and runtime (additive)
+### 4. Deploy the skill, runtime, settings, and USER scaffold
+
+Use the config root reported by `DetectEnv`; never infer one from the current
+shell. Preview first, then rerun with `--apply` after permission:
 
 ```
-bun Tools/DeployCore.ts
+bun Tools/DeployCore.ts --skill-root . --config-root <configRoot>
+bun Tools/DeployCore.ts --skill-root . --config-root <configRoot> --apply
+bun Tools/InstallSettings.ts --skill-root . --config-root <configRoot>
+bun Tools/InstallSettings.ts --skill-root . --config-root <configRoot> --apply
+bun Tools/ScaffoldUser.ts --skill-root . --config-root <configRoot> --config-dir <dataRoot>
+bun Tools/ScaffoldUser.ts --skill-root . --config-root <configRoot> --config-dir <dataRoot> --apply
+bun Tools/LinkUser.ts --config-root <configRoot> --config-dir <dataRoot>
+bun Tools/LinkUser.ts --config-root <configRoot> --config-dir <dataRoot> --apply
 ```
 
-Copies the LifeOS skill and runtime into the harness's config tree. Existing files are never overwritten — only missing ones are added.
+PowerShell uses the same preview/apply sequence; quote concrete paths rather
+than angle-bracket placeholders:
 
-### 5. Scaffold the personal (USER) tree
-
+```powershell
+$configRoot = Join-Path $env:USERPROFILE ".claude"
+$dataRoot = Join-Path $env:USERPROFILE ".pai"
+bun .\Tools\ScaffoldUser.ts --skill-root . --config-root $configRoot --config-dir $dataRoot
+bun .\Tools\ScaffoldUser.ts --skill-root . --config-root $configRoot --config-dir $dataRoot --apply
+bun .\Tools\LinkUser.ts --config-root $configRoot --config-dir $dataRoot
+bun .\Tools\LinkUser.ts --config-root $configRoot --config-dir $dataRoot --apply
 ```
-bun Tools/ScaffoldUser.ts
-bun Tools/LinkUser.ts
-```
 
-Creates the personal config tree from templates and links it in. This is empty structure — no personal content yet. That comes in the interview.
+`<dataRoot>` defaults to `~/.pai`; `UAI_DATA_DIR` and `PAI_DATA_DIR` are
+compatible overrides. Existing files are preserved. Invalid JSON or an
+incomplete payload blocks before mutation.
 
 ### 6. Wire the integration — HARNESS-SPECIFIC, WITH PERMISSION
 
 This is the one place harnesses genuinely differ. Show the exact change and get a yes.
 
-- **Claude Code** — run `bun Tools/InstallHooks.ts` (merges the hook set into `settings.json`, backing it up first) and `bun Tools/ActivateImports.ts` (turns on the identity context imports). This is what lights up the always-on behavior: the LifeOS response format, the memory loop, and per-turn context injection.
+- **Claude Code** — preview `bun Tools/InstallHooks.ts --skill-root . --config-root <configRoot>`, then rerun with `--apply` only after approval. It stages and verifies the approved hook tree before atomically merging `settings.json`. Run `bun Tools/ActivateImports.ts` only after its own preview and approval.
 
-- **Any other harness (Cursor / Cline / Codex / Gemini / other)** — LifeOS's always-on behavior is enforced by Claude Code *hooks*, which are a Claude Code mechanism. They don't auto-wire on other harnesses **yet**. So instead:
-  1. Write an `AGENTS.md` (or the harness's own context file — e.g. `.cursor/rules`) that points the harness at the LifeOS tree, so it loads the LifeOS context every session.
-  2. Tell your human, plainly and honestly: *"On <harness>, the always-on hooks aren't wired yet. You get the skill, your USER data, Pulse, and context loading every session, and you run Setup and Interview on request. Full always-on behavior is on the roadmap for this harness."*
-  3. **Do not** write Claude hook files or a Claude `settings.json` `hooks` block into a non-Claude harness — it would sit there inert and do nothing.
+- **OMP** — first complete the full hook deployment above, because the OMP
+  adapter executes the canonical shared hooks and classifier. Then run:
+  `bun <configRoot>/LIFEOS/OMP/manage.ts install` and
+  `bun <configRoot>/LIFEOS/OMP/manage.ts status`. Installation fails before
+  profile mutation when any dependency is absent. `wired`/`loadable` are not
+  certification; the repository fixture gate remains C0.
+
+- **Other harnesses without a certified adapter** — install only the compatible
+  context/tool surfaces the harness can actually load. Do not write Claude hook
+  configuration into another harness and do not claim always-on parity from
+  file presence. Report unsupported capabilities explicitly.
 
 ### 7. Wire the launch command — HOW LifeOS actually turns on (WITH PERMISSION)
 
@@ -154,12 +172,15 @@ Run the **Setup** workflow (`Workflows/Setup.md`) to finish integration and veri
 
 | Harness / OS | Skill + USER data + Pulse | Always-on behavior (response format, memory loop, context injection) |
 |---|---|---|
-| **Claude Code — macOS / Linux** | ✅ | ✅ full (native hooks) |
-| **Claude Code — Windows** | ✅ (copy fallback where symlinks need admin) | ✅ full |
-| **Cursor / Cline / Codex / Gemini / other** | ✅ | ⚠️ context loads every session via `AGENTS.md`; workflows run on request; always-on hooks not wired yet (roadmap) |
-| **Chat-only assistants (no files / no commands)** | ❌ | ❌ — install stops at the capability gate |
+| **Claude Code — macOS / Linux** | ✅ additive install | Hook behavior depends on successful bounded load probes and the selected profile |
+| **Claude Code — Windows** | ✅ additive install (copy fallback where links need privilege) | Hook behavior depends on successful bounded load probes and the selected profile |
+| **OMP** | ✅ additive wiring | Isolated gates prove wired/loadable behavior; live C3 is unavailable |
+| **Cursor / Cline / Codex / Gemini / other** | Adapter-dependent | Compatible context can be additive; always-on controls are unsupported unless executable evidence says otherwise |
+| **Chat-only assistants (no files / no commands)** | ❌ | Unsupported — installation stops at the capability gate |
 
-Full-doctrine features additionally depend on the external tools in step 8.5 (codex, browser, Cloudflare, ElevenLabs). Without one, the dependent feature runs degraded **and says so** — it never silently pretends. The Doctor table is the live source of truth for what's on.
+Doctrine features may also depend on external tools from step 8.5. Missing
+tools are reported as degraded or unsupported; file presence is never treated
+as behavioral certification.
 
 ## Rules you must follow
 

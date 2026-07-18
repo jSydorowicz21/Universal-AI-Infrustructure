@@ -1,6 +1,6 @@
 > ## 🍴 Universal AI Infrastructure (UAI)
 >
-> **UAI is a community fork of [Personal AI Infrastructure (PAI)](https://github.com/danielmiessler/Personal_AI_Infrastructure), created by [Daniel Miessler](https://danielmiessler.com).** The architecture, the Algorithm, Pulse, the skill and memory systems, and the overwhelming majority of the code are Daniel's work — all foundational credit belongs to him and the PAI community. This fork extends PAI toward cross-CLI feature parity (Claude Code + Codex).
+> **UAI is a community fork of [Personal AI Infrastructure (PAI)](https://github.com/danielmiessler/Personal_AI_Infrastructure), created by [Daniel Miessler](https://danielmiessler.com).** The architecture, the Algorithm, Pulse, the skill and memory systems, and the overwhelming majority of the code are Daniel's work — all foundational credit belongs to him and the PAI community. This fork adds explicit cross-CLI adapter and capability boundaries (Claude Code + Codex).
 >
 > UAI is **not affiliated with, sponsored by, or endorsed by** Daniel Miessler. Licensed under MIT (Daniel's original copyright preserved — see [LICENSE](LICENSE)). Upstream: https://github.com/danielmiessler/Personal_AI_Infrastructure
 
@@ -75,8 +75,8 @@
 **Universal AI Infrastructure (UAI)** is a community fork of **[Personal AI Infrastructure (PAI)](https://github.com/danielmiessler/Personal_AI_Infrastructure)**, originally created by **[Daniel Miessler](https://danielmiessler.com)**.
 
 - **Original author & credit:** PAI — its architecture, the Algorithm, Pulse, the skill/memory systems, and nearly all of the code — is the work of Daniel Miessler and the PAI community. All credit for the foundation belongs to them.
-- **Why this fork exists:** UAI focuses on bringing the full PAI ecosystem to feature parity across multiple agent CLIs — Claude Code, Codex, and [OMP (Oh My Pi)](LifeOS/install/LIFEOS/OMP/README.md) — so the same Life OS works behind any of them.
-- **OMP harness:** fully wired via `LifeOS/install/LIFEOS/OMP/` — constitution injection, a CC-hook-protocol adapter running the real hooks against mapped OMP events, memory injection + retrieval, native safety, observability with a session-scoped `DIRECT` / `ALGO <phase> <effort>` depth indicator, slash commands, and a Claude-free-by-default, model-agnostic inference backend (`manage.ts inference default|claude|omp|auto`) so no Claude account or subscription is required and the intelligence layer runs on whatever model/auth OMP holds. **Order matters:** install LifeOS to `~/.claude` first (the adapter runs the *installed* hooks/tools, not the repo checkout's), then wire OMP from the installed tree: `~/.claude/LIFEOS/OMP/install.sh` · verify: `bun ~/.claude/LIFEOS/OMP/manage.ts status` · full docs + parity accounting: [README](LifeOS/install/LIFEOS/OMP/README.md) / [PARITY.md](LifeOS/install/LIFEOS/OMP/PARITY.md).
+- **Why this fork exists:** UAI is incrementally adapting PAI across Claude Code, Codex, OpenCode, and [OMP (Oh My Pi)](LifeOS/install/LIFEOS/OMP/README.md). Adapter discovery and compatible context surfaces are broader than behavioral certification; unsupported surfaces remain explicit.
+- **OMP harness:** `LifeOS/install/LIFEOS/OMP/` provides additive constitution, hook-adapter, memory, safety, observability, command, and inference wiring. The checked-in gate proves install/status/uninstall and bounded load probes in isolated profiles. Current status is **wired/loadable, C0 without live evidence**; it is not a claim of Claude parity, native C3 enforcement, or production activity.
 - **License:** MIT, unchanged. Daniel's original copyright notice is preserved in [LICENSE](LICENSE), exactly as MIT requires.
 - **Not official:** UAI is an independent fork and is **not affiliated with, sponsored by, or endorsed by** Daniel Miessler. For the canonical project, see the [upstream repository](https://github.com/danielmiessler/Personal_AI_Infrastructure).
 
@@ -185,139 +185,86 @@ A meaningful library of custom thinking skills — first principles, council deb
 ## 🚀 Installation
 
 > [!CAUTION]
-> **Project in Active Development** — PAI is evolving rapidly. Expect breaking changes, restructuring, and frequent updates.
+> **Project Under Development** — PAI is evolving rapidly. Expect breaking changes, restructuring, and frequent updates.
 
 ### Use your AI to install and run PAI
 
 We very much believe in AI-based installation and modification of PAI. Once you have a working install, point your AI at the system itself — upgrade versions, add skills, modify hooks, change settings, repair anything that breaks. The most important thing your AI can do for you up front is bring all of your existing custom context — notes, project state, preferences, identity, history — into the `PAI/USER/` directory so PAI knows who you are from day one. Tell your DA: *"Help me migrate my context into PAI/USER/."* The system was designed to be operated by AI; lean on it.
 
-### Install (clone + run)
+### Install the current LifeOS runtime
 
-UAI has no hosted one-line installer of its own — clone this repo and run the bundled installer.
-
-> **Note:** the `Releases/` bundle was retired from `main` when the upstream LifeOS restructure
-> was merged (upstream moved to GitHub Releases; the new installer lives at `LifeOS/`). The UAI
-> installer flow below still works — check out the pinned pre-restructure commit first. Porting
-> the installer to the new layout is tracked as Phase-2 work.
+Clone the current branch and run the Bun installer tools from `LifeOS/`. Do **not**
+check out the retired `Releases/v5.0.0` bundle: it predates this LifeOS runtime and
+does not deploy the OMP adapter in this repository.
 
 ```bash
 git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git
-cd Universal-AI-Infrustructure
-git checkout 68f501b2   # last commit carrying the Releases/v5.0.0 bundle
-cd Releases/v5.0.0
-cp -R .claude ~/ && cd ~/.claude && ./install.sh
+cd Universal-AI-Infrustructure/LifeOS
+bun Tools/DetectEnv.ts
+bun Tools/DeployCore.ts --skill-root . --config-root "$HOME/.claude" --apply
+bun Tools/InstallSettings.ts --skill-root . --config-root "$HOME/.claude" --apply
+bun Tools/ScaffoldUser.ts --skill-root . --config-root "$HOME/.claude" --config-dir "$HOME/.pai" --apply
+bun Tools/LinkUser.ts --config-root "$HOME/.claude" --config-dir "$HOME/.pai"
+bun Tools/LinkUser.ts --config-root "$HOME/.claude" --config-dir "$HOME/.pai" --apply
 ```
 
-Windows PowerShell from the cloned release bundle:
+Review the proposed hook changes before granting the trust-gated approved-hook install:
+
+```bash
+bun Tools/InstallHooks.ts --skill-root . --config-root "$HOME/.claude"
+bun Tools/InstallHooks.ts --skill-root . --config-root "$HOME/.claude" --apply
+```
+
+Windows PowerShell uses the same TypeScript tools without Bash:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\.claude\install.ps1
+git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git
+Set-Location .\Universal-AI-Infrustructure\LifeOS
+$root = Join-Path $env:USERPROFILE ".claude"
+bun .\Tools\DetectEnv.ts
+bun .\Tools\DeployCore.ts --skill-root . --config-root $root --apply
+bun .\Tools\InstallSettings.ts --skill-root . --config-root $root --apply
+bun .\Tools\ScaffoldUser.ts --skill-root . --config-root $root --config-dir (Join-Path $env:USERPROFILE ".pai") --apply
+bun .\Tools\LinkUser.ts --config-root $root --config-dir (Join-Path $env:USERPROFILE ".pai")
+bun .\Tools\LinkUser.ts --config-root $root --config-dir (Join-Path $env:USERPROFILE ".pai") --apply
+bun .\Tools\InstallHooks.ts --skill-root . --config-root $root
+# After reviewing the dry-run:
+bun .\Tools\InstallHooks.ts --skill-root . --config-root $root --apply
+bun (Join-Path $root "LIFEOS\OMP\manage.ts") install
+bun (Join-Path $root "LIFEOS\OMP\manage.ts") status
 ```
 
-That's it. The installer wizard handles Bun, Git, framework selection, agent CLI verification, ElevenLabs key (optional), DA identity setup, voice picker, Pulse launchd registration, and validation. You can target Claude Code, Codex, or OpenCode. The selected framework home is auto-backed-up before anything is overwritten.
+To add OMP wiring after the runtime and approved hook set are present:
 
-> **Note:** Upstream PAI offers a hosted one-liner (`curl -sSL https://ourpai.ai/install.sh | bash`) that installs the **original PAI**, not this fork. Always inspect `Releases/v5.0.0/.claude/install.sh` in your clone before running it.
+```bash
+bun "$HOME/.claude/LIFEOS/OMP/manage.ts" install
+bun "$HOME/.claude/LIFEOS/OMP/manage.ts" status
+```
 
-After install, or any time startup reports a PAI self-check warning, run `k doctor` for AV-safe local diagnostics across the active framework config, hooks/plugins, Pulse, and MCP profiles. Use `k doctor --smoke` for static source smoke checks, or `k doctor --deep` when you intentionally want child/session/install probes.
+`status` distinguishes installed/wired/loadable from certified behavior. The
+repository fixture gate does not produce live C3 evidence.
+Missing hooks, classifiers, parsers, or extension manifests block installation
+before profile mutation. See [`LifeOS/INSTALL.md`](LifeOS/INSTALL.md) for the
+permission gates, component choices, verification, and rollback flow.
+
+After install, or any time startup reports a PAI self-check warning, run `k doctor` for AV-safe local diagnostics across the selected framework config, hooks/plugins, Pulse, and MCP profiles. Use `k doctor --smoke` for static source smoke checks, or `k doctor --deep` when you intentionally want child/session/install probes.
 
 ### Update an existing install
 
-For small fixes after PAI is already installed, use the hotfix updater instead of re-running the full installer. It fetches the release bundle, reads `hotfix-manifest.json`, backs up touched files under `~/.pai/BACKUPS/`, and overlays only managed PAI files. It does not overwrite `USER`, `MEMORY`, auth, env files, framework config, or hook trust state.
+The retired `Releases/v5.0.0` hotfix scripts do not update the current LifeOS
+layout and must not be used. Until a journaled current-layout updater ships,
+install a fresh checkout into an isolated staging profile, run the focused
+verification, and then use the ownership-aware adapter uninstall/install flow.
+Back up the harness configuration root first; durable USER/MEMORY data under
+`~/.pai` is retained.
 
-From a cloned checkout (at the pinned `68f501b2` commit — see the install note above):
+### Migrate an existing PAI install
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\Releases\v5.0.0\.claude\update-installed.ps1 -Framework codex -SourceDir . -NoPull
-```
-
-macOS/Linux/WSL:
-
-```bash
-bash ./Releases/v5.0.0/.claude/update-installed.sh --framework codex --source-dir . --no-pull
-```
-
-From a machine that already has PAI installed but no checkout: clone at the pinned commit and run
-the bundled updater from it. (The updater's standalone raw-URL mode defaulted to the
-`pai-codex-flawless-runtime` branch, which no longer exists on origin — so always pass a
-`--source-dir` that points at the pinned checkout.)
-
-```powershell
-git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git; cd Universal-AI-Infrustructure
-git checkout 68f501b2
-powershell -NoProfile -ExecutionPolicy Bypass -File .\Releases\v5.0.0\.claude\update-installed.ps1 -Framework codex -SourceDir . -NoPull
-```
-
-macOS/Linux/WSL:
-
-```bash
-git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git && cd Universal-AI-Infrustructure
-git checkout 68f501b2
-bash ./Releases/v5.0.0/.claude/update-installed.sh --framework codex --source-dir . --no-pull
-```
-
-Use `-Framework claude` or `-Framework opencode` for those targets, or omit `-Framework` to let the updater read `~/.pai/framework.json`.
-
-Use `--framework claude` or `--framework opencode` with the shell updater. When the source directory points at a git checkout, the updater runs `git fetch --prune` and `git pull --ff-only` before copying files. Pass `-NoPull` in PowerShell or `--no-pull` in Bash when testing uncommitted local changes.
-
-Rollback restores the files touched by the hotfix from the newest backup:
-
-```bash
-BACKUP="$(ls -dt ~/.pai/BACKUPS/hotfix-* | head -1)"
-cp -a "$BACKUP"/. "$CODEX_HOME"/
-```
-
-PowerShell:
-
-```powershell
-$backup = Get-ChildItem "$HOME\.pai\BACKUPS" -Directory -Filter "hotfix-*" | Sort-Object Name -Descending | Select-Object -First 1
-Get-ChildItem -LiteralPath $backup.FullName -Force | Copy-Item -Destination $env:CODEX_HOME -Recurse -Force
-```
-
-### Convert an existing PAI install to UAI
-
-Already running upstream PAI and want to switch it to UAI? Clone this repo and run the converter — a thin wrapper over the hotfix updater that overlays UAI's managed files onto the framework install recorded in `~/.pai/framework.json` and writes a `~/.pai/distribution.json` marker. It preserves `USER`, `MEMORY`, settings, config, auth, env files, and hook trust state.
-
-```bash
-git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git
-cd Universal-AI-Infrustructure
-git checkout 68f501b2   # last commit carrying the Releases/v5.0.0 bundle
-cd Releases/v5.0.0/.claude
-bash ./convert-to-uai.sh            # --dry-run to preview (skip --fetch: it would pull past the bundle)
-```
-
-Windows PowerShell:
-
-```powershell
-cd Universal-AI-Infrustructure
-git checkout 68f501b2
-cd Releases\v5.0.0\.claude
-powershell -ExecutionPolicy Bypass -File .\convert-to-uai.ps1   # -DryRun to preview (skip -Fetch)
-```
-
-Restart your agent session afterward so instructions reload.
-
-### Manual install (clone + run)
-
-```bash
-git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git
-cd Universal-AI-Infrustructure
-git checkout 68f501b2   # last commit carrying the Releases/v5.0.0 bundle
-cd Releases/v5.0.0
-cp -R .claude ~/
-cd ~/.claude && ./install.sh
-```
-
-On Windows, run `.\.claude\install.ps1` from `Releases\v5.0.0` instead of `install.sh`.
-
-**The installer will:**
-- Ask which agent framework to target: Claude Code, Codex, or OpenCode
-- Verify Bun, Git, and the selected agent CLI are installed
-- Generate native framework files: `CLAUDE.md`/`settings.json`, Codex `AGENTS.md`/`config.toml`/`hooks.json`, or OpenCode `AGENTS.md`/`opencode.json` plus the PAI plugin
-- Link memory and USER context through `~/.pai/` so state survives framework switches
-- Prompt for your ElevenLabs API key (skippable — voice falls back to desktop notifications)
-- Launch the DA identity wizard (name + voice + personality)
-- Set up Pulse as a launchd service (`com.pai.pulse`)
-- Run validation
+The retired release converter is not compatible with the current LifeOS layout.
+Do not run it against an existing profile. Preserve the current harness root and
+`~/.pai`, deploy this checkout into a separate staging root with the current Bun
+commands above, and compare the dry-run/verification output before switching.
+UAI installation is additive; USER and MEMORY remain durable under `~/.pai`.
 
 ### After install
 
@@ -336,18 +283,11 @@ This is the most important step. **Without TELOS, your DA has nothing to optimiz
 
 ### Switching agent frameworks
 
-PAI can switch the active CLI after setup while keeping the same memory store:
-
-```bash
-pai framework status
-pai framework switch codex
-pai framework switch claude
-pai framework switch opencode
-```
-
-Framework switching changes which CLI `pai` launches and regenerates that framework's native config. PAI memory and USER context remain under `~/.pai/MEMORY` and `~/.pai/USER`.
-
-MCP profile selection also follows the active framework: `pai -m ...` and `pai mcp set ...` keep Claude on `.mcp.json`, project MCP servers into Codex `config.toml`, and project them into OpenCode `opencode.json`.
+This repository does not yet ship a packaged `pai framework switch` or
+`pai mcp` launcher. Select the target harness explicitly during installation
+and use that harness's own configuration. Durable USER data can be shared
+through the documented root/link contract, but configuration projection and
+framework switching are not advertised until a launcher is packaged and tested.
 
 ### Upgrading from v4.x
 

@@ -12,11 +12,13 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { parse as parseYaml } from 'yaml';
 import { loadLifeosConfig } from '../../LIFEOS/TOOLS/LifeosConfig';
+import { resolveConfigRoot, resolveDataRoot, resolveLifeosRoot } from '../../LIFEOS/UNIVERSAL/platform';
 
-const HOME = process.env.HOME!;
-const SETTINGS_PATH = join(HOME, '.claude/settings.json');
+const CONFIG_ROOT = resolveConfigRoot(process.env, 'claude');
+const DATA_ROOT = resolveDataRoot(process.env);
+const LIFEOS_ROOT = resolveLifeosRoot(process.env, 'claude');
+const SETTINGS_PATH = join(CONFIG_ROOT, 'settings.json');
 
 // Identity-file paths derive from LifeosConfig's userDir. On fresh installs where
 // LIFEOS_CONFIG.toml hasn't been created yet, fall back to the conventional
@@ -26,7 +28,9 @@ function paiUserDir(): string {
   try {
     return loadLifeosConfig().paths.userDir;
   } catch {
-    return join(HOME, '.claude/LIFEOS/USER');
+    return process.env.UAI_DATA_DIR || process.env.PAI_DATA_DIR
+      ? join(DATA_ROOT, 'USER')
+      : join(LIFEOS_ROOT, 'USER');
   }
 }
 const DA_IDENTITY_PATH = join(paiUserDir(), 'DIGITAL_ASSISTANT/DA_IDENTITY.md');
@@ -104,7 +108,7 @@ function loadFrontmatter(path: string): Record<string, any> | null {
     const content = readFileSync(path, 'utf-8');
     const match = content.match(/^---\n([\s\S]*?)\n---/);
     if (!match) return null;
-    return parseYaml(match[1]) || null;
+    return Bun.YAML.parse(match[1]) || null;
   } catch {
     return null;
   }

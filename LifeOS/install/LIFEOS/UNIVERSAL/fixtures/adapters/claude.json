@@ -1,0 +1,22 @@
+{
+  "contract": "uai.adapter.v1",
+  "adapter": { "id": "claude", "version": "1.0.0", "class": "native" },
+  "discovery": { "state": "detected", "confidence": 1, "cliVersion": "fixture-2.0.0", "roots": ["fixture://claude"] },
+  "capabilities": {
+    "lifecycleBlocking": {
+      "critical": true,
+      "state": "active",
+      "failMode": "fail-closed",
+      "evidence": {
+        "adapterVersion": "1.0.0",
+        "cliVersion": "fixture-2.0.0",
+        "platform": { "os": "linux", "profile": "fixture" },
+        "probeId": "uai-critical-suite",
+        "observedAt": "2026-07-17T00:00:00.000Z",
+        "evidenceUri": "fixture:///evidence/claude.json"
+      }
+    }
+  },
+  "certification": "C3",
+  "losses": []
+}

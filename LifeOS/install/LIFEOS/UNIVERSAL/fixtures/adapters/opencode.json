@@ -1,0 +1,11 @@
+{
+  "contract": "uai.adapter.v1",
+  "adapter": { "id": "opencode", "version": "1.0.0", "class": "compatibility" },
+  "discovery": { "state": "detected", "confidence": 1, "cliVersion": "fixture-1.2.0", "roots": ["fixture://opencode"] },
+  "capabilities": {
+    "lifecycleBlocking": { "critical": true, "state": "degraded", "failMode": "fail-visible-open", "losses": ["plugin blocking semantics not observed"] },
+    "promptAuthority": { "state": "degraded", "losses": ["system authority lowers to context"] }
+  },
+  "certification": "C1",
+  "losses": ["blocking depends on plugin event semantics"]
+}

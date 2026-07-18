@@ -36,16 +36,16 @@
  */
 
 import { resolve as pathResolve, join as pathJoin } from "node:path";
-import { homedir } from "node:os";
+import { resolveDataRoot, resolveLifeosRoot } from "../UNIVERSAL/platform";
 
 // ── Paths ──
 
-const CLAUDE_ROOT = pathResolve(homedir(), ".claude");
-const LIFEOS_DIR = pathJoin(CLAUDE_ROOT, "LIFEOS");
+const LIFEOS_DIR = pathResolve(resolveLifeosRoot(process.env, "claude"));
+export const USER_ROOT = pathJoin(pathResolve(resolveDataRoot(process.env)), "USER");
 const KNOWLEDGE_DIR = pathJoin(LIFEOS_DIR, "MEMORY", "KNOWLEDGE");
 
-export const PRINCIPAL_MEMORY_PATH = pathJoin(LIFEOS_DIR, "USER", "PRINCIPAL", "PRINCIPAL_MEMORY.md");
-export const DA_MEMORY_PATH = pathJoin(LIFEOS_DIR, "USER", "DIGITAL_ASSISTANT", "DA_MEMORY.md");
+export const PRINCIPAL_MEMORY_PATH = pathJoin(USER_ROOT, "PRINCIPAL", "PRINCIPAL_MEMORY.md");
+export const DA_MEMORY_PATH = pathJoin(USER_ROOT, "DIGITAL_ASSISTANT", "DA_MEMORY.md");
 export const PENDING_PROPOSALS_PATH = pathJoin(LIFEOS_DIR, "MEMORY", "OBSERVABILITY", "pending-proposals.jsonl");
 export const TIER_B_AUDIT_PATH = pathJoin(LIFEOS_DIR, "MEMORY", "OBSERVABILITY", "tier-b-writes.jsonl");
 
@@ -57,15 +57,15 @@ export const TIER_B_AUDIT_PATH = pathJoin(LIFEOS_DIR, "MEMORY", "OBSERVABILITY",
 // allowed as proposal targets so the reviewer can propose first-time additions
 // rather than blind-appending behavioral inference.
 
-export const PRINCIPAL_IDENTITY_PATH = pathJoin(LIFEOS_DIR, "USER", "PRINCIPAL", "PRINCIPAL_IDENTITY.md");
-export const DA_IDENTITY_PATH = pathJoin(LIFEOS_DIR, "USER", "DIGITAL_ASSISTANT", "DA_IDENTITY.md");
-export const WRITINGSTYLE_PATH = pathJoin(LIFEOS_DIR, "USER", "PRINCIPAL", "WRITINGSTYLE.md");
-export const RESUME_PATH = pathJoin(LIFEOS_DIR, "USER", "PRINCIPAL", "RESUME.md");
-export const DEFINITIONS_PATH = pathJoin(LIFEOS_DIR, "USER", "DEFINITIONS.md");
-export const CANONICAL_CONTENT_PATH = pathJoin(LIFEOS_DIR, "USER", "CANONICAL_CONTENT.md");
-export const OPERATIONAL_RULES_PATH = pathJoin(LIFEOS_DIR, "USER", "CONFIG", "OPERATIONAL_RULES.md");
-export const PROJECTS_PATH = pathJoin(LIFEOS_DIR, "USER", "PROJECTS.md");
-export const CONTACTS_PATH = pathJoin(LIFEOS_DIR, "USER", "CONTACTS.md");
+export const PRINCIPAL_IDENTITY_PATH = pathJoin(USER_ROOT, "PRINCIPAL", "PRINCIPAL_IDENTITY.md");
+export const DA_IDENTITY_PATH = pathJoin(USER_ROOT, "DIGITAL_ASSISTANT", "DA_IDENTITY.md");
+export const WRITINGSTYLE_PATH = pathJoin(USER_ROOT, "PRINCIPAL", "WRITINGSTYLE.md");
+export const RESUME_PATH = pathJoin(USER_ROOT, "PRINCIPAL", "RESUME.md");
+export const DEFINITIONS_PATH = pathJoin(USER_ROOT, "DEFINITIONS.md");
+export const CANONICAL_CONTENT_PATH = pathJoin(USER_ROOT, "CANONICAL_CONTENT.md");
+export const OPERATIONAL_RULES_PATH = pathJoin(USER_ROOT, "CONFIG", "OPERATIONAL_RULES.md");
+export const PROJECTS_PATH = pathJoin(USER_ROOT, "PROJECTS.md");
+export const CONTACTS_PATH = pathJoin(USER_ROOT, "CONTACTS.md");
 
 // ── Types ──
 
@@ -202,16 +202,13 @@ export const PROPOSAL_KIND_TO_FILES: Readonly<Record<ProposalTargetKind, readonl
   contacts:             Object.freeze([CONTACTS_PATH]),
 });
 
-/**
- * Reverse lookup — derive a proposal kind from a target file path. Returns
- * 'identity' as the sane default for legacy proposals that only carry a
- * target_file (no target_kind), so the v8.1 wire format keeps working.
- */
-export function inferProposalKind(targetFile: string): ProposalTargetKind {
+/** Resolve the exact proposal subtype. Unknown paths have no legacy fallback. */
+export function inferProposalKind(targetFile: string): ProposalTargetKind | undefined {
+  const normalized = pathResolve(targetFile);
   for (const [kind, files] of Object.entries(PROPOSAL_KIND_TO_FILES) as [ProposalTargetKind, readonly string[]][]) {
-    if (files.includes(targetFile)) return kind;
+    if (files.some((file) => pathResolve(file) === normalized)) return kind;
   }
-  return "identity";
+  return undefined;
 }
 
 export function isKnownProposalKind(k: string): k is ProposalTargetKind {

@@ -6,17 +6,35 @@
  *
  * Thin entry point over InstallEngine.detectEnv() — all logic lives there.
  *
- * Usage: bun DetectEnv.ts [--json]   (--json is the default and only format)
+ * Usage: bun DetectEnv.ts [--json] [--config-root <dir>]
  */
 
 import { detectEnv } from "./InstallEngine";
 
+function selectedConfigRoot(argv = process.argv.slice(2)): string | undefined {
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index];
+    if (arg.startsWith("--config-root=")) {
+      const value = arg.slice("--config-root=".length).trim();
+      if (!value) throw new Error("--config-root requires a value");
+      return value;
+    }
+    if (arg === "--config-root") {
+      const value = argv[index + 1]?.trim();
+      if (!value || value.startsWith("--")) throw new Error("--config-root requires a value");
+      return value;
+    }
+  }
+  return undefined;
+}
+
 function main(): void {
-  const env = detectEnv();
+  const configRoot = selectedConfigRoot();
+  const env = detectEnv(configRoot ? { ...process.env, UAI_CONFIG_DIR: configRoot } : process.env);
   // Single JSON object, jq-pipeable. The Setup workflow reads these fields by name.
   console.log(JSON.stringify(env, null, 2));
-  // Exit 0 always — detection never "fails"; the workflow decides on the data.
-  process.exit(0);
+  // A clean, unselected machine must not silently mutate a Claude profile.
+  process.exit(env.harness.name === "unknown" ? 2 : 0);
 }
 
 main();

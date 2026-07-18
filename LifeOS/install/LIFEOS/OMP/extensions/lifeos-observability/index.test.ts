@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -29,6 +29,8 @@ describe("LifeOS depth indicator", () => {
 	test("renders only the current OMP session's Algorithm state", async () => {
 		const { lifeosDir, workJson } = createWorkState();
 		const previousLifeosDir = process.env.LIFEOS_DIR;
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = join(lifeosDir, "profile");
 		process.env.LIFEOS_DIR = lifeosDir;
 		try {
 			// Import after LIFEOS_DIR is isolated; the extension resolves its state path at module load.
@@ -36,6 +38,8 @@ describe("LifeOS depth indicator", () => {
 			const event = {
 				toolName: "edit",
 				input: {
+					headers: { authorization: "Bearer SECRET_NESTED_123" },
+					patch: { new_string: "SECRET_NESTED_123" },
 					content: "x".repeat(400),
 					file_path: "/tmp/MEMORY/WORK/current-session/ISA.md",
 				},
@@ -56,6 +60,7 @@ describe("LifeOS depth indicator", () => {
 			let status = "";
 			const ctx = {
 				hasUI: true,
+				sessionManager: { getSessionFile: () => join(lifeosDir, "profile", "sessions", "native-a.jsonl") },
 				ui: {
 					setStatus: (_key: string, value: string) => { status = value; },
 					setWidget: () => undefined,
@@ -70,9 +75,26 @@ describe("LifeOS depth indicator", () => {
 			expect(status).toBe("LifeOS · 🔧1 · ALGO execute E3");
 			expect(status).not.toContain("verify");
 			expect(status).not.toContain("E5");
+
+			const secondCtx = {
+				...ctx,
+				sessionManager: { getSessionFile: () => join(lifeosDir, "profile", "sessions", "native-b.jsonl") },
+			};
+			await handlers.get("tool_execution_end")?.(event, secondCtx);
+			const activityRaw = readFileSync(join(lifeosDir, "MEMORY", "OBSERVABILITY", "tool-activity.jsonl"), "utf8");
+			expect(activityRaw).not.toContain("SECRET_NESTED_123");
+			expect(activityRaw).toContain("[REDACTED]");
+			const activity = readFileSync(join(lifeosDir, "MEMORY", "OBSERVABILITY", "tool-activity.jsonl"), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { session_id: string; native_session_id: string });
+			expect(activity.map((row) => row.native_session_id)).toEqual(["native-a", "native-b"]);
+			expect(activity[0].session_id).not.toBe(activity[1].session_id);
 		} finally {
 			if (previousLifeosDir === undefined) delete process.env.LIFEOS_DIR;
 			else process.env.LIFEOS_DIR = previousLifeosDir;
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		}
 	});
 });

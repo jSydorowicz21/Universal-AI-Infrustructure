@@ -52,6 +52,7 @@ temp/
 dist/
 build/
 out/
+.build/
 
 # Re-include Pulse Observability built dashboard — must ship in public releases
 # so fresh installs get a working dashboard immediately. The `out/` rule above

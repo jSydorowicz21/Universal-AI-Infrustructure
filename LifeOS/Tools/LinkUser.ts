@@ -1,10 +1,4 @@
 #!/usr/bin/env bun
-// Normalize env path vars Claude Code may inject unexpanded — literal $HOME/${HOME}
-// in LIFEOS_DIR/LIFEOS_CONFIG_DIR/PROJECTS_DIR resolves to a shadow dir (#1404 / PR #1451, author jbmml).
-for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
-  const __v = process.env[__k];
-  if (__v && /^\$\{?HOME\}?(\/|$)/.test(__v)) process.env[__k] = __v.replace(/^\$\{?HOME\}?/, process.env.HOME ?? "~");
-}
 
 /**
  * LinkUser — Setup step 6. Establishes the system/user separation contract:
@@ -18,13 +12,8 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
  */
 
 import { join } from "node:path";
-import { checkSymlinkContract, detectDevTree, setupUserSeparation } from "./InstallEngine";
+import { checkSymlinkContract, detectDevTree, resolveInstallRoots, setupUserSeparation } from "./InstallEngine";
 
-// Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
-for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
-  const v = process.env[k];
-  if (v && /^\$\{?HOME\}?(\/|$)/.test(v)) process.env[k] = v.replace(/^\$\{?HOME\}?/, process.env.HOME ?? "~");
-}
 
 
 function main(): void {
@@ -33,9 +22,9 @@ function main(): void {
     const i = a.indexOf(f);
     return i >= 0 && a[i + 1] && !a[i + 1].startsWith("--") ? a[i + 1] : undefined;
   };
-  const home = process.env.HOME || "";
-  const configRoot = get("--config-root") || process.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
-  const configDir = get("--config-dir") || process.env.LIFEOS_CONFIG_DIR || join(home, ".config", "LIFEOS");
+  const roots = resolveInstallRoots();
+  const configRoot = get("--config-root") || roots.configRoot;
+  const configDir = get("--config-dir") || roots.dataRoot;
   const apply = a.includes("--apply");
   const allowDev = a.includes("--allow-dev");
 

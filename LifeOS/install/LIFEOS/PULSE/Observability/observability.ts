@@ -31,7 +31,6 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 
 import { join, extname } from "path"
 import { readFileSync, readdirSync, existsSync, realpathSync, statSync, watch, type FSWatcher } from "fs"
-import YAML from "yaml"
 import { effortToCanonicalTierName } from "../../../hooks/lib/effort"
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
@@ -1103,7 +1102,7 @@ function loadYaml<T = any>(path: string): T | null {
   try {
     if (!existsSync(path)) return null
     const raw = readFileSync(path, "utf-8")
-    return YAML.parse(raw) as T
+    return Bun.YAML.parse(raw) as T
   } catch (err) {
     console.error(`[finances] YAML parse failed: ${path}`, err)
     return null

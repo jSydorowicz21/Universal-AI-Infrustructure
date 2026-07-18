@@ -1,0 +1,11 @@
+{
+  "contract": "uai.adapter.v1",
+  "adapter": { "id": "omp", "version": "1.0.0", "class": "native" },
+  "discovery": { "state": "detected", "confidence": 1, "cliVersion": "fixture-1.0.0", "roots": ["fixture://omp"] },
+  "capabilities": {
+    "lifecycleBlocking": { "critical": true, "state": "wired", "failMode": "fail-closed", "losses": ["active requires observed negative probes"] },
+    "egressCeiling": { "critical": true, "state": "degraded", "failMode": "fail-visible-open", "losses": ["native provider route surface unavailable in fixture"] }
+  },
+  "certification": "C1",
+  "losses": ["approval mode is version-specific"]
+}

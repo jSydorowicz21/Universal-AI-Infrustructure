@@ -11,17 +11,19 @@
  *       route all proposals through Telegram (no silent direct-apply yet).
  */
 
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import {
   PENDING_PROPOSALS_PATH,
+  USER_ROOT,
   inferProposalKind,
   type ProposalTargetKind,
 } from "../../TOOLS/MemoryTypes";
+import { validateProposalTargetBinding } from "../../TOOLS/MemorySystem";
+import { resolveLifeosRoot } from "../../UNIVERSAL/platform";
 
-const HOME = process.env.HOME ?? homedir();
-const OBS_DIR = join(HOME, ".claude", "LIFEOS", "MEMORY", "OBSERVABILITY");
+const OBS_DIR = join(resolveLifeosRoot(process.env, "claude"), "MEMORY", "OBSERVABILITY");
 const PROPOSAL_REPLIES_LOG_PATH = join(OBS_DIR, "proposal-replies.jsonl");
 const IDENTITY_PROPOSALS_LOG_PATH = join(OBS_DIR, "identity-proposals.jsonl");
 
@@ -85,11 +87,27 @@ export function loadProposalQueue(path: string = PENDING_PROPOSALS_PATH): Propos
   }
 }
 
+function atomicWrite(path: string, body: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporary = join(dirname(path), `.${randomUUID()}.uai-tmp`);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporary, "wx", 0o600);
+    writeFileSync(descriptor, body, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporary, path);
+  } catch (error) {
+    if (descriptor !== undefined) try { closeSync(descriptor); } catch { /* best effort */ }
+    try { unlinkSync(temporary); } catch { /* only our temporary */ }
+    throw error;
+  }
+}
+
 export function writeProposalQueue(rows: ProposalRow[], path: string = PENDING_PROPOSALS_PATH): void {
-  const tmp = `${path}.tmp`;
-  const body = rows.map((r) => JSON.stringify(r)).join("\n") + (rows.length > 0 ? "\n" : "");
-  writeFileSync(tmp, body, "utf8");
-  renameSync(tmp, path);
+  const body = rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length > 0 ? "\n" : "");
+  atomicWrite(path, body);
 }
 
 export function markProposal(id: string, patch: Partial<ProposalRow>, path: string = PENDING_PROPOSALS_PATH): ProposalRow | null {
@@ -122,14 +140,17 @@ export function logProposalReply(event: Record<string, unknown>, path: string = 
   }
 }
 
-export function formatProposalMessage(p: ProposalRow, home: string = HOME): string {
-  const fileLabel = p.target_file.replace(`${home}/.claude/`, "");
+export function formatProposalMessage(p: ProposalRow, userRoot: string = USER_ROOT): string {
+  const relativeTarget = relative(userRoot, p.target_file);
+  const fileLabel = relativeTarget && !relativeTarget.startsWith("..") && !isAbsolute(relativeTarget)
+    ? relativeTarget.replaceAll("\\", "/")
+    : "unrecognized proposal target";
   const conf = p.confidence.toFixed(2);
   const obs = p.observed_across_sessions ?? 1;
   // P1 2026-05-25: prepend subtype badge so the principal sees at a glance
   // which curated-context class is being touched. Falls back to inference
   // when the row predates target_kind.
-  const kind: ProposalTargetKind = p.target_kind ?? inferProposalKind(p.target_file);
+  const kind: ProposalTargetKind | "unknown" = p.target_kind ?? inferProposalKind(p.target_file) ?? "unknown";
   return [
     `🆔 [${kind}] Propose adding to ${fileLabel}:`,
     `"${p.edit}"`,
@@ -156,7 +177,10 @@ export function parseProposalReply(text: string): ProposalReply {
   return { kind, id };
 }
 
-export function applyProposalEdit(targetFile: string, editText: string): { ok: true } | { ok: false; reason: string } {
+export function applyProposalEdit(targetFile: string, editText: string, targetKind?: ProposalTargetKind): { ok: true } | { ok: false; reason: string } {
+  const kind = targetKind ?? inferProposalKind(targetFile);
+  const validation = validateProposalTargetBinding(targetFile, kind);
+  if (!validation.ok) return { ok: false, reason: validation.message };
   if (!existsSync(targetFile)) return { ok: false, reason: `target file missing: ${targetFile}` };
   try {
     const current = readFileSync(targetFile, "utf8");
@@ -169,9 +193,7 @@ export function applyProposalEdit(targetFile: string, editText: string): { ok: t
     } else {
       next = current.trimEnd() + `\n\n${sectionHeader}\n\n${entry.trim()}\n`;
     }
-    const tmp = `${targetFile}.tmp`;
-    writeFileSync(tmp, next, "utf8");
-    renameSync(tmp, targetFile);
+    atomicWrite(targetFile, next);
     return { ok: true };
   } catch (e) {
     return { ok: false, reason: (e as Error)?.message ?? String(e) };

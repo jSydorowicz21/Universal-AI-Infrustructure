@@ -12,10 +12,10 @@
  * from this one sibling module (flat 2-level skill structure forbids a lib/ dir).
  */
 
-import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, accessSync, constants as fsConstants } from "node:fs";
+import { delimiter, dirname, extname, isAbsolute, join, normalize, resolve } from "node:path";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
 
 // ── Types (inlined — the skill ships without the engine's types.ts) ──
 
@@ -34,7 +34,7 @@ export interface ToolInfo {
   path?: string;
 }
 
-export type Harness = "claude-code" | "opencode" | "hermes" | "cursor" | "openclaw" | "unknown";
+export type Harness = "claude-code" | "omp" | "codex" | "opencode" | "hermes" | "cursor" | "openclaw" | "unknown";
 
 export interface HarnessInfo {
   name: Harness;
@@ -48,7 +48,7 @@ export interface HarnessInfo {
    * must confirm an "assumed" harness with the user before branching (#1448 —
    * a leftover ~/.claude dir sent an OpenCode install down the Claude Code path).
    */
-  confidence: "detected" | "assumed";
+  confidence: "detected" | "assumed" | "unselected";
 }
 
 export interface EnvDetection {
@@ -73,6 +73,72 @@ export interface EnvDetection {
   homeDir: string;
   configRoot: string;
   timezone: string;
+}
+
+export function resolveHomeDir(
+  env: Pick<NodeJS.ProcessEnv, "HOME" | "USERPROFILE"> = process.env,
+  osHome = homedir(),
+): string {
+  const configured = env.HOME?.trim() || env.USERPROFILE?.trim();
+  return normalize(configured || osHome);
+}
+export interface ResolvedInstallRoots {
+  home: string;
+  configRoot: string;
+  dataRoot: string;
+  lifeosRoot: string;
+  userRoot: string;
+}
+
+export function resolveInstallRoots(
+  env: NodeJS.ProcessEnv = process.env,
+  harness: Harness = "claude-code",
+  osHome = homedir(),
+): ResolvedInstallRoots {
+  const home = resolveHomeDir(env, osHome);
+  const explicitConfig = env.UAI_CONFIG_DIR?.trim() || env.PAI_CONFIG_DIR?.trim();
+  const harnessConfig = harness === "claude-code"
+    ? env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude")
+    : harness === "codex"
+      ? env.CODEX_HOME?.trim() || join(home, ".codex")
+      : harness === "opencode"
+        ? env.OPENCODE_CONFIG_DIR?.trim() || join(home, ".config", "opencode")
+        : harness === "omp"
+          ? env.PI_CODING_AGENT_DIR?.trim() || join(home, ".omp", "agent")
+          : join(home, ".config", "uai", harness);
+  const configRoot = normalize(explicitConfig || harnessConfig);
+  const dataRoot = normalize(env.UAI_DATA_DIR?.trim() || env.PAI_DATA_DIR?.trim() || join(home, ".pai"));
+  const lifeosRoot = normalize(env.LIFEOS_DIR?.trim() || join(configRoot, "LIFEOS"));
+  return { home, configRoot, dataRoot, lifeosRoot, userRoot: join(dataRoot, "USER") };
+}
+
+
+export function findExecutable(
+  name: string,
+  env: Pick<NodeJS.ProcessEnv, "PATH" | "Path" | "PATHEXT"> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const pathValue = env.PATH || env.Path || "";
+  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const extensions = platform === "win32"
+    ? (env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    : [""];
+  const candidates = isAbsolute(name) || name.includes("/") || name.includes("\\")
+    ? [name]
+    : pathValue.split(pathDelimiter).filter(Boolean).flatMap((dir) => {
+        if (platform !== "win32" || extname(name)) return [join(dir, name)];
+        return extensions.map((extension) => join(dir, `${name}${extension.toLowerCase()}`))
+          .concat(extensions.map((extension) => join(dir, `${name}${extension.toUpperCase()}`)));
+      });
+  for (const candidate of candidates) {
+    try {
+      accessSync(candidate, platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK);
+      return normalize(candidate);
+    } catch {
+      // Continue through PATH/PATHEXT.
+    }
+  }
+  return null;
 }
 
 // ── Low-level probes (from engine detect.ts, unchanged) ──
@@ -105,9 +171,16 @@ export function detectOS(): OsInfo {
 }
 
 export function detectTool(name: string, versionCmd: string): ToolInfo {
-  const path = tryExec(`command -v ${name}`);
+  const path = findExecutable(name);
   if (!path) return { installed: false };
-  const out = tryExec(versionCmd);
+  const versionArgs = versionCmd.trim().split(/\s+/).slice(1);
+  let out: string | null = null;
+  try {
+    const result = Bun.spawnSync([path, ...versionArgs], { stdout: "pipe", stderr: "pipe" });
+    if (result.exitCode === 0) out = result.stdout.toString().trim() || result.stderr.toString().trim();
+  } catch {
+    out = null;
+  }
   const m = out?.match(/(\d+\.\d+[.\d]*)/);
   return { installed: true, version: m?.[1] || out || undefined, path };
 }
@@ -121,32 +194,40 @@ export function detectTool(name: string, versionCmd: string): ToolInfo {
  * claude CLI must not out-rank a live OpenCode install. Anything short of a
  * binary match is reported as confidence "assumed", never as fact.
  */
-export function detectHarness(home: string): HarnessInfo {
-  const candidates: Array<{ name: Harness; root: string; skills: string; bin: string }> = [
-    { name: "claude-code", root: process.env.CLAUDE_CONFIG_DIR || join(home, ".claude"), skills: "skills", bin: "claude" },
-    { name: "opencode", root: process.env.OPENCODE_CONFIG_DIR || join(home, ".config", "opencode"), skills: "skills", bin: "opencode" },
+export function detectHarness(home: string, env: NodeJS.ProcessEnv = process.env): HarnessInfo {
+  const candidates: Array<{ name: Exclude<Harness, "unknown">; root: string; skills: string; bin: string }> = [
+    { name: "claude-code", root: env.CLAUDE_CONFIG_DIR || join(home, ".claude"), skills: "skills", bin: "claude" },
+    { name: "omp", root: env.PI_CODING_AGENT_DIR || join(home, ".omp", "agent"), skills: "skills", bin: "omp" },
+    { name: "codex", root: env.CODEX_HOME || join(home, ".codex"), skills: "skills", bin: "codex" },
+    { name: "opencode", root: env.OPENCODE_CONFIG_DIR || join(home, ".config", "opencode"), skills: "skills", bin: "opencode" },
     { name: "hermes", root: join(home, ".hermes"), skills: "skills", bin: "hermes" },
     { name: "cursor", root: join(home, ".cursor"), skills: "skills", bin: "cursor" },
     { name: "openclaw", root: join(home, ".openclaw"), skills: "skills", bin: "openclaw" },
   ];
-  const hasBin = (c: (typeof candidates)[number]) => !!tryExec(`command -v ${c.bin}`);
-  const info = (c: (typeof candidates)[number], confidence: HarnessInfo["confidence"]): HarnessInfo => ({
-    name: c.name,
-    configRoot: c.root,
-    skillsDir: join(c.root, c.skills),
+  const hasBin = (candidate: (typeof candidates)[number]) => findExecutable(candidate.bin, env) !== null;
+  const info = (candidate: (typeof candidates)[number], confidence: HarnessInfo["confidence"]): HarnessInfo => ({
+    name: candidate.name,
+    configRoot: candidate.root,
+    skillsDir: join(candidate.root, candidate.skills),
     confidence,
   });
-  for (const c of candidates) {
-    if (existsSync(c.root) && hasBin(c)) return info(c, "detected");
+  const explicit = (env.UAI_HARNESS || env.PAI_HARNESS || "").trim().toLowerCase();
+  const explicitName = explicit === "claude" ? "claude-code" : explicit;
+  if (explicitName) {
+    const selected = candidates.find((candidate) => candidate.name === explicitName);
+    if (selected) return info(selected, hasBin(selected) ? "detected" : "assumed");
+    return { name: "unknown", confidence: "unselected" };
   }
-  for (const c of candidates) {
-    if (existsSync(c.root)) return info(c, "assumed");
+  for (const candidate of candidates) {
+    if (existsSync(candidate.root) && hasBin(candidate)) return info(candidate, "detected");
   }
-  for (const c of candidates) {
-    if (hasBin(c)) return info(c, "detected");
+  for (const candidate of candidates) {
+    if (hasBin(candidate)) return info(candidate, "detected");
   }
-  // Default assumption when nothing is present yet (a clean machine pre-bootstrap).
-  return { name: "claude-code", configRoot: join(home, ".claude"), skillsDir: join(home, ".claude", "skills"), confidence: "assumed" };
+  for (const candidate of candidates) {
+    if (existsSync(candidate.root)) return info(candidate, "assumed");
+  }
+  return { name: "unknown", confidence: "unselected" };
 }
 
 /**
@@ -162,17 +243,21 @@ export function detectDevTree(configRoot: string): boolean {
 
 // ── Composite env detection (the DetectEnv Tool payload) ──
 
-export function detectEnv(): EnvDetection {
-  const home = homedir();
+export function detectEnv(env: NodeJS.ProcessEnv = process.env): EnvDetection {
+  const home = resolveHomeDir(env);
   const os = detectOS();
-  const harness = detectHarness(home);
-  const configRoot = harness.configRoot || join(home, ".claude");
+  const discoveredHarness = detectHarness(home, env);
+  const roots = resolveInstallRoots(env, discoveredHarness.name, home);
+  const harness = discoveredHarness.name === "unknown"
+    ? discoveredHarness
+    : { ...discoveredHarness, configRoot: roots.configRoot, skillsDir: join(roots.configRoot, "skills") };
+  const configRoot = roots.configRoot;
   const settingsPath = join(configRoot, "settings.json");
-  const claudeMdPath = join(configRoot, "CLAUDE.md");
-  const ssh = !!(process.env.SSH_CONNECTION || process.env.SSH_TTY || process.env.SSH_CLIENT);
+  const claudeMdPath = join(configRoot, harness.name === "codex" || harness.name === "opencode" ? "AGENTS.md" : "CLAUDE.md");
+  const ssh = !!(env.SSH_CONNECTION || env.SSH_TTY || env.SSH_CLIENT);
   // GUI session: macOS always has one locally; Linux needs DISPLAY/WAYLAND and not pure-SSH.
   const display =
-    os.platform === "darwin" ? !ssh : !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY) && !ssh;
+    os.platform === "darwin" ? !ssh : !!(env.DISPLAY || env.WAYLAND_DISPLAY) && !ssh;
 
   return {
     os,
@@ -328,8 +413,7 @@ export function scanSettingsHooks(settingsPath: string): SettingsHookScan {
 //  follows the proven logic from the legacy engine actions.ts.
 // ════════════════════════════════════════════════════════════════════
 
-import { cpSync, lstatSync, mkdirSync, readdirSync, readlinkSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { closeSync, cpSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readlinkSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 
 const TEMPLATE_EXTENSIONS = new Set([".md", ".json", ".txt", ".ts", ".toml", ".yaml", ".yml", ".sh"]);
 const SKIP_DIRS = new Set(["node_modules", ".git", "MEMORY"]);
@@ -342,9 +426,23 @@ const SKIP_DIRS = new Set(["node_modules", ".git", "MEMORY"]);
 export function copyMissing(src: string, dst: string): { copied: number; failures: string[] } {
   const failures: string[] = [];
   let copied = 0;
+  const sourceFailure = physicalTreeFailure(src, "payload source");
+  const destinationFailure = physicalTreeFailure(dst, "payload destination");
+  if (sourceFailure) failures.push(sourceFailure);
+  if (destinationFailure) failures.push(destinationFailure);
+  if (failures.length > 0) return { copied, failures };
   const walk = (s: string, d: string): void => {
-    if (!existsSync(s)) return;
-    const stat = lstatSync(s);
+    let stat;
+    try {
+      stat = lstatSync(s);
+    } catch (error) {
+      failures.push(`payload artifact is unreadable: ${s}: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      failures.push(`payload link is not allowed: ${s}`);
+      return;
+    }
     if (stat.isFile()) {
       if (!existsSync(d)) {
         try {
@@ -357,20 +455,34 @@ export function copyMissing(src: string, dst: string): { copied: number; failure
       }
       return;
     }
+    if (!stat.isDirectory()) {
+      failures.push(`payload contains an unsupported artifact: ${s}`);
+      return;
+    }
     for (const entry of readdirSync(s, { withFileTypes: true })) {
       if (SKIP_DIRS.has(entry.name)) continue;
       const sp = join(s, entry.name);
       const dp = join(d, entry.name);
-      if (entry.isDirectory()) {
-        if (!existsSync(dp)) mkdirSync(dp, { recursive: true });
-        walk(sp, dp);
-      } else if (entry.isFile() && !existsSync(dp)) {
-        try {
-          cpSync(sp, dp);
-          copied++;
-        } catch (err) {
-          failures.push(`${sp} → ${dp}: ${err instanceof Error ? err.message : String(err)}`);
+      const child = lstatSync(sp);
+      if (child.isSymbolicLink()) {
+        failures.push(`payload link is not allowed: ${sp}`);
+        continue;
+      }
+      if (child.isDirectory()) {
+        if (existsSync(dp)) {
+          const destination = lstatSync(dp);
+          if (destination.isSymbolicLink() || !destination.isDirectory()) {
+            failures.push(`payload destination must be a physical directory: ${dp}`);
+            continue;
+          }
+        } else {
+          mkdirSync(dp, { recursive: true });
         }
+        walk(sp, dp);
+      } else if (child.isFile()) {
+        walk(sp, dp);
+      } else {
+        failures.push(`payload contains an unsupported artifact: ${sp}`);
       }
     }
   };
@@ -388,6 +500,8 @@ export interface TemplateVars {
  * (Simplified from engine actions.ts substituteTemplates.)
  */
 export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: number; modified: number; applied: number } {
+  const failure = physicalTreeFailure(rootDir, "template source");
+  if (failure) throw new Error(failure);
   let scanned = 0;
   let modified = 0;
   let applied = 0;
@@ -403,23 +517,36 @@ export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: 
       after = parts.join(value);
     }
     if (after !== before) {
-      const tmp = filePath + ".lifeos.tmp";
-      writeFileSync(tmp, after);
-      renameSync(tmp, filePath);
-      modified++;
+      const temporary = join(dirname(filePath), `.${randomUUID()}.uai-tmp`);
+      let descriptor: number | undefined;
+      try {
+        descriptor = openSync(temporary, "wx", 0o600);
+        writeFileSync(descriptor, after, "utf8");
+        fsyncSync(descriptor);
+        closeSync(descriptor);
+        descriptor = undefined;
+        renameSync(temporary, filePath);
+        modified++;
+      } catch (error) {
+        if (descriptor !== undefined) try { closeSync(descriptor); } catch { /* best effort */ }
+        try { unlinkSync(temporary); } catch { /* only our temporary */ }
+        throw error;
+      }
     }
   };
-  const walk = (dir: string): void => {
-    if (!existsSync(dir)) return;
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+  const walk = (directory: string): void => {
+    const metadata = lstatSync(directory);
+    if (metadata.isFile()) {
+      processFile(directory);
+      return;
+    }
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
       if (SKIP_DIRS.has(entry.name)) continue;
-      const child = join(dir, entry.name);
-      if (entry.isDirectory()) walk(child);
-      else if (entry.isFile()) processFile(child);
+      const child = join(directory, entry.name);
+      if (entry.isDirectory() || entry.isFile()) walk(child);
     }
   };
-  if (existsSync(rootDir) && lstatSync(rootDir).isFile()) processFile(rootDir);
-  else walk(rootDir);
+  if (existsSync(rootDir)) walk(rootDir);
   return { scanned, modified, applied };
 }
 
@@ -446,20 +573,61 @@ function filesDiffer(a: string, b: string): boolean {
  * `<file>.replaced-<stamp>`. Lossless in every direction — nothing is removed
  * without a recoverable copy. Symlinked entries are skipped (Dirent semantics).
  */
+function physicalTreeFailure(root: string, label: string): string | undefined {
+  try {
+    lstatSync(root);
+  } catch {
+    return undefined;
+  }
+  const visit = (path: string): string | undefined => {
+    let metadata;
+    try {
+      metadata = lstatSync(path);
+    } catch (error) {
+      return `${label} cannot inspect ${path}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (metadata.isSymbolicLink()) return label === "payload source" ? `payload link is not allowed: ${path}` : `${label} links are not allowed: ${path}`;
+    if (metadata.isFile()) return undefined;
+    if (!metadata.isDirectory()) return `${label} contains an unsupported artifact: ${path}`;
+    let names: string[];
+    try {
+      names = readdirSync(path);
+    } catch (error) {
+      return `${label} cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    for (const name of names) {
+      const failure = visit(join(path, name));
+      if (failure) return failure;
+    }
+    return undefined;
+  };
+  return visit(root);
+}
+
 function mergeTree(src: string, dst: string, stamp: string): { copied: number; overwritten: number; preserved: number; failures: string[] } {
   let copied = 0;
   let overwritten = 0;
   let preserved = 0;
   const failures: string[] = [];
+  const sourceFailure = physicalTreeFailure(src, "live USER source");
+  const destinationFailure = physicalTreeFailure(dst, "data USER destination");
+  if (sourceFailure) failures.push(sourceFailure);
+  if (destinationFailure) failures.push(destinationFailure);
+  if (failures.length > 0) return { copied, overwritten, preserved, failures };
   const walk = (s: string, d: string): void => {
-    if (!existsSync(s)) return;
-    if (lstatSync(s).isFile()) {
+    const sourceMetadata = lstatSync(s);
+    if (sourceMetadata.isFile()) {
       if (!existsSync(d)) {
         try { mkdirSync(dirname(d), { recursive: true }); cpSync(s, d); copied++; }
         catch (err) { failures.push(`${s} → ${d}: ${err instanceof Error ? err.message : String(err)}`); }
       } else if (filesDiffer(s, d)) {
-        try { cpSync(d, `${d}.replaced-${stamp}`); cpSync(s, d); overwritten++; preserved++; }
-        catch (err) { failures.push(`${s} → ${d}: ${err instanceof Error ? err.message : String(err)}`); }
+        try {
+          if (lstatSync(d).isSymbolicLink()) throw new Error("destination link is not allowed");
+          cpSync(d, `${d}.replaced-${stamp}`);
+          cpSync(s, d);
+          overwritten++;
+          preserved++;
+        } catch (err) { failures.push(`${s} → ${d}: ${err instanceof Error ? err.message : String(err)}`); }
       }
       return;
     }
@@ -467,8 +635,19 @@ function mergeTree(src: string, dst: string, stamp: string): { copied: number; o
       if (SKIP_DIRS.has(entry.name)) continue;
       const sp = join(s, entry.name);
       const dp = join(d, entry.name);
-      if (entry.isDirectory()) { if (!existsSync(dp)) mkdirSync(dp, { recursive: true }); walk(sp, dp); }
-      else if (entry.isFile()) walk(sp, dp);
+      const metadata = lstatSync(sp);
+      if (metadata.isDirectory()) {
+        if (existsSync(dp) && lstatSync(dp).isSymbolicLink()) {
+          failures.push(`data USER destination links are not allowed: ${dp}`);
+          continue;
+        }
+        if (!existsSync(dp)) mkdirSync(dp, { recursive: true });
+        walk(sp, dp);
+      } else if (metadata.isFile()) {
+        walk(sp, dp);
+      } else {
+        failures.push(`live USER source contains an unsupported artifact: ${sp}`);
+      }
     }
   };
   walk(src, dst);
@@ -482,26 +661,39 @@ export function setupUserSeparation(
   const liveUserDir = join(configRoot, "LIFEOS", "USER");
   const dataUserDir = join(configDir, "USER");
 
-  // Branch (a): already a correct symlink → no-op.
+  // Branch (a): already a correct symlink → no-op. A relative link is correct
+  // when it resolves to the selected data root, not merely when its raw text
+  // happens to match the absolute target.
   if (existsSync(liveUserDir)) {
     const st = lstatSync(liveUserDir);
     if (st.isSymbolicLink()) {
       try {
-        if (readlinkSync(liveUserDir) === dataUserDir) return { action: "already-linked", target: dataUserDir, copied: 0 };
-      } catch { /* fall through to rebuild */ }
+        const target = readlinkSync(liveUserDir);
+        const resolvedTarget = isAbsolute(target) ? normalize(target) : resolve(dirname(liveUserDir), target);
+        if (resolvedTarget === normalize(dataUserDir)) return { action: "already-linked", target: dataUserDir, copied: 0 };
+      } catch { /* reject below without mutating a foreign link */ }
+      return { action: "linked", target: dataUserDir, copied: 0, error: `live USER is linked to an unrecognized target: ${liveUserDir}` };
     }
+  }
+
+  // No mutation (including mkdir/rename) is allowed until both physical trees
+  // have been walked with lstat. This prevents a destination link/junction from
+  // redirecting merge copies outside the selected user-data root.
+  const destinationFailure = physicalTreeFailure(dataUserDir, "data USER destination");
+  if (destinationFailure) return { action: "linked", target: dataUserDir, copied: 0, error: destinationFailure };
+  if (existsSync(liveUserDir)) {
+    const liveMetadata = lstatSync(liveUserDir);
+    if (!liveMetadata.isDirectory()) {
+      return { action: "linked", target: dataUserDir, copied: 0, error: `live USER is not a physical directory: ${liveUserDir}` };
+    }
+    const sourceFailure = physicalTreeFailure(liveUserDir, "live USER source");
+    if (sourceFailure) return { action: "linked", target: dataUserDir, copied: 0, error: sourceFailure };
   }
 
   mkdirSync(dataUserDir, { recursive: true });
   let copied = 0;
 
-  // Branch (b): live USER is a real dir → migrate into the data home LOSSLESSLY,
-  // then symlink. We RENAME the live dir aside (never rm) so the user's real tree
-  // ALWAYS survives, then merge it into the data home with live-wins so real
-  // content beats any template stub ScaffoldUser placed first. The backup is
-  // retained and reported; recovery is always possible, including if the symlink
-  // step itself fails. This fixes the prior copyMissing-then-rm data-loss path
-  // where a divergent dest stub was kept and the user's real file destroyed.
+  // Branch (b): move the verified live tree aside, then merge it losslessly.
   if (existsSync(liveUserDir) && lstatSync(liveUserDir).isDirectory()) {
     const stamp = String(Date.now());
     const backupDir = `${liveUserDir}.pre-link-backup-${stamp}`;
@@ -512,9 +704,20 @@ export function setupUserSeparation(
     }
     const merged = mergeTree(backupDir, dataUserDir, stamp);
     copied = merged.copied;
+    if (merged.failures.length > 0) {
+      return {
+        action: "linked",
+        target: dataUserDir,
+        copied,
+        overwritten: merged.overwritten,
+        preserved: merged.preserved,
+        backup: backupDir,
+        error: `USER migration failed; live USER preserved at ${backupDir}: ${merged.failures.join("; ")}`,
+      };
+    }
     try {
       mkdirSync(dirname(liveUserDir), { recursive: true });
-      symlinkSync(dataUserDir, liveUserDir);
+      symlinkSync(dataUserDir, liveUserDir, process.platform === "win32" ? "junction" : "dir");
       return { action: "linked", target: dataUserDir, copied, overwritten: merged.overwritten, preserved: merged.preserved, backup: backupDir };
     } catch (err) {
       return { action: "linked", target: dataUserDir, copied, overwritten: merged.overwritten, preserved: merged.preserved, backup: backupDir, error: `symlink creation failed (live USER preserved at ${backupDir}): ${err instanceof Error ? err.message : String(err)}` };
@@ -524,7 +727,7 @@ export function setupUserSeparation(
   // Branch (c): fresh install — scaffold the data home (if empty) + symlink.
   try {
     mkdirSync(dirname(liveUserDir), { recursive: true });
-    symlinkSync(dataUserDir, liveUserDir);
+    symlinkSync(dataUserDir, liveUserDir, process.platform === "win32" ? "junction" : "dir");
     return { action: "scaffolded-linked", target: dataUserDir, copied };
   } catch (err) {
     return { action: "scaffolded-linked", target: dataUserDir, copied, error: `symlink creation failed: ${err instanceof Error ? err.message : String(err)}` };
@@ -547,21 +750,79 @@ export function checkSymlinkContract(configRoot: string, configDir: string): { p
   } catch (err) {
     return { passed: false, detail: `readlink failed: ${err instanceof Error ? err.message : String(err)}` };
   }
-  if (target !== expected) return { passed: false, detail: `symlink points to ${target}, expected ${expected}` };
+  const resolvedTarget = isAbsolute(target) ? normalize(target) : resolve(dirname(liveUserDir), target);
+  if (resolvedTarget !== normalize(expected)) return { passed: false, detail: `link points to ${resolvedTarget}, expected ${normalize(expected)}` };
   return { passed: true, detail: `${liveUserDir} → ${expected}` };
 }
 
 // ── Hooks merge (InstallHooks core — the one genuinely-new piece) ──
+const DORMANT_USER_IMPORTS: Record<string, true> = {
+  "@LIFEOS/USER/TELOS/PRINCIPAL_TELOS.md": true,
+  "@LIFEOS/USER/PRINCIPAL/PRINCIPAL_IDENTITY.md": true,
+  "@LIFEOS/USER/DIGITAL_ASSISTANT/DA_IDENTITY.md": true,
+  "@LIFEOS/USER/PROJECTS.md": true,
+  "@LIFEOS/USER/CONFIG/OPERATIONAL_RULES.md": true,
+};
+
+function atomicWriteOwned(path: string, contents: string): void {
+  const temporary = join(dirname(path), `.${randomUUID()}.uai-tmp`);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporary, "wx", 0o600);
+    writeFileSync(descriptor, contents, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporary, path);
+  } catch (error) {
+    if (descriptor !== undefined) try { closeSync(descriptor); } catch { /* best effort */ }
+    try { unlinkSync(temporary); } catch { /* only our unpredictable temporary */ }
+    throw error;
+  }
+}
+
+export function activateImports(claudeMdPath: string, configRoot: string): { activated: string[]; skipped: string[] } {
+  const activated: string[] = [];
+  const skipped: string[] = [];
+  const normalizedRoot = resolve(configRoot);
+  const normalizedFile = resolve(claudeMdPath);
+  if (dirname(normalizedFile) !== normalizedRoot) return { activated, skipped };
+  if (!existsSync(normalizedFile)) return { activated, skipped };
+  let metadata;
+  try {
+    metadata = lstatSync(normalizedFile);
+  } catch {
+    return { activated, skipped };
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) return { activated, skipped };
+  const lines = readFileSync(normalizedFile, "utf-8").split("\n");
+  const commented = /^\s*#\s+(@LIFEOS\/USER\/[\w./-]+)\s*$|^\s*<!--\s*(@LIFEOS\/USER\/[\w./-]+)\s*-->\s*$/;
+  const out = lines.map((line) => {
+    const match = line.match(commented);
+    if (!match) return line;
+    const importPath = match[1] || match[2];
+    if (!DORMANT_USER_IMPORTS[importPath]) return line;
+    const relativeImport = importPath.slice(1);
+    const target = resolve(normalizedRoot, relativeImport);
+    if (!target.startsWith(`${normalizedRoot}${process.platform === "win32" ? "\\" : "/"}`)) {
+      skipped.push(importPath);
+      return line;
+    }
+    if (existsSync(target)) {
+      activated.push(importPath);
+      return importPath;
+    }
+    skipped.push(importPath);
+    return line;
+  });
+  if (activated.length > 0) atomicWriteOwned(normalizedFile, out.join("\n"));
+  return { activated, skipped };
+}
 
 type HookEntry = { type?: string; command?: string; url?: string; [k: string]: unknown };
 type MatcherGroup = { matcher?: string; hooks?: HookEntry[]; [k: string]: unknown };
 type HooksMap = Record<string, MatcherGroup[]>;
 
-/**
- * Normalize a hook command for dedup: collapse the harness/PAI path-var forms to
- * a single canonical token and squeeze whitespace, so the same hook expressed as
- * `${LIFEOS_DIR}/x`, `$LIFEOS_DIR/x`, or `~/.claude/x` dedupes to one.
- */
 function normalizeCommand(cmd: string): string {
   return cmd
     .replace(/\$\{?LIFEOS_DIR\}?|\$\{?CLAUDE_PROJECT_DIR\}?|\$\{?CLAUDE_PLUGIN_ROOT\}?|~\/\.claude|\$HOME\/\.claude|\$\{HOME\}\/\.claude/g, "§ROOT§")
@@ -569,46 +830,59 @@ function normalizeCommand(cmd: string): string {
     .trim();
 }
 
-/** Identity key for a hook entry: http → url, else normalized command. */
 function hookKey(h: HookEntry): string {
   if (h.type === "http" && h.url) return `http:${h.url}`;
   if (h.command) return `cmd:${normalizeCommand(h.command)}`;
   return `raw:${JSON.stringify(h)}`;
 }
 
+export function validateHooksMap(hooks: unknown, label: string): asserts hooks is HooksMap {
+  if (hooks === null || typeof hooks !== "object" || Array.isArray(hooks)) throw new Error(`${label} hooks must be an object`);
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) throw new Error(`${label} hook event '${event}' must be an array`);
+    for (const [index, group] of groups.entries()) {
+      if (group === null || typeof group !== "object" || Array.isArray(group)) throw new Error(`${label} hook group '${event}' at ${index} must be an object`);
+      const record = group as Record<string, unknown>;
+      if (record.matcher !== undefined && typeof record.matcher !== "string") throw new Error(`${label} hook matcher '${event}' at ${index} must be a string`);
+      if (!Array.isArray(record.hooks)) throw new Error(`${label} hook group '${event}' at ${index} must contain a hooks array`);
+      for (const [hookIndex, hook] of record.hooks.entries()) {
+        if (hook === null || typeof hook !== "object" || Array.isArray(hook)) throw new Error(`${label} hook '${event}' at ${index}/${hookIndex} must be an object`);
+        const entry = hook as Record<string, unknown>;
+        if (entry.type !== undefined && typeof entry.type !== "string") throw new Error(`${label} hook type '${event}' at ${index}/${hookIndex} must be a string`);
+        if (entry.command !== undefined && typeof entry.command !== "string") throw new Error(`${label} hook command '${event}' at ${index}/${hookIndex} must be a string`);
+        if (entry.url !== undefined && typeof entry.url !== "string") throw new Error(`${label} hook url '${event}' at ${index}/${hookIndex} must be a string`);
+      }
+    }
+  }
+}
 /**
  * Additively merge `incoming` hooks into `existing` settings.hooks, per matcher
  * bucket, idempotent by normalized-command (and url for http). NEVER removes or
  * reorders a foreign entry. Returns the merged map + counts. Pure (no I/O).
  */
 export function mergeHooks(existing: HooksMap, incoming: HooksMap): { merged: HooksMap; added: number; skipped: number } {
-  // Deep-clone existing so we never mutate the caller's object.
-  const merged: HooksMap = JSON.parse(JSON.stringify(existing ?? {}));
+  validateHooksMap(existing, "existing");
+  validateHooksMap(incoming, "incoming");
+  const merged: HooksMap = JSON.parse(JSON.stringify(existing));
   let added = 0;
   let skipped = 0;
-
-  for (const [event, incomingGroups] of Object.entries(incoming ?? {})) {
-    if (!Array.isArray(merged[event])) merged[event] = [];
-    const eventBucket = merged[event];
-
+  for (const [event, incomingGroups] of Object.entries(incoming)) {
+    const eventBucket = merged[event] ?? (merged[event] = []);
     for (const inGroup of incomingGroups) {
       const matcher = inGroup.matcher ?? "";
-      const inHooks = Array.isArray(inGroup.hooks) ? inGroup.hooks : [];
-      // Find a same-matcher group already present.
-      let target = eventBucket.find((g) => (g.matcher ?? "") === matcher);
+      const inHooks = inGroup.hooks!;
+      let target = eventBucket.find((group) => (group.matcher ?? "") === matcher);
       if (!target) {
-        // New matcher bucket — append a fresh group, then fill it (counts each hook as added).
         target = { matcher, hooks: [] };
         eventBucket.push(target);
       }
-      if (!Array.isArray(target.hooks)) target.hooks = [];
-      const present = new Set(target.hooks.map(hookKey));
-      for (const h of inHooks) {
-        const key = hookKey(h);
-        if (present.has(key)) {
-          skipped++;
-        } else {
-          target.hooks.push(h);
+      const targetHooks = target.hooks!;
+      const present = new Set(targetHooks.map(hookKey));
+      for (const hook of inHooks) {
+        const key = hookKey(hook);
+        if (present.has(key)) skipped++;
+        else {
+          targetHooks.push(hook);
           present.add(key);
           added++;
         }
@@ -616,38 +890,6 @@ export function mergeHooks(existing: HooksMap, incoming: HooksMap): { merged: Ho
     }
   }
   return { merged, added, skipped };
-}
-
-/**
- * Uncomment the identity `@`-imports in a CLAUDE.md, each guarded by existsSync
- * of its symlink-resolved target under configRoot. Lines shipped as
- * `<!-- @LIFEOS/USER/... -->` are activated to `@LIFEOS/USER/...` only when the target
- * resolves. Returns which imports were activated vs left commented.
- */
-export function activateImports(claudeMdPath: string, configRoot: string): { activated: string[]; skipped: string[] } {
-  const activated: string[] = [];
-  const skipped: string[] = [];
-  if (!existsSync(claudeMdPath)) return { activated, skipped };
-  const lines = readFileSync(claudeMdPath, "utf-8").split("\n");
-  // Two dormant-import conventions: the public CLAUDE.md ships `# @LIFEOS/USER/...`
-  // (hash-prefixed so the @ isn't at line-start and Claude Code skips it); the
-  // older form is `<!-- @LIFEOS/USER/... -->`. Activation strips the prefix so the
-  // import sits at line-start and resolves.
-  const commented = /^\s*#\s+(@[\w./-]+)\s*$|^\s*<!--\s*(@[\w./-]+)\s*-->\s*$/;
-  const out = lines.map((line) => {
-    const m = line.match(commented);
-    if (!m) return line;
-    const importPath = m[1] || m[2]; // e.g. @LIFEOS/USER/TELOS/PRINCIPAL_TELOS.md
-    const rel = importPath.replace(/^@/, "");
-    if (existsSync(join(configRoot, rel))) {
-      activated.push(importPath);
-      return importPath;
-    }
-    skipped.push(importPath);
-    return line;
-  });
-  if (activated.length > 0) writeFileSync(claudeMdPath, out.join("\n"));
-  return { activated, skipped };
 }
 
 export { resolve };

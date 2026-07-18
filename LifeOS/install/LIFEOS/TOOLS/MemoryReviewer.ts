@@ -34,17 +34,22 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
-  readdirSync,
+  lstatSync,
   readFileSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join as pathJoin, resolve as pathResolve } from "node:path";
-import { homedir } from "node:os";
+import { dirname, isAbsolute, join as pathJoin, relative, resolve as pathResolve } from "node:path";
 
 import { add as memoryAdd, type AddResult } from "./MemorySystem";
 import { read as memoryWriterRead } from "./MemoryWriter";
-import { isKnownType, type TypedItem } from "./MemoryTypes";
+import {
+  isKnownType,
+  PROPOSAL_KIND_TO_FILES,
+  USER_ROOT as CANONICAL_USER_ROOT,
+  type ProposalTargetKind,
+  type TypedItem,
+} from "./MemoryTypes";
 import { inference } from "./Inference";
 import { getPrincipalName, getDAName } from "../../hooks/lib/identity";
 import {
@@ -52,15 +57,20 @@ import {
   markProposal,
   logProposalEvent,
 } from "../PULSE/lib/telegram-proposals";
+import { parseTranscriptLines, type Provenance } from "../UNIVERSAL/canonical";
+import { resolveConfigRoot, resolveHome, resolveLifeosRoot } from "../UNIVERSAL/platform";
 
 // ── Constants ──
 
-const CLAUDE_ROOT = pathResolve(homedir(), ".claude");
-const HARNESS_PROJECTS_DIR = pathResolve(homedir(), ".claude", "projects");
-const OMP_SESSIONS_DIR = pathResolve(homedir(), ".omp", "agent", "sessions");
-const RUNS_LOG_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/reviewer-runs.jsonl");
-const RUNS_DEBUG_DIR = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/reviewer-runs");
-const REVIEW_CONFIG_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/CONFIG/memory-review.json");
+const HOME = resolveHome();
+const CLAUDE_ROOT = pathResolve(resolveConfigRoot(process.env, "claude"));
+const LIFEOS_DIR = pathResolve(resolveLifeosRoot(process.env, "claude"));
+const USER_ROOT = pathResolve(CANONICAL_USER_ROOT);
+const HARNESS_PROJECTS_DIR = pathResolve(process.env.CLAUDE_PROJECTS_DIR ?? pathResolve(CLAUDE_ROOT, "projects"));
+const OMP_SESSIONS_DIR = pathResolve(resolveConfigRoot(process.env, "omp"), "sessions");
+const RUNS_LOG_PATH = pathResolve(LIFEOS_DIR, "MEMORY/OBSERVABILITY/reviewer-runs.jsonl");
+const RUNS_DEBUG_DIR = pathResolve(LIFEOS_DIR, "MEMORY/OBSERVABILITY/reviewer-runs");
+const REVIEW_CONFIG_PATH = pathResolve(USER_ROOT, "CONFIG/memory-review.json");
 
 const DEFAULT_TURNS = 20;
 // Curation is heavier than the old additive capture — the reviewer now reads
@@ -86,10 +96,20 @@ function loadConfidenceThreshold(): number {
 
 // ── Conversation extraction ──
 
-interface Exchange {
+export interface Exchange {
   user: string;
   assistant: string;
   ts: string;
+  userProvenance: Provenance;
+  assistantProvenance: Provenance;
+  tainted: boolean;
+}
+
+export interface ExtractedExchanges extends Array<Exchange> {
+  transcriptUri: string;
+  malformedCount: number;
+  warnings: string[];
+  tainted: boolean;
 }
 
 /**
@@ -120,6 +140,34 @@ function collectSessionJsonl(root: string, out: Array<{ path: string; mtime: num
   }
 }
 
+function isPhysicalTranscriptUnder(transcriptPath: string, root: string): boolean {
+  const absolutePath = pathResolve(transcriptPath);
+  const absoluteRoot = pathResolve(root);
+  const delta = relative(absoluteRoot, absolutePath);
+  if (!delta || delta.startsWith("..") || isAbsolute(delta)) return false;
+  try {
+    const rootMetadata = lstatSync(absoluteRoot);
+    if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) return false;
+    let cursor = absolutePath;
+    while (cursor !== absoluteRoot) {
+      const metadata = lstatSync(cursor);
+      if (metadata.isSymbolicLink()) return false;
+      cursor = dirname(cursor);
+    }
+    return lstatSync(absolutePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function transcriptProvenance(transcriptPath: string): "trusted" | "tainted" | "unknown" {
+  if (!existsSync(transcriptPath)) return "unknown";
+  return isPhysicalTranscriptUnder(transcriptPath, HARNESS_PROJECTS_DIR)
+    || isPhysicalTranscriptUnder(transcriptPath, OMP_SESSIONS_DIR)
+    ? "trusted"
+    : "tainted";
+}
+
 function findMostRecentTranscript(): string | null {
   const candidates: Array<{ path: string; mtime: number }> = [];
   collectSessionJsonl(HARNESS_PROJECTS_DIR, candidates);
@@ -135,62 +183,79 @@ function findMostRecentTranscript(): string | null {
  * Tool-use blocks and system messages are filtered out — the reviewer only
  * needs the conversational surface.
  */
-export function extractRecentExchanges(transcriptPath: string, maxExchanges: number): Exchange[] {
-  if (!existsSync(transcriptPath)) return [];
-
-  const lines = readFileSync(transcriptPath, "utf8").split("\n").filter((l) => l.trim().length > 0);
-  const events: Array<{ ts: string; role: string; text: string }> = [];
-
-  for (const line of lines) {
-    let event: any;
-    try { event = JSON.parse(line); } catch { continue; }
-
-    const role = event?.message?.role ?? event?.role ?? null;
-    if (role !== "user" && role !== "assistant") continue;
-
-    const ts = event?.timestamp ?? event?.message?.created_at ?? new Date().toISOString();
-    const content = event?.message?.content;
-    let text = "";
-
-    if (typeof content === "string") {
-      text = content;
-    } else if (Array.isArray(content)) {
-      // Extract only text blocks; skip tool_use, tool_result, image, etc.
-      text = content
-        .filter((b: any) => b?.type === "text" && typeof b.text === "string")
-        .map((b: any) => b.text)
-        .join("\n")
-        .trim();
-    }
-
-    if (text.length > 0) {
-      events.push({ ts, role, text });
-    }
+export function extractRecentExchanges(transcriptPath: string, maxExchanges: number): ExtractedExchanges {
+  const empty = Object.assign([] as Exchange[], {
+    transcriptUri: transcriptPath,
+    malformedCount: 0,
+    warnings: [] as string[],
+    tainted: false,
+  }) as ExtractedExchanges;
+  const pathProvenance = transcriptProvenance(transcriptPath);
+  if (pathProvenance !== "trusted") {
+    return Object.assign(empty, { tainted: pathProvenance === "tainted" }) as ExtractedExchanges;
   }
+  const lines = readFileSync(transcriptPath, "utf8").split("\n");
+  const adapterId = pathResolve(transcriptPath).startsWith(pathResolve(OMP_SESSIONS_DIR))
+    ? "omp"
+    : "claude";
+  const parsed = parseTranscriptLines(adapterId, lines, transcriptPath, "memory-reviewer.v1");
+  const textContent = (content: unknown): string => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content
+      .filter((block): block is Record<string, unknown> => typeof block === "object" && block !== null && !Array.isArray(block))
+      .filter((block) => block.type === "text" && typeof block.text === "string")
+      .map((block) => String(block.text))
+      .join("\n")
+      .trim();
+  };
+  const events = parsed.entries
+    .filter((entry) => entry.role === "user" || entry.role === "assistant")
+    .map((entry) => ({
+      role: entry.role,
+      text: textContent(entry.content),
+      provenance: entry.provenance,
+    }))
+    .filter((entry) => entry.text.length > 0);
 
-  // Walk forward, pair user→assistant. Cap each message so a single giant turn
-  // (huge tool dumps, pasted reports) can't blow the inference budget — the
-  // reviewer only needs the gist to extract durable facts, not full transcripts.
-  // Keeps the curation pass bounded regardless of how large any one turn was.
   const MAX_MSG_CHARS = 2000;
-  const cap = (s: string): string =>
-    s.length > MAX_MSG_CHARS ? s.slice(0, MAX_MSG_CHARS) + " …[truncated]" : s;
+  const cap = (value: string): string =>
+    value.length > MAX_MSG_CHARS ? `${value.slice(0, MAX_MSG_CHARS)} …[truncated]` : value;
   const exchanges: Exchange[] = [];
   for (let i = 0; i < events.length; i++) {
-    if (events[i].role === "user") {
-      const next = events[i + 1];
-      if (next && next.role === "assistant") {
-        exchanges.push({ user: cap(events[i].text), assistant: cap(next.text), ts: events[i].ts });
-        i++; // skip the assistant turn
-      }
+    const current = events[i];
+    const next = events[i + 1];
+    if (current?.role === "user" && next?.role === "assistant") {
+      const tainted = current.provenance.tainted === true || next.provenance.tainted === true;
+      exchanges.push({
+        user: cap(current.text),
+        assistant: cap(next.text),
+        ts: `${current.provenance.transcriptUri}#L${current.provenance.sourceLine}`,
+        userProvenance: current.provenance,
+        assistantProvenance: next.provenance,
+        tainted,
+      });
+      i++;
     }
   }
-
-  // Return last N
-  return exchanges.slice(-maxExchanges);
+  const result = exchanges.slice(-maxExchanges);
+  return Object.assign(result, {
+    transcriptUri: transcriptPath,
+    malformedCount: parsed.malformedCount,
+    warnings: parsed.warnings,
+    tainted: parsed.malformedCount > 0 || result.some((exchange) => exchange.tainted),
+  }) as ExtractedExchanges;
 }
 
 // ── Reviewer prompt ──
+
+export function reviewerProposalTargets(): Readonly<Record<ProposalTargetKind, readonly string[]>> {
+  return PROPOSAL_KIND_TO_FILES;
+}
+
+function proposalTargetText(kind: ProposalTargetKind): string {
+  return PROPOSAL_KIND_TO_FILES[kind].join(" OR ");
+}
 
 const REVIEWER_SYSTEM_PROMPT = `You are {{DA_NAME}}'s Memory Reviewer — a background process that reads recent conversation between {{PRINCIPAL_NAME}} and {{DA_NAME}}, and extracts durable signal as a flat list of typed items.
 
@@ -225,35 +290,35 @@ TYPE GUIDANCE:
 
 PROPOSAL SUBTYPES (target_kind → target_file → what to emit):
 
-- identity → LIFEOS/USER/PRINCIPAL/PRINCIPAL_IDENTITY.md OR LIFEOS/USER/DIGITAL_ASSISTANT/DA_IDENTITY.md
+- identity → ${proposalTargetText("identity")}
   Emit when: {{PRINCIPAL_NAME}} reveals a durable identity-level fact about himself or about how he wants {{DA_NAME}} to operate.
   Example: {"type":"proposal","target_kind":"identity","target_file":"<absolute path to PRINCIPAL_IDENTITY.md>","edit":"RULE: Always confirm before deploying to production","confidence":0.85,"rationale":"observed across N turns; principal explicitly asked for confirmation gate"}.
 
-- style → LIFEOS/USER/PRINCIPAL/WRITINGSTYLE.md
+- style → ${proposalTargetText("style")}
   Emit when: {{PRINCIPAL_NAME}} corrects voice/tone/cadence/word choice in a way that generalizes beyond the moment. Banned vocabulary, preferred constructions, rhythmic preferences.
   Example: edit="BAN: 'underscores' — replace with 'shows' or 'proves'".
 
-- definition → LIFEOS/USER/DEFINITIONS.md
+- definition → ${proposalTargetText("definition")}
   Emit when: {{PRINCIPAL_NAME}} defines a term (his coined concept, a principle's exact meaning, an acronym he uses) that future {{DA_NAME}} will need to interpret correctly.
   Example: edit="**Human 3.0** — humans transitioning from corporate (2.0) to creative self-expression (3.0) via AI-enabled augmentation".
 
-- canonical-content → LIFEOS/USER/CANONICAL_CONTENT.md
+- canonical-content → ${proposalTargetText("canonical-content")}
   Emit when: {{PRINCIPAL_NAME}} names a piece of content (post, talk, framework) as canonical / pillar / essential to his published body of work.
   Example: edit="- SPQA framework (2024 blog) — canonical reference for the four-stage AI architecture pattern".
 
-- resume → LIFEOS/USER/PRINCIPAL/RESUME.md
+- resume → ${proposalTargetText("resume")}
   Emit when: {{PRINCIPAL_NAME}} mentions a career fact (new role, certification, achievement, year of service) that should land in the resume.
   Example: edit="- Speaking: B-Sides SF 2026 keynote on Human 3.0".
 
-- operational-rule → LIFEOS/USER/CONFIG/OPERATIONAL_RULES.md
+- operational-rule → ${proposalTargetText("operational-rule")}
   Emit when: {{PRINCIPAL_NAME}} states an operating directive about HOW {{DA_NAME}}/PAI should handle a class of work — tooling preference, deployment ritual, repo convention, environment-specific behavior.
   Example: edit="**Ship-it directive** — when {{PRINCIPAL_NAME}} says 'ship it' on a Cloudflare repo, deploy AND push to main in one atomic operation".
 
-- projects → LIFEOS/USER/PROJECTS.md
+- projects → ${proposalTargetText("projects")}
   Emit when: {{PRINCIPAL_NAME}} names a new project (repo, app, service, side build) that should be in the project routing table. Propose the row, not the body content.
   Example: edit="| **NewProject** | \`~/Projects/NewProject\` | newproject.com | bun run deploy | TS, CF Workers |".
 
-- contacts → LIFEOS/USER/CONTACTS.md
+- contacts → ${proposalTargetText("contacts")}
   Emit when: {{PRINCIPAL_NAME}} mentions a person 3+ times with enough context (role, relationship, why they matter) to add to the contacts file.
 
 DO SAVE:
@@ -294,8 +359,8 @@ export interface CurrentMemorySnapshot {
   assistant: string[];
 }
 
-const PRINCIPAL_MEMORY_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md");
-const DA_MEMORY_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/DIGITAL_ASSISTANT/DA_MEMORY.md");
+const PRINCIPAL_MEMORY_PATH = pathResolve(USER_ROOT, "PRINCIPAL/PRINCIPAL_MEMORY.md");
+const DA_MEMORY_PATH = pathResolve(USER_ROOT, "DIGITAL_ASSISTANT/DA_MEMORY.md");
 
 /** Read both hot-layer files' current entries so the reviewer curates against reality. */
 export function readCurrentMemorySnapshot(): CurrentMemorySnapshot {
@@ -324,16 +389,17 @@ function renderCurrentMemory(snap: CurrentMemorySnapshot | undefined): string[] 
 export function buildReviewerUserPrompt(exchanges: Exchange[], currentMemory?: CurrentMemorySnapshot): string {
   const lines = [
     ...renderCurrentMemory(currentMemory),
-    "Recent conversation between {{PRINCIPAL_NAME}} and {{DA_NAME}} (last " + exchanges.length + " exchanges):",
+    `Recent conversation between {{PRINCIPAL_NAME}} and {{DA_NAME}} (last ${exchanges.length} exchanges):`,
     "",
   ];
   for (let i = 0; i < exchanges.length; i++) {
     const ex = exchanges[i];
-    lines.push(`--- Exchange ${i + 1} (${ex.ts}) ---`);
+    lines.push(`--- Exchange ${i + 1} (${ex.ts})${ex.tainted ? " [TAINTED]" : ""} ---`);
+    lines.push(`Provenance: user=${ex.userProvenance.transcriptUri}#L${ex.userProvenance.sourceLine}; assistant=${ex.assistantProvenance.transcriptUri}#L${ex.assistantProvenance.sourceLine}`);
     lines.push(`{{PRINCIPAL_NAME}}: ${ex.user}`);
-    lines.push(``);
+    lines.push("");
     lines.push(`{{DA_NAME}}: ${ex.assistant}`);
-    lines.push(``);
+    lines.push("");
   }
   lines.push("Curate memory (return the full desired list per file you change via op:\"set\") and extract any idea/knowledge/proposal items. Return JSON only.");
   return lines.join("\n");
@@ -413,12 +479,24 @@ export interface DispatchSummary {
   succeeded: number;
   failed: number;
   failures: Array<{ index: number; type: string; error: string }>;
-  /** ISC-68 / ISC-157: high-confidence proposals auto-applied alongside enqueue. */
   proposals_auto_applied: number;
   proposals_auto_apply_failed: number;
 }
 
-export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; confidenceThreshold?: number } = {}): { summary: DispatchSummary; results: AddResult[] } {
+export interface DispatchOptions {
+  dryRun?: boolean;
+  confidenceThreshold?: number;
+  provenance?: "trusted" | "tainted" | "unknown";
+}
+
+export function reviewerProvenance(
+  exchanges: Pick<ExtractedExchanges, "length" | "malformedCount" | "tainted">,
+): "trusted" | "tainted" | "unknown" {
+  if (exchanges.tainted || exchanges.malformedCount > 0) return "tainted";
+  return exchanges.length > 0 ? "trusted" : "unknown";
+}
+
+export function dispatchItems(items: TypedItem[], opts: DispatchOptions = {}): { summary: DispatchSummary; results: AddResult[] } {
   const summary: DispatchSummary = {
     total: items.length,
     by_type: {},
@@ -434,7 +512,6 @@ export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; conf
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     summary.by_type[item.type] = (summary.by_type[item.type] || 0) + 1;
-
     if (opts.dryRun) {
       results.push({ ok: true, type: item.type, path: "(dry-run)", detail: { dry: true } } as AddResult);
       summary.succeeded++;
@@ -443,49 +520,43 @@ export function dispatchItems(items: TypedItem[], opts: { dryRun?: boolean; conf
 
     const result = memoryAdd(item);
     results.push(result);
-    if (result.ok) {
-      summary.succeeded++;
-
-      // ISC-68 / ISC-157: direct-apply branch for high-confidence proposals.
-      // The enqueue already landed via MemorySystem.add → pending-proposals.jsonl.
-      // For proposals at or above the threshold, ALSO apply the edit to the
-      // Tier C target file and transition status pending → auto-applied.
-      // This is the orchestrator that was deferred from MemorySystem.add (which
-      // is a pure TS module and cannot reach into Claude-side skills).
-      if (item.type === "proposal" && typeof item.confidence === "number" && item.confidence >= threshold) {
-        const proposalId = (result.detail?.id as string | undefined) ?? null;
-        const applied = applyProposalEdit(item.target_file, item.edit);
-        if (applied.ok && proposalId) {
-          markProposal(proposalId, {
-            status: "auto-applied",
-            resolved_at: new Date().toISOString(),
-            applied_edit: item.edit,
-          });
-          logProposalEvent({
-            id: proposalId,
-            file: item.target_file,
-            edit: item.edit,
-            confidence: item.confidence,
-            status: "auto-applied",
-            threshold,
-          });
-          summary.proposals_auto_applied++;
-        } else {
-          logProposalEvent({
-            id: proposalId,
-            file: item.target_file,
-            edit: item.edit,
-            confidence: item.confidence,
-            status: "auto-apply-failed",
-            reason: applied.ok ? "missing-id" : applied.reason,
-            threshold,
-          });
-          summary.proposals_auto_apply_failed++;
-        }
-      }
-    } else {
+    if (!result.ok) {
       summary.failed++;
       summary.failures.push({ index: i, type: item.type, error: `${result.code}: ${result.message}` });
+      continue;
+    }
+    summary.succeeded++;
+
+    if (item.type === "proposal" && opts.provenance === "trusted" && typeof item.confidence === "number" && item.confidence >= threshold) {
+      const proposalId = (result.detail?.id as string | undefined) ?? null;
+      const applied = applyProposalEdit(item.target_file, item.edit, item.target_kind);
+      if (applied.ok && proposalId) {
+        markProposal(proposalId, {
+          status: "auto-applied",
+          resolved_at: new Date().toISOString(),
+          applied_edit: item.edit,
+        });
+        logProposalEvent({
+          id: proposalId,
+          file: item.target_file,
+          edit: item.edit,
+          confidence: item.confidence,
+          status: "auto-applied",
+          threshold,
+        });
+        summary.proposals_auto_applied++;
+      } else {
+        logProposalEvent({
+          id: proposalId,
+          file: item.target_file,
+          edit: item.edit,
+          confidence: item.confidence,
+          status: "auto-apply-failed",
+          reason: applied.ok ? "missing-id" : applied.reason,
+          threshold,
+        });
+        summary.proposals_auto_apply_failed++;
+      }
     }
   }
 
@@ -529,6 +600,9 @@ export interface ReviewOptions {
 export interface ReviewResult {
   ok: boolean;
   runId: string;
+  malformed_transcript_rows?: number;
+  transcript_warnings?: string[];
+  transcript_tainted?: boolean;
   transcript: string | null;
   exchanges: number;
   inference_duration_ms: number;
@@ -552,26 +626,38 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
   // 2. Extract exchanges
   const exchanges = extractRecentExchanges(transcript, turns);
   if (exchanges.length === 0) {
-    const result: ReviewResult = { ok: false, runId, transcript, exchanges: 0, inference_duration_ms: 0, parse_ok: false, error: "no exchanges extracted" };
+    const result: ReviewResult = {
+      ok: false,
+      runId,
+      transcript,
+      exchanges: 0,
+      malformed_transcript_rows: exchanges.malformedCount,
+      transcript_warnings: exchanges.warnings,
+      transcript_tainted: exchanges.tainted,
+      inference_duration_ms: 0,
+      parse_ok: false,
+      error: "no exchanges extracted",
+    };
     logRunSummary({ ts: new Date().toISOString(), ...result });
     return result;
   }
 
-  // 3. Build prompt — inject CURRENT memory state so the reviewer curates
-  //    against reality (the op:"set" path REPLACES, so it must see what's there).
   const snapshot = readCurrentMemorySnapshot();
-  // Resolve {{PRINCIPAL_NAME}} / {{DA_NAME}} placeholders (present in shipped
-  // installs after the release scrubber) to the configured identity before the
-  // prompts reach the model. No-op in the live tree.
   const systemPrompt = renderNames(REVIEWER_SYSTEM_PROMPT);
   const userPrompt = renderNames(buildReviewerUserPrompt(exchanges, snapshot));
   writeRunDebug(runId, {
     "prompt.system.md": systemPrompt,
     "prompt.user.md": userPrompt,
-    "transcript.txt": `Source: ${transcript}\nExchanges: ${exchanges.length}\n`,
+    "transcript.txt": [
+      `Source: ${exchanges.transcriptUri}`,
+      `Exchanges: ${exchanges.length}`,
+      `Malformed: ${exchanges.malformedCount}`,
+      `Tainted: ${exchanges.tainted}`,
+      ...exchanges.warnings,
+      "",
+    ].join("\n"),
   });
 
-  // 4. Call inference (or use mock)
   let inferenceOutput: string;
   let inferenceDuration: number;
   if (opts.mockInferenceResponse !== undefined) {
@@ -579,54 +665,81 @@ export async function review(opts: ReviewOptions = {}): Promise<ReviewResult> {
     inferenceDuration = 0;
   } else {
     const startedAt = Date.now();
-    const result = await inference({
+    const inferenceResult = await inference({
       systemPrompt,
       userPrompt,
       level: "medium",
-      expectJson: false,         // we parse ourselves for tolerance
+      expectJson: false,
       timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     });
     inferenceDuration = Date.now() - startedAt;
-    if (!result.success) {
-      const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: false, error: `inference failed: ${result.error}` };
+    if (!inferenceResult.success) {
+      const failed: ReviewResult = {
+        ok: false,
+        runId,
+        transcript,
+        exchanges: exchanges.length,
+        malformed_transcript_rows: exchanges.malformedCount,
+        transcript_warnings: exchanges.warnings,
+        transcript_tainted: exchanges.tainted,
+        inference_duration_ms: inferenceDuration,
+        parse_ok: false,
+        error: `inference failed: ${inferenceResult.error}`,
+      };
       logRunSummary({ ts: new Date().toISOString(), ...failed });
       return failed;
     }
-    inferenceOutput = result.output;
+    inferenceOutput = inferenceResult.output;
   }
   writeRunDebug(runId, { "response.raw.txt": inferenceOutput });
 
-  // 5. Parse output
   const parsed = parseReviewerOutput(inferenceOutput);
   if (!parsed.ok) {
     writeRunDebug(runId, { "parse-error.txt": `${parsed.error}\n\nRaw:\n${parsed.raw}` });
-    const failed: ReviewResult = { ok: false, runId, transcript, exchanges: exchanges.length, inference_duration_ms: inferenceDuration, parse_ok: false, error: `parse failed: ${parsed.error}` };
+    const failed: ReviewResult = {
+      ok: false,
+      runId,
+      transcript,
+      exchanges: exchanges.length,
+      malformed_transcript_rows: exchanges.malformedCount,
+      transcript_warnings: exchanges.warnings,
+      transcript_tainted: exchanges.tainted,
+      inference_duration_ms: inferenceDuration,
+      parse_ok: false,
+      error: `parse failed: ${parsed.error}`,
+    };
     logRunSummary({ ts: new Date().toISOString(), ...failed });
     return failed;
   }
   writeRunDebug(runId, { "response.parsed.json": JSON.stringify(parsed.output, null, 2) });
 
-  // 6. Dispatch
-  const { summary, results } = dispatchItems(parsed.output.items, { dryRun: opts.dryRun });
+  const { summary, results } = dispatchItems(parsed.output.items, {
+    dryRun: opts.dryRun,
+    provenance: reviewerProvenance(exchanges),
+  });
   writeRunDebug(runId, {
     "dispatch.log": [
       `Items: ${summary.total} (succeeded=${summary.succeeded} failed=${summary.failed})`,
       `By type: ${JSON.stringify(summary.by_type)}`,
-      ...summary.failures.map((f) => `  FAIL [${f.index}] ${f.type}: ${f.error}`),
+      ...summary.failures.map((failure) => `  FAIL [${failure.index}] ${failure.type}: ${failure.error}`),
       "",
       "Per-item results:",
-      ...results.map((r, i) => `[${i}] ${r.ok ? "OK " + (r as any).type : "FAIL " + (r as any).code}: ${r.ok ? (r as any).path?.replace(CLAUDE_ROOT, "~/.claude") : (r as any).message}`),
+      ...results.map((dispatchResult, index) => `[${index}] ${dispatchResult.ok ? `OK ${dispatchResult.type}` : `FAIL ${dispatchResult.code}`}: ${dispatchResult.ok ? dispatchResult.path?.replace(CLAUDE_ROOT, "~/.claude") : dispatchResult.message}`),
     ].join("\n"),
   });
 
   const result: ReviewResult = {
-    ok: true,
+    ok: summary.failed === 0,
     runId,
     transcript,
     exchanges: exchanges.length,
+    malformed_transcript_rows: exchanges.malformedCount,
+    transcript_warnings: exchanges.warnings,
+    transcript_tainted: exchanges.tainted,
     inference_duration_ms: inferenceDuration,
     parse_ok: true,
     dispatch_summary: summary,
+    ...(summary.failed > 0 ? { error: `${summary.failed} item(s) failed dispatch` } : {}),
   };
   logRunSummary({ ts: new Date().toISOString(), ...result });
   return result;
@@ -685,7 +798,7 @@ async function smokeTest(): Promise<number> {
   const mockResponse = JSON.stringify({
     items: [
       { type: "memory", actor: "principal", content: "PREFERENCE: smoke E2E mock" },
-      { type: "proposal", target_file: pathJoin(homedir(), ".claude/LIFEOS/USER/PRINCIPAL/PRINCIPAL_IDENTITY.md"), edit: "RULE: E2E mock", confidence: 0.5, rationale: "smoke" },
+      { type: "proposal", target_kind: "identity", target_file: PROPOSAL_KIND_TO_FILES.identity[0], edit: "RULE: E2E mock", confidence: 0.5, rationale: "smoke" },
     ],
   });
 
@@ -719,11 +832,11 @@ async function smokeTest(): Promise<number> {
   // Cleanup synthetic memory entry
   try {
     const { read: mwRead, setEntries: mwSet } = await import("./MemoryWriter");
-    const PRINCIPAL_MEMORY_PATH = pathJoin(CLAUDE_ROOT, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md");
-    const cur = mwRead(PRINCIPAL_MEMORY_PATH);
+    const principalMemoryPath = pathJoin(USER_ROOT, "PRINCIPAL", "PRINCIPAL_MEMORY.md");
+    const cur = mwRead(principalMemoryPath);
     if (!("code" in cur)) {
       const cleaned = cur.entries.filter((e) => !e.includes("smoke E2E mock"));
-      mwSet(PRINCIPAL_MEMORY_PATH, cleaned, { updatedBy: "smoke-test-cleanup" });
+      mwSet(principalMemoryPath, cleaned, { updatedBy: "smoke-test-cleanup" });
     }
   } catch { /* ignore */ }
 

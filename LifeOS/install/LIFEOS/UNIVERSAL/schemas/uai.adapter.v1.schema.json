@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uai.dev/schema/uai.adapter.v1.json",
+  "title": "UAI Adapter v1 Descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "adapter", "discovery"],
+  "properties": {
+    "contract": { "const": "uai.adapter.v1" },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "class"],
+      "properties": {
+        "id": { "anyOf": [{ "enum": ["claude", "omp", "codex", "opencode", "unknown"] }, { "type": "string", "pattern": "^external:[a-z0-9][a-z0-9._-]*$" }] },
+        "version": { "type": "string", "minLength": 1 },
+        "class": { "enum": ["native", "compatibility", "wrapper-proxy", "discovery-only", "unsupported"] }
+      }
+    },
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "confidence"],
+      "properties": {
+        "state": { "enum": ["detected", "unsupported"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "roots": { "type": "array", "items": { "type": "string" } },
+        "cliVersion": { "type": "string" }
+      }
+    },
+    "capabilities": { "type": "object", "additionalProperties": { "$ref": "#/$defs/capability" } },
+    "certification": { "enum": ["C0", "C1", "C2", "C2-W", "C3", "C4", "C5"] },
+    "losses": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapterVersion", "cliVersion", "platform", "probeId", "observedAt", "evidenceUri"],
+      "properties": {
+        "adapterVersion": { "type": "string", "minLength": 1 },
+        "cliVersion": { "type": "string", "minLength": 1 },
+        "platform": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["os", "profile"],
+          "properties": { "os": { "type": "string", "minLength": 1 }, "profile": { "type": "string", "minLength": 1 } }
+        },
+        "probeId": { "type": "string", "minLength": 1 },
+        "observedAt": { "type": "string", "format": "date-time" },
+        "evidenceUri": { "type": "string", "minLength": 1 }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "critical": { "type": "boolean" },
+        "state": { "enum": ["unsupported", "detected", "installed", "wired", "active", "degraded", "failed", "declined"] },
+        "failMode": { "enum": ["fail-closed", "fail-visible-open", "advisory", "unsupported"] },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "losses": { "type": "array", "items": { "type": "string" } }
+      },
+      "allOf": [{
+        "if": { "properties": { "critical": { "const": true }, "state": { "const": "active" } }, "required": ["critical", "state"] },
+        "then": { "required": ["evidence"] }
+      }]
+    }
+  }
+}

@@ -13,8 +13,10 @@
 
 import { existsSync, mkdirSync, appendFileSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import { spawn } from "node:child_process";
+import { getOmpSessionIdentity } from "../../session";
+import { redactSensitiveValue } from "../../../UNIVERSAL/canonical";
 
 interface ContextUsage {
 	tokens?: number;
@@ -27,6 +29,7 @@ interface ExtensionCtx {
 	cwd?: string;
 	model?: { id?: string; name?: string };
 	getContextUsage?: () => ContextUsage | undefined | Promise<ContextUsage | undefined>;
+	sessionManager?: { getSessionFile?: () => string | undefined };
 	ui?: {
 		setStatus?: (key: string, text: string) => void;
 		notify?: (message: string, level?: string) => void;
@@ -43,12 +46,12 @@ interface ExtensionApi {
 	) => void;
 }
 
-const HOME = homedir();
-const LIFEOS_DIR = process.env.LIFEOS_DIR ?? join(HOME, ".claude", "LIFEOS");
+const HOME = normalize(process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir());
+const LIFEOS_DIR = normalize(process.env.LIFEOS_DIR ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(HOME, ".claude"), "LIFEOS"));
 const OBS_DIR = join(LIFEOS_DIR, "MEMORY", "OBSERVABILITY");
 const ACTIVITY_FILE = join(OBS_DIR, "tool-activity.jsonl");
 const FAILURES_FILE = join(OBS_DIR, "tool-failures.jsonl");
-const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(HOME, ".omp", "agent");
+const AGENT_DIR = normalize(process.env.PI_CODING_AGENT_DIR ?? join(HOME, ".omp", "agent"));
 const STATUSLINE_SCRIPT = join(LIFEOS_DIR, "LIFEOS_StatusLine.sh");
 // Full statusline panel opt-out marker (panel defaults ON when the script exists).
 const STATUSLINE_OFF_MARKER = join(AGENT_DIR, "lifeos-statusline.off");
@@ -87,7 +90,7 @@ function inputPreview(event: unknown): string {
 	const input = readField(event, "input") ?? readField(event, "args");
 	if (input === undefined) return "";
 	try {
-		return JSON.stringify(input).slice(0, 200);
+		return JSON.stringify(redactSensitiveValue(input)).slice(0, 200);
 	} catch {
 		return "";
 	}
@@ -96,7 +99,7 @@ function inputPreview(event: unknown): string {
 function appendJsonl(file: string, record: Record<string, unknown>): void {
 	try {
 		if (!existsSync(OBS_DIR)) mkdirSync(OBS_DIR, { recursive: true });
-		appendFileSync(file, `${JSON.stringify(record)}\n`, "utf-8");
+		appendFileSync(file, `${JSON.stringify(redactSensitiveValue(record))}\n`, "utf-8");
 	} catch {
 		/* observability never breaks a tool call */
 	}
@@ -130,10 +133,13 @@ const ompVersionPromise: Promise<string> = (() => {
  * statusline.
  */
 async function runStatusLine(ctx: ExtensionCtx, usage: ContextUsage | undefined): Promise<string[]> {
+	if (process.platform === "win32") return [];
 	const version = await ompVersionPromise;
 	const { promise, resolve } = Promise.withResolvers<string[]>();
+	const identity = getOmpSessionIdentity(ctx, AGENT_DIR);
 	const stdin = JSON.stringify({
-		session_id: "omp",
+		session_id: identity.uaiSessionId,
+		native_session_id: identity.nativeSessionId,
 		workspace: { current_dir: ctx.cwd ?? process.cwd() },
 		model: { display_name: ctx.model?.name ?? ctx.model?.id ?? "unknown" },
 		harness: { name: "OMP", version },
@@ -236,8 +242,30 @@ export default function lifeosObservability(pi: ExtensionApi): void {
 	// ── Full statusline panel (the CC statusline, rendered as an OMP widget) ──
 	// Default ON when the script exists; `/statusline off` writes the opt-out marker.
 	let paintingPanel = false;
+	let statuslineAdvisoryRecorded = false;
+	function recordStatuslineAdvisory(ctx: ExtensionCtx, reason: string): void {
+		if (statuslineAdvisoryRecorded) return;
+		statuslineAdvisoryRecorded = true;
+		appendJsonl(join(OBS_DIR, "statusline-degraded.jsonl"), {
+			timestamp: new Date().toISOString(),
+			adapter_id: "omp",
+			status: "degraded",
+			reason,
+		});
+		const message = `LifeOS statusline degraded: ${reason}`;
+		if (ctx.ui?.notify) ctx.ui.notify(message, "warning");
+		else process.stderr.write(`${message}\n`);
+	}
 	async function paintPanel(ctx: ExtensionCtx): Promise<void> {
-		if (!ctx.hasUI || !ctx.ui?.setWidget) return;
+		if (!ctx.hasUI || !ctx.ui?.setWidget) {
+			recordStatuslineAdvisory(ctx, "headless OMP has no widget surface");
+			return;
+		}
+		if (process.platform === "win32") {
+			recordStatuslineAdvisory(ctx, "the Bash statusline panel is unavailable on native Windows; compact OMP status remains available");
+			ctx.ui.setWidget("lifeos-statusline", undefined);
+			return;
+		}
 		if (!existsSync(STATUSLINE_SCRIPT) || existsSync(STATUSLINE_OFF_MARKER)) {
 			ctx.ui.setWidget("lifeos-statusline", undefined);
 			return;
@@ -288,10 +316,14 @@ export default function lifeosObservability(pi: ExtensionApi): void {
 	pi.on("tool_execution_end", (event, ctx) => {
 		toolCount++;
 		noteSlugFromEvent(readField(event, "data") ?? event);
+		const identity = getOmpSessionIdentity(ctx, AGENT_DIR);
 		appendJsonl(ACTIVITY_FILE, {
 			timestamp: new Date().toISOString(),
 			type: "tool_use",
-			session_id: "omp",
+			session_id: identity.uaiSessionId,
+			native_session_id: identity.nativeSessionId,
+			profile_root: identity.profileRoot,
+			transcript_path: identity.transcriptPath,
 			tool_name: ccToolName(readField(event, "data") ?? event),
 			tool_input_preview: inputPreview(readField(event, "data") ?? event),
 			harness: "omp",
@@ -312,10 +344,14 @@ export default function lifeosObservability(pi: ExtensionApi): void {
 				.trim();
 			if (text.length > 0) error = text;
 		}
+		const identity = getOmpSessionIdentity(ctx, AGENT_DIR);
 		appendJsonl(FAILURES_FILE, {
 			timestamp: new Date().toISOString(),
 			event: "tool_failure",
-			session_id: "omp",
+			session_id: identity.uaiSessionId,
+			native_session_id: identity.nativeSessionId,
+			profile_root: identity.profileRoot,
+			transcript_path: identity.transcriptPath,
 			tool_name: ccToolName(event),
 			error: error.slice(0, 1000),
 			tool_input_preview: inputPreview(event),

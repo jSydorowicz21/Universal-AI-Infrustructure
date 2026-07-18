@@ -10,7 +10,6 @@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { spawnSync } from "child_process";
-import { parse as parseYaml } from "yaml";
 
 const HOME = process.env.HOME!;
 const CLAUDE_DIR = join(HOME, ".claude");
@@ -159,7 +158,9 @@ function getStats(): SystemStats {
       const content = readFileSync(daPath, "utf-8");
       const m = content.match(/^---\n([\s\S]*?)\n---/);
       if (m) {
-        const fm: any = parseYaml(m[1]) || {};
+        const fm = (Bun.YAML.parse(m[1]) ?? {}) as {
+          core?: { display_name?: string; name?: string; startup_catchphrase?: string };
+        };
         const core = fm.core ?? {};
         name = core.display_name || core.name || "LifeOS";
         const cp = core.startup_catchphrase as string | undefined;

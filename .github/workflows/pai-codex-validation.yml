@@ -1,16 +1,15 @@
-name: PAI Codex Validation
+name: LifeOS Cross-Platform Validation
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - pai-codex-flawless-runtime
-      - pai-codex-windows-installer
+      - main
+      - feat/sync-upstream-lifeos
   pull_request:
     paths:
+      - "LifeOS/**"
       - ".github/workflows/pai-codex-validation.yml"
-      - "README.md"
-      - "Releases/v5.0.0/**"
 
 jobs:
   validate:
@@ -31,5 +30,46 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
-      - name: Run Codex branch validation
-        run: bun Releases/v5.0.0/.claude/PAI/TOOLS/CodexBranchValidation.ts
+      - name: Install shipped runtime dependencies
+        run: bun install --cwd LifeOS/install
+      - name: Compile OMP integration entries
+        run: |
+          bun build --target=bun --outfile=omp-ci-manage.js LifeOS/install/LIFEOS/OMP/manage.ts
+          bun build --target=bun --outfile=omp-ci-memory.js LifeOS/install/LIFEOS/OMP/extensions/lifeos-memory/index.ts
+          bun build --target=bun --outfile=omp-ci-commands.js LifeOS/install/LIFEOS/OMP/extensions/lifeos-commands/index.ts
+          bun build --target=bun --outfile=omp-ci-safety.js LifeOS/install/LIFEOS/OMP/extensions/lifeos-safety/index.ts
+          bun build --target=bun --outfile=omp-ci-hooks.js LifeOS/install/LIFEOS/OMP/extensions/lifeos-hooks/index.ts
+          bun build --target=bun --outfile=omp-ci-observability.js LifeOS/install/LIFEOS/OMP/extensions/lifeos-observability/index.ts
+
+
+      - name: Run cross-platform installer regressions
+        run: bun test LifeOS/Tools
+
+      - name: Run OMP integration regressions
+        run: bun test LifeOS/install/LIFEOS/OMP
+
+      - name: Validate Unix installer entrypoints
+        if: runner.os != 'Windows'
+        run: |
+          bash -n LifeOS/install/install.sh
+          bash -n LifeOS/install/LIFEOS/PULSE/manage.sh
+          bash -n LifeOS/install/LIFEOS/PULSE/manage-deriver.sh
+
+      - name: Validate Windows installer entrypoints
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parseErrors = @()
+          foreach ($path in @(
+            "LifeOS/install/install.ps1",
+            "LifeOS/install/LIFEOS/PULSE/manage.ps1"
+          )) {
+            $fileErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref]$null,
+              [ref]$fileErrors
+            )
+            $parseErrors += $fileErrors
+          }
+          if ($parseErrors.Count -gt 0) { $parseErrors | Out-String | Write-Error }

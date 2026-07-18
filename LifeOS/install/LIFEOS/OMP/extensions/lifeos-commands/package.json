@@ -1,0 +1,9 @@
+{
+  "name": "lifeos-commands",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LifeOS slash commands for OMP — /e1-/e5 effort levers and /interview passthrough to the Interview skill.",
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}

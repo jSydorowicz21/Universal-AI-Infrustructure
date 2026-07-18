@@ -1,0 +1,9 @@
+{
+  "name": "lifeos-safety",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Native hot-path port of LifeOS Safety — dangerous-shape/injection/credential blocking on tool_call and external-content data-framing on tool_result, reusing hooks/lib/safety-classifier.",
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}

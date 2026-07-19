@@ -221,7 +221,7 @@ describe("transactional OMP installation", () => {
 		const ownership = JSON.parse(readFileSync(m.paths.manifestPath, "utf8")) as OwnershipManifest;
 		const applied = ownership.artifacts.find((artifact) => artifact.path === append)?.applied;
 		if (!applied || applied.kind !== "file") throw new Error("OMP ownership manifest did not record the applied constitution");
-		if (process.platform !== "win32") expect(statSync(append).mode & 0o777).toBe(applied.mode);
+		if (process.platform !== "win32") expect(statSync(append).mode & 0o777).toBe((applied.mode ?? 0) & 0o777);
 		unlinkSync(append);
 		writeFileSync(append, "foreign edit\n");
 		const conflicted = await m.uninstall();

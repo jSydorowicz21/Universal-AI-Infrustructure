@@ -4,8 +4,8 @@ slug: 20260716-uai-universal-runtime
 project: Universal AI Infrastructure
 effort: comprehensive
 effort_source: explicit
-phase: verify
-progress: 17/18
+phase: complete
+progress: 18/18
 mode: parallel
 started: 2026-07-16T00:00:00Z
 updated: 2026-07-16T00:00:00Z
@@ -67,7 +67,7 @@ Deliver two reviewed PRDs plus an implementation on a branch based on PR #1 that
 - [x] ISC-13: Lifecycle planner, journal, ownership manifest, rollback executor, and crash recovery are used by supported adapters.
 - [x] ISC-14: Claude, OMP, Codex, and OpenCode adapters lower supported hooks/tools/commands/prompts/agents and report unsupported capabilities explicitly.
 - [x] ISC-15: Critical-control conformance runs positive and negative probes for blocking, external-content labeling, session isolation, transcript provenance, and rollback.
-- [ ] ISC-16: The workflow defines Windows, macOS, and Linux compile/unit/fixture/lifecycle/conformance gates; local Bash and PowerShell probes pass, but hosted macOS/Linux execution was not observed in this worktree.
+- [x] ISC-16: GitHub Actions run `29666347660` passed all 12 blocking compile, unit, fixture, and conformance matrix jobs across Windows, macOS, and Linux; optional credentialed discovery remained skipped by design.
 - [x] ISC-17: Generated support evidence identifies adapter/CLI/OS versions, probe results, degraded capabilities, and hard blockers.
 - [x] ISC-18: Anti: no test or installer mutates an actual user profile, no support badge is emitted from configuration presence alone, and no failed install leaves active partial wiring.
 
@@ -175,6 +175,7 @@ Deliver two reviewed PRDs plus an implementation on a branch based on PR #1 that
 
 - conjectured: PR #1 plus a universal roadmap could be implemented safely by adding adapters directly; refuted by: review evidence showing installer/session/state invariants are already broken and adapters would duplicate them; learned: stabilization and a lifecycle kernel must precede breadth; criterion now: ISC-3 through ISC-13 gate first-party adapter completion.
 - 2026-07-16 self-audit: adversarial reruns found remaining ancestor-junction reads, shell double-quote expansion, inherited data-root test leakage, and ambiguous crash-journal recovery; the release gate now rejects those paths before read/exec/mutation and proves hostile environment precedence explicitly.
+- 2026-07-16 hosted verification: the first runner attempt exposed an invalid workflow-level context; the next exposed inherited-root fixture coupling and platform mode/path assumptions; each was reproduced and fixed at source, and run `29666347660` passed every blocking matrix job.
 
 ## Verification
 
@@ -187,7 +188,7 @@ Deliver two reviewed PRDs plus an implementation on a branch based on PR #1 that
 - Selected-root follow-up: isolated Codex and OMP detection bound config and skills coordinates to the declared root; a real-Bun custom-root install created the durable USER link, rebased LifeOS environment and hook commands, reported OMP `wired: true` / `active: false`, uninstalled owned wiring, and removed its sandbox.
 - Cadence concurrency: the fresh-lease regression passed, focused two-process contention passed `200/200`, and stale recovery remains age/lease-based with explicit ownership-loss failures.
 - Core update smoke: a second deployment updated only changed owned payload (`1` skill and `3` runtime files), refused drifted ownership in regression coverage, and retained the original uninstall baseline. The dependency-free payload created no `node_modules` side effect.
-- CI contract: YAML parsed with blocking `compile`, `unit`, `fixtures`, and `conformance` jobs across Windows, macOS, and Linux; checked-in probes passed under local Bash and PowerShell on Windows. Hosted macOS/Linux execution remains unobserved.
+- CI contract: GitHub Actions run `29666347660` passed compile, unit, fixtures, and conformance on Windows, macOS, and Linux—12 blocking jobs total. Optional live vendor discovery was skipped by design and remains non-certifying.
 - Repository guard: `bun Tools/validate-protected.ts` validated all six protected files.
 - Final isolated install smoke: settings, USER scaffold/link, hooks, OMP install/status/uninstall all exited `0`; the USER target was a symlink; OMP reported `wired: true`, `loadable: true`, `active: false`, and `C0`; the temporary sandbox was removed.
 - Cleanup: generated `.build` output removed; the pre-existing unrelated `ToolInventory.md` deletion was not touched.

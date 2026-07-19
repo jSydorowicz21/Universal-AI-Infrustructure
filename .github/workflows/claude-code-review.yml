@@ -26,12 +26,18 @@ jobs:
       id-token: write
 
     steps:
+      - name: Explain unavailable automated review
+        if: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' }}
+        run: echo "CLAUDE_CODE_OAUTH_TOKEN is not configured; automated Claude review was skipped." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout repository
+        if: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Run Claude Code Review
+        if: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:

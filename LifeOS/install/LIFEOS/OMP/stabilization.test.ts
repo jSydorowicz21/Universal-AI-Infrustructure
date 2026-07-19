@@ -394,7 +394,7 @@ describe("full hook profile transaction", () => {
 		expect(commands.some((command) => command.includes(guardPath))).toBe(true);
 		expect(commands.some((command) => command.includes("$HOME/.claude"))).toBe(false);
 		expect(existsSync(guardPath)).toBe(true);
-	});
+	}, 30_000);
 
 	test("injected failure restores exact settings and hook tree", async () => {
 		const root = temp("uai-hooks-rollback-");

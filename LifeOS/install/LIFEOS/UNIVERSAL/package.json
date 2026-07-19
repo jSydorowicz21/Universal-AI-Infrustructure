@@ -7,7 +7,7 @@
   "scripts": {
     "test:unit": "bun test tests/contract.test.ts tests/platform-lifecycle.test.ts tests/runtime.test.ts",
     "test:fixtures": "bun test tests/fixtures.test.ts tests/first-party-bootstrap.test.ts",
-    "test:conformance": "bun test tests/conformance.test.ts",
+    "test:conformance": "bun test tests/conformance.test.ts tests/codex-first-class.test.ts",
     "conformance": "bun run run-conformance.ts",
     "compile": "bun run compile.ts",
     "ci:layout": "bun run workflow-probes.ts layout",

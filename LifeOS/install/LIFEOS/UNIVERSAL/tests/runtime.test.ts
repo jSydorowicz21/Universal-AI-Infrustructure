@@ -18,7 +18,7 @@ async function root() { const value = await mkdtemp(join(tmpdir(), "uai-runtime-
 const preToolFixtures = {
   claude: { hook_event_name: "PreToolUse", session_id: "native-1", tool_name: "Bash", tool_input: { command: "echo hi" } },
   omp: { event: "tool.execute.before", session: { id: "native-1" }, tool: { name: "Bash", input: { command: "echo hi" } } },
-  codex: { event: "pre_tool", conversation_id: "native-1", tool: "Bash", arguments: { command: "echo hi" } },
+  codex: { hook_event_name: "PreToolUse", session_id: "native-1", tool_name: "Bash", tool_input: { command: "echo hi" } },
   opencode: { event: "tool.execute.before", sessionID: "native-1", tool: "Bash", input: { command: "echo hi" } },
 } as const;
 
@@ -72,9 +72,9 @@ describe("registry, canonical events and adapters", () => {
   test("lowers block into each native form and records unsupported losses", () => {
     expect(lowerDecision("claude", { action: "block", reason: "no" })).toEqual({ exitCode: 2, output: undefined });
     expect(lowerDecision("omp", { action: "block", reason: "no" })).toMatchObject({ exitCode: 0, output: { block: true } });
-    expect(lowerDecision("codex", { action: "block", reason: "no" }).output).toMatchObject({ decision: "deny" });
+    expect(lowerDecision("codex", { action: "block", reason: "no" }).output).toMatchObject({ decision: "block" });
     expect(lowerDecision("opencode", { action: "block", reason: "no" }).output).toMatchObject({ permission: "deny" });
-    expect(FIRST_PARTY_ADAPTERS.codex.losses).toContain("native lifecycle blocking requires trusted managed hooks");
+    expect(FIRST_PARTY_ADAPTERS.codex.losses).toContain("native PreToolUse hooks block via trust-reviewed command handlers; managed hooks require policy trust");
     expect(FIRST_PARTY_ADAPTERS.opencode.losses).toContain("blocking depends on plugin event semantics");
   });
 });
@@ -152,7 +152,8 @@ describe("portable capability lowerers and platform models", () => {
   test("lowers shared command, agent and prompt intents with explicit losses", () => {
     expect(lowerCommandIntent("claude", { id: "interview", prompt: "Ask questions" }).nativeName).toBe("/interview");
     expect(lowerCommandIntent("omp", { id: "interview", prompt: "Ask questions" }).nativeName).toBe("/interview");
-    expect(lowerAgentIntent("codex", { id: "reviewer", instructions: "Review" }).losses).toContain("no native reusable agent surface proven");
+    expect(lowerAgentIntent("codex", { id: "reviewer", instructions: "Review" }).nativeName).toBe("reviewer");
+    expect(lowerAgentIntent("codex", { id: "reviewer", instructions: "Review", model: "gpt-5" }).losses).toContain("model selection is per-agent-file, not per-invocation");
     expect(lowerPromptIntent("opencode", { id: "policy", content: "Policy", authority: "system" }).effectiveAuthority).toBe("context");
   });
 

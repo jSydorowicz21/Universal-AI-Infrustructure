@@ -12,8 +12,8 @@
     "executable": "codex",
     "instructionPath": "AGENTS.md",
     "configPath": "config.toml",
-    "lastVerified": "2026-07-17",
-    "sourceDoc": "https://developers.openai.com/codex/guides/agents-md/"
+    "lastVerified": "2026-07-18",
+    "sourceDoc": "https://learn.chatgpt.com/docs/agent-configuration/agents-md"
   },
   {
     "adapterId": "opencode",

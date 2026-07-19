@@ -172,7 +172,7 @@ jobs:
           PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
           UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
           PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
-        run: bun test tests/conformance.test.ts
+        run: bun test tests/conformance.test.ts tests/codex-first-class.test.ts
       - name: Smoke conformance entry point
         working-directory: LifeOS/install/LIFEOS/UNIVERSAL
         env:

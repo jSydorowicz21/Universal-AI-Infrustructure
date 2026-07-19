@@ -67,7 +67,7 @@ export function normalizeNativeEvent(adapterId: FirstPartyAdapterId, value: unkn
   if (type === "tool.before" || type === "tool.after") event.tool = toolFrom(payload);
   if (type === "prompt.submit") event.prompt = string(payload.prompt) ?? string(payload.message) ?? "";
   if (type === "tool.after") {
-    const output = payload.tool_result ?? payload.toolResult ?? payload.result ?? payload.output;
+    const output = payload.tool_response ?? payload.tool_result ?? payload.toolResult ?? payload.result ?? payload.output;
     event.result = { output, provenance: object(payload.provenance) as never };
   }
   return event;
@@ -77,15 +77,22 @@ export function lowerDecision(adapterId: FirstPartyAdapterId, decision: Canonica
   if (decision.action === "block") {
     if (adapterId === "claude") return { exitCode: 2, output: undefined };
     if (adapterId === "omp") return { exitCode: 0, output: { block: true, reason: decision.reason ?? "Blocked by UAI" } };
-    if (adapterId === "codex") return { exitCode: 0, output: { decision: "deny", reason: decision.reason ?? "Blocked by UAI" } };
+    if (adapterId === "codex") return { exitCode: 0, output: { decision: "block", reason: decision.reason ?? "Blocked by UAI" } };
     return { exitCode: 0, output: { permission: "deny", message: decision.reason ?? "Blocked by UAI" } };
   }
   if (decision.action === "update") {
+    if (adapterId === "codex") {
+      const additionalContext = decision.additionalContext?.join("\n");
+      return { exitCode: 0, output: { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: decision.updatedInput ?? {}, ...(additionalContext ? { additionalContext } : {}) } } };
+    }
     const output = { updatedInput: decision.updatedInput ?? {}, additionalContext: decision.additionalContext ?? [] };
     return adapterId === "opencode" ? { exitCode: 0, output: { permission: "allow", ...output } } : { exitCode: 0, output };
   }
-  if (decision.action === "advisory") return { exitCode: 0, output: { additionalContext: decision.additionalContext ?? [decision.reason ?? ""] } };
-  if (adapterId === "codex") return { exitCode: 0, output: { decision: "allow" } };
+  if (decision.action === "advisory") {
+    if (adapterId === "codex") return { exitCode: 0, output: { hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: (decision.additionalContext ?? [decision.reason ?? ""]).join("\n") } } };
+    return { exitCode: 0, output: { additionalContext: decision.additionalContext ?? [decision.reason ?? ""] } };
+  }
+  if (adapterId === "codex") return { exitCode: 0, output: { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" } } };
   if (adapterId === "opencode") return { exitCode: 0, output: { permission: "allow" } };
   if (adapterId === "omp") return { exitCode: 0, output: { block: false } };
   return { exitCode: 0 };
@@ -110,7 +117,7 @@ function descriptor(id: FirstPartyAdapterId, adapterClass: AdapterDescriptor["ad
 export const FIRST_PARTY_ADAPTERS: Record<FirstPartyAdapterId, AdapterDescriptor> = {
   claude: descriptor("claude", "native", ["certification requires same-version negative probes"], "wired"),
   omp: descriptor("omp", "native", ["approval and egress surfaces require version-specific evidence"], "wired"),
-  codex: descriptor("codex", "compatibility", ["native lifecycle blocking requires trusted managed hooks", "system authority depends on managed configuration"], "degraded"),
+  codex: descriptor("codex", "compatibility", ["native PreToolUse hooks block via trust-reviewed command handlers; managed hooks require policy trust", "system authority depends on managed configuration"], "degraded"),
   opencode: descriptor("opencode", "compatibility", ["blocking depends on plugin event semantics", "system prompt lowers to context authority"], "degraded"),
 };
 

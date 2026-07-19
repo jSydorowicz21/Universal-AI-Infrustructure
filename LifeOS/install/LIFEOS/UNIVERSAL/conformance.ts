@@ -303,7 +303,7 @@ export async function runConformance(context: ConformanceContext): Promise<Confo
 function preToolPayload(adapterId: FirstPartyAdapterId, command: string) {
   if (adapterId === "claude") return { hook_event_name: "PreToolUse", session_id: "fixture-native", tool_name: "Bash", tool_input: { command } };
   if (adapterId === "omp") return { event: "tool.execute.before", session: { id: "fixture-native" }, tool: { name: "Bash", input: { command } } };
-  if (adapterId === "codex") return { event: "pre_tool", conversation_id: "fixture-native", tool: "Bash", arguments: { command } };
+  if (adapterId === "codex") return { hook_event_name: "PreToolUse", session_id: "fixture-native", tool_name: "Bash", tool_input: { command } };
   return { event: "tool.execute.before", sessionID: "fixture-native", tool: "Bash", input: { command } };
 }
 
@@ -311,7 +311,7 @@ function postToolPayload(adapterId: FirstPartyAdapterId) {
   const provenance = { transcriptUri: "fixture:///native.jsonl", parserVersion: "fixture@1", sourceLine: 1, sourceUri: "https://fixture.invalid/item", tainted: true };
   if (adapterId === "claude") return { hook_event_name: "PostToolUse", session_id: "fixture-native", tool_name: "WebFetch", tool_input: {}, tool_result: "external", provenance };
   if (adapterId === "omp") return { event: "tool.execute.after", session: { id: "fixture-native" }, tool: { name: "WebFetch", input: {} }, result: "external", provenance };
-  if (adapterId === "codex") return { event: "post_tool", conversation_id: "fixture-native", tool: "WebFetch", arguments: {}, result: "external", provenance };
+  if (adapterId === "codex") return { hook_event_name: "PostToolUse", session_id: "fixture-native", tool_name: "WebFetch", tool_input: {}, tool_response: "external", provenance };
   return { event: "tool.execute.after", sessionID: "fixture-native", tool: "WebFetch", input: {}, result: "external", provenance };
 }
 
@@ -325,14 +325,14 @@ function transcriptFixture(adapterId: FirstPartyAdapterId) {
 function blockObserved(adapterId: FirstPartyAdapterId, decision: NativeDecision) {
   if (adapterId === "claude") return decision.exitCode === 2;
   if (adapterId === "omp") return decision.output?.block === true;
-  if (adapterId === "codex") return decision.output?.decision === "deny";
+  if (adapterId === "codex") return decision.exitCode === 0 && decision.output?.decision === "block";
   return decision.output?.permission === "deny";
 }
 
 function allowObserved(adapterId: FirstPartyAdapterId, decision: NativeDecision) {
   if (adapterId === "claude") return decision.exitCode === 0;
   if (adapterId === "omp") return decision.output?.block === false;
-  if (adapterId === "codex") return decision.output?.decision === "allow";
+  if (adapterId === "codex") return decision.exitCode === 0 && decision.output?.hookSpecificOutput?.permissionDecision === "allow";
   return decision.output?.permission === "allow";
 }
 

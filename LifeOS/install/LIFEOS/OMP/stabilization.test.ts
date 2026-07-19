@@ -340,6 +340,62 @@ describe("transactional OMP installation", () => {
 		expect(manifestResult.problems.some((problem) => problem.includes("manifest export"))).toBe(true);
 	});
 
+	test("a fresh OMP install forces no agent and keeps hooks/extensions/inference loadable", async () => {
+		// Regression guard for forced Forge / named-agent / reviewer / observer auto-inclusion:
+		// a fresh install must wire only the neutral LifeOS<->OMP adapter (constitution + 5
+		// extensions + shared hooks) and must NOT inject any mandatory agent invocation,
+		// effort-tier agent binding, or auto-spawn into the OMP profile.
+		const home = temp("uai-omp-no-forced-agent-");
+		stageRequiredHooks(home);
+		const m = manager(home);
+		const installed = await m.install();
+		expect(installed.ok, installed.problems.join("\n")).toBe(true);
+
+		const agentDir = join(home, ".omp", "agent");
+		const configPath = join(agentDir, "config.yml");
+		const appendPath = join(agentDir, "APPEND_SYSTEM.md");
+		expect(existsSync(configPath)).toBe(true);
+		expect(existsSync(appendPath)).toBe(true);
+
+		// The injected constitution is byte-identical to the shipped source — no install-time
+		// rewriting could have spliced in a forced-agent clause.
+		expect(readFileSync(appendPath, "utf8")).toBe(readFileSync(join(sourceOmp, "APPEND_SYSTEM.md"), "utf8"));
+
+		// config.yml wires ONLY the five neutral LifeOS extensions — no agent entries.
+		const config = Bun.YAML.parse(readFileSync(configPath, "utf8")) as { extensions?: unknown[] };
+		expect(Array.isArray(config.extensions)).toBe(true);
+		expect(config.extensions!.length).toBe(5);
+		for (const entry of config.extensions as string[]) {
+			expect(entry.replace(/\\/g, "/")).toMatch(/\/extensions\/(lifeos-memory|lifeos-commands|lifeos-safety|lifeos-hooks|lifeos-observability)$/);
+		}
+		const configBytes = readFileSync(configPath, "utf8");
+		// No agent/subagent/forge/reviewer/observer/effort-tier-spawn keys leaked into the wiring.
+		expect(configBytes).not.toMatch(/agents?\s*[:=]/i);
+		expect(configBytes).not.toMatch(/forge/i);
+		expect(configBytes).not.toMatch(/subagent/i);
+		expect(configBytes).not.toMatch(/(auto[-_ ])?(spawn|include)/i);
+		expect(configBytes).not.toMatch(/(reviewer|observer)/i);
+
+		// The constitution itself carries no forced-agent language (it is the neutral 7.x
+		// unified-format layer; Forge/etc. remain available only via explicit user invocation).
+		const constitution = readFileSync(appendPath, "utf8");
+		expect(constitution).not.toMatch(/MUST include Forge|must include Forge|Forge in EXECUTE|auto-include binding|spawn via.*Forge|Forge.*E3\/E4\/E5|mandatory.*Forge|Forge.*mandatory/i);
+		expect(constitution).not.toMatch(/auto[-_ ]?(spawn|include).*(forge|agent|subagent|reviewer|observer)/i);
+
+		// The five extensions and the shared hook set remain loadable (status reports wired +
+		// loadable); inference wiring stays selectable without forcing a backend.
+		const status = m.status();
+		expect(status.wired).toBe(true);
+		expect(status.loadable).toBe(true);
+		expect(status.agentDir).toBe(agentDir);
+
+		// Uninstall reverses the wiring cleanly and leaves no forced-agent residue.
+		const uninstalled = await m.uninstall();
+		expect(uninstalled.ok, uninstalled.problems.join("\n")).toBe(true);
+		expect(existsSync(configPath)).toBe(false);
+		expect(existsSync(appendPath)).toBe(false);
+	});
+
 
 });
 

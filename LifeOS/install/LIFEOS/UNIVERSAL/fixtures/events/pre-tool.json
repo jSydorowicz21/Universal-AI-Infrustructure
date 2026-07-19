@@ -1,6 +1,6 @@
 {
   "claude": { "hook_event_name": "PreToolUse", "session_id": "native-1", "tool_name": "Bash", "tool_input": { "command": "echo hi" } },
   "omp": { "event": "tool.execute.before", "session": { "id": "native-1" }, "tool": { "name": "Bash", "input": { "command": "echo hi" } } },
-  "codex": { "event": "pre_tool", "conversation_id": "native-1", "tool": "Bash", "arguments": { "command": "echo hi" } },
+  "codex": { "hook_event_name": "PreToolUse", "session_id": "native-1", "tool_name": "Bash", "tool_input": { "command": "echo hi" } },
   "opencode": { "event": "tool.execute.before", "sessionID": "native-1", "tool": "Bash", "input": { "command": "echo hi" } }
 }

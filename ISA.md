@@ -8,7 +8,7 @@ phase: complete
 progress: 18/18
 mode: parallel
 started: 2026-07-16T00:00:00Z
-updated: 2026-07-16T00:00:00Z
+updated: 2026-07-18T00:00:00Z
 ---
 
 ## Problem
@@ -177,6 +177,7 @@ Deliver two reviewed PRDs plus an implementation on a branch based on PR #1 that
 - 2026-07-16 self-audit: adversarial reruns found remaining ancestor-junction reads, shell double-quote expansion, inherited data-root test leakage, and ambiguous crash-journal recovery; the release gate now rejects those paths before read/exec/mutation and proves hostile environment precedence explicitly.
 - 2026-07-16 hosted verification: the first runner attempt exposed an invalid workflow-level context; the next exposed inherited-root fixture coupling and platform mode/path assumptions; each was reproduced and fixed at source, and run `29666347660` passed every blocking matrix job.
 - 2026-07-16 PR publication: repository Claude review automation failed before review when its OAuth secret was absent, then the first skip guard used a context GitHub rejects at workflow evaluation; the credential is now bound through job environment state, missing credentials produce an explicit successful skip, and run `29666571457` passed that final-head check.
+- 2026-07-18 renewed self-audit: two independent implementation vets rechecked PR #3 against lifecycle, security, OMP neutrality, and current first-party Codex documentation; Codex hook normalization/lowering now uses documented `PreToolUse`/`PostToolUse`, block, `hookSpecificOutput`, updated-input, and additional-context shapes; Codex reusable-agent lowering now emits `.codex/agents/<name>.toml` semantics without implicit spawning; a fresh OMP install regression proves no Forge, reviewer, observer, named-agent, or auto-spawn binding is injected while all five extensions remain loadable.
 
 ## Verification
 
@@ -192,4 +193,7 @@ Deliver two reviewed PRDs plus an implementation on a branch based on PR #1 that
 - CI contract: GitHub Actions run `29666571480` at code head `60adc0c` passed compile, unit, fixtures, and conformance on Windows, macOS, and Linux—12 blocking jobs total. Optional live vendor discovery was skipped by design and remains non-certifying; Claude review automation run `29666571457` also passed through its explicit missing-credential skip path.
 - Repository guard: `bun Tools/validate-protected.ts` validated all six protected files.
 - Final isolated install smoke: settings, USER scaffold/link, hooks, OMP install/status/uninstall all exited `0`; the USER target was a symlink; OMP reported `wired: true`, `loadable: true`, `active: false`, and `C0`; the temporary sandbox was removed.
+- Renewed universal gate: all `74` tests passed with `0` failures and `433` assertions; the CI-bound conformance slice passed `16` tests and `118` assertions; compile, the `11`-probe kernel conformance smoke, and the six-check workflow layout probe passed.
+- Renewed OMP neutrality gate: `86` tests passed with `0` failures and `342` assertions; the fresh-install regression observed only the neutral constitution, five extensions, shared hooks, and selectable inference wiring, then removed all owned wiring on uninstall.
+- Real Codex CLI smoke: default discovery found `codex-cli 0.144.5`, generated and applied the documented `AGENTS.md` C1 bootstrap in an isolated temporary profile, proved instruction sentinel/byte-preserving uninstall/profile-root isolation, and returned `uninstalled`; no live user profile was mutated.
 - Cleanup: generated `.build` output removed; the pre-existing unrelated `ToolInventory.md` deletion was not touched.

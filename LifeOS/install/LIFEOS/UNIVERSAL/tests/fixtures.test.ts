@@ -12,7 +12,7 @@ describe("deterministic fixture pack", () => {
     for (const [adapterId, payload] of Object.entries(fixtures) as [FirstPartyAdapterId, unknown][]) {
       expect(normalizeNativeEvent(adapterId, payload)).toMatchObject({ type: "tool.before", nativeSessionId: "native-1", tool: { name: "Bash", input: { command: "echo hi" } } });
       const lowered = lowerDecision(adapterId, { action: "block", reason: "fixture-block" });
-      expect(lowered.exitCode === 2 || lowered.output?.block === true || lowered.output?.decision === "deny" || lowered.output?.permission === "deny").toBeTrue();
+      expect(lowered.exitCode === 2 || lowered.output?.block === true || lowered.output?.decision === "block" || lowered.output?.permission === "deny").toBeTrue();
     }
   });
 

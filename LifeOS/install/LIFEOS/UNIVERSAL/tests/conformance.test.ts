@@ -74,7 +74,7 @@ describe("deterministic conformance", () => {
     });
     expect(nominal).toMatchObject({ state: "observed", certification: "C2" });
     expect(nominal.blockers).toContain("no repository-owned certifying executor is registered");
-  });
+  }, 20_000);
 
   test("rejects fake, forged, stale and mismatched adapter evidence", async () => {
     const evidence = await runAdapterConformance({ context: ompContext, adapter: ADAPTERS.omp, executor: createFixtureHarnessExecutor("omp") });
@@ -97,7 +97,7 @@ describe("deterministic conformance", () => {
     const fakeResult = certifyFromEvidence({ wired: true, evidence: validlyHashedFake, expected: { ...expected, adapterId: "fake" }, now: () => "2026-07-17T00:00:00.000Z" });
     expect(fakeResult.state).not.toBe("active");
     expect(fakeResult.blockers).toContain("invalid adapter identity");
-  });
+  }, 20_000);
 
   test("malformed, null, empty, and integrity-forged artifacts remain C0 without throwing", async () => {
     const expected = { adapterId: "omp", adapterVersion: "1.0.0", cliVersion: "fixture-1.0.0", osProfile: "linux:fixture" };

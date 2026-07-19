@@ -105,9 +105,9 @@ export const FIRST_PARTY_BOOTSTRAP_SURFACES: Record<BootstrapAdapterId, Bootstra
     adapterId: "codex", adapterVersion: "1.0.0", executable: "codex",
     instruction: { relativePath: "AGENTS.md", sentinel: "UAI_CODEX_INSTRUCTION_SENTINEL_V1", authority: "user-context" },
     config: { relativePath: "config.toml", format: "toml" },
-    sourceDocs: ["https://developers.openai.com/codex/guides/agents-md/", "https://developers.openai.com/codex/config-reference/"],
-    lastVerified: "2026-07-17",
-    losses: [...COMMON_LOSSES, "AGENTS.md supplies instructions but no native lifecycle-blocking contract"],
+    sourceDocs: ["https://learn.chatgpt.com/docs/agent-configuration/agents-md", "https://learn.chatgpt.com/docs/config-file/config-reference", "https://learn.chatgpt.com/docs/hooks"],
+    lastVerified: "2026-07-18",
+    losses: [...COMMON_LOSSES, "native PreToolUse hooks block via command handlers but require trust review; managed hooks require policy trust"],
   },
   opencode: {
     adapterId: "opencode", adapterVersion: "1.0.0", executable: "opencode",

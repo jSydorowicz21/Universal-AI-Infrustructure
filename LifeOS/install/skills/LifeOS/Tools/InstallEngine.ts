@@ -63,9 +63,9 @@ export interface EnvDetection {
   /** A prior LifeOS/PAI install is present (settings.json exists in the config root). */
   existingInstall: boolean;
   /**
-   * This IS the author's live source tree — refuse all mutation. Marker: the
-   * private maintenance skill (`skills/_LIFEOS`) only exists in the source repo,
-   * never in a public install.
+   * This IS a checked-out LifeOS source tree — refuse mutation. Legacy
+   * maintainer trees carry `skills/_LIFEOS`; current source trees are identified
+   * structurally by their git metadata and the checked-in LifeOS installer.
    */
   isDevTree: boolean;
   settingsExists: boolean;
@@ -231,14 +231,35 @@ export function detectHarness(home: string, env: NodeJS.ProcessEnv = process.env
 }
 
 /**
- * Dev-tree refusal marker. The private maintenance skill (`skills/_LIFEOS`) exists
- * ONLY in the author's source repo — never in a public install (release tooling
- * strips all `_ALLCAPS` skills). Its presence means "this is the live source;
- * do not mutate." A `.git` remote check is a secondary signal but `<your-release-skill>` alone
- * is decisive and cheap.
+ * Resolve which harness owns an explicitly selected config root. Explicit
+ * UAI_HARNESS/PAI_HARNESS wins; otherwise only a known harness root is accepted.
+ * Custom roots must therefore be paired with an explicit harness selection.
+ */
+export function resolveSelectedHarness(
+  configRoot: string,
+  env: NodeJS.ProcessEnv = process.env,
+  home = resolveHomeDir(env),
+): Harness {
+  if ((env.UAI_HARNESS || env.PAI_HARNESS || "").trim()) return detectHarness(home, env).name;
+  const normalizedRoot = normalize(configRoot);
+  for (const harness of ["claude-code", "omp", "codex", "opencode", "hermes", "cursor", "openclaw"] as const) {
+    if (normalizedRoot === resolveInstallRoots(env, harness, home).configRoot) return harness;
+  }
+  return "unknown";
+}
+
+/**
+ * Refuse a source checkout rather than treating it as a live harness profile.
+ * Legacy maintainer trees retain `skills/_LIFEOS`; current repositories are
+ * identified by git metadata plus the installer source layout. A normal profile
+ * may contain LIFEOS after installation but never this complete source shape.
  */
 export function detectDevTree(configRoot: string): boolean {
-  return existsSync(join(configRoot, "skills", "_LIFEOS"));
+  return existsSync(join(configRoot, "skills", "_LIFEOS")) || (
+    existsSync(join(configRoot, ".git")) &&
+    existsSync(join(configRoot, "LifeOS", "install")) &&
+    existsSync(join(configRoot, "LifeOS", "Tools", "InstallEngine.ts"))
+  );
 }
 
 // ── Composite env detection (the DetectEnv Tool payload) ──
@@ -558,7 +579,7 @@ export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: 
  * EXDEV (cross-filesystem) rename falls back to cp + rm. (Ported from engine.)
  */
 /** Byte-compare two files; treats unreadable as "differs" (conservative). */
-function filesDiffer(a: string, b: string): boolean {
+export function filesDiffer(a: string, b: string): boolean {
   try {
     return !readFileSync(a).equals(readFileSync(b));
   } catch {
@@ -573,7 +594,7 @@ function filesDiffer(a: string, b: string): boolean {
  * `<file>.replaced-<stamp>`. Lossless in every direction — nothing is removed
  * without a recoverable copy. Symlinked entries are skipped (Dirent semantics).
  */
-function physicalTreeFailure(root: string, label: string): string | undefined {
+export function physicalTreeFailure(root: string, label: string): string | undefined {
   try {
     lstatSync(root);
   } catch {
@@ -604,7 +625,76 @@ function physicalTreeFailure(root: string, label: string): string | undefined {
   return visit(root);
 }
 
-function mergeTree(src: string, dst: string, stamp: string): { copied: number; overwritten: number; preserved: number; failures: string[] } {
+/**
+ * Single-file merge primitive — the shared core of mergeTree (and the PAI
+ * migrator's per-entry apply). LIVE-WINS semantics: a missing destination is
+ * copied; a byte-identical destination is skipped; a DIFFERING destination is
+ * overwritten with the source AFTER the displaced destination is preserved
+ * aside as `<file>.replaced-<stamp>`. Lossless in every direction. A symlinked
+ * destination is refused (never followed). Returns the classification so
+ * callers that need per-file reporting (the migrator) can use it directly.
+ */
+export interface MergeFileOptions {
+  /** Create the destination parent directory if missing (mergeTree does this
+   * inline; the migrator pre-creates). Default false. */
+  createMissingParent?: boolean;
+}
+
+export type MergeFileAction = "copied" | "overwritten" | "skipped-identical" | "skipped-missing-dest-link";
+
+export interface MergeFileResult {
+  action: MergeFileAction;
+  /** Absolute destination path. */
+  destination: string;
+  /** Path of the displaced copy when action === "overwritten"; else undefined. */
+  preservedPath?: string;
+  /** Error message if the copy failed (action is still set to the intended one). */
+  failure?: string;
+}
+
+function nextPreservedPath(destination: string, stamp: string): string {
+  const base = `${destination}.replaced-${stamp}`;
+  let candidate = base;
+  let suffix = 1;
+  while (true) {
+    try {
+      lstatSync(candidate);
+      candidate = `${base}-${suffix++}`;
+    } catch {
+      return candidate;
+    }
+  }
+}
+
+export function mergeFile(src: string, dst: string, stamp: string, options: MergeFileOptions = {}): MergeFileResult {
+  let dstStat;
+  try {
+    dstStat = lstatSync(dst);
+  } catch {
+    try {
+      if (options.createMissingParent) mkdirSync(dirname(dst), { recursive: true });
+      cpSync(src, dst);
+      return { action: "copied", destination: dst };
+    } catch (err) {
+      return { action: "copied", destination: dst, failure: `${src} → ${dst}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+  if (dstStat.isSymbolicLink()) {
+    return { action: "skipped-missing-dest-link", destination: dst, failure: `destination link is not allowed: ${dst}` };
+  }
+  if (!filesDiffer(src, dst)) {
+    return { action: "skipped-identical", destination: dst };
+  }
+  try {
+    const preservedPath = nextPreservedPath(dst, stamp);
+    cpSync(dst, preservedPath);
+    cpSync(src, dst);
+    return { action: "overwritten", destination: dst, preservedPath };
+  } catch (err) {
+    return { action: "overwritten", destination: dst, failure: `${src} → ${dst}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+export function mergeTree(src: string, dst: string, stamp: string): { copied: number; overwritten: number; preserved: number; failures: string[] } {
   let copied = 0;
   let overwritten = 0;
   let preserved = 0;
@@ -617,18 +707,11 @@ function mergeTree(src: string, dst: string, stamp: string): { copied: number; o
   const walk = (s: string, d: string): void => {
     const sourceMetadata = lstatSync(s);
     if (sourceMetadata.isFile()) {
-      if (!existsSync(d)) {
-        try { mkdirSync(dirname(d), { recursive: true }); cpSync(s, d); copied++; }
-        catch (err) { failures.push(`${s} → ${d}: ${err instanceof Error ? err.message : String(err)}`); }
-      } else if (filesDiffer(s, d)) {
-        try {
-          if (lstatSync(d).isSymbolicLink()) throw new Error("destination link is not allowed");
-          cpSync(d, `${d}.replaced-${stamp}`);
-          cpSync(s, d);
-          overwritten++;
-          preserved++;
-        } catch (err) { failures.push(`${s} → ${d}: ${err instanceof Error ? err.message : String(err)}`); }
-      }
+      const result = mergeFile(s, d, stamp, { createMissingParent: true });
+      if (result.action === "copied") copied++;
+      else if (result.action === "overwritten") { overwritten++; preserved++; }
+      else if (result.action === "skipped-identical") { /* byte-equal; no-op */ }
+      if (result.failure) failures.push(result.failure);
       return;
     }
     for (const entry of readdirSync(s, { withFileTypes: true })) {

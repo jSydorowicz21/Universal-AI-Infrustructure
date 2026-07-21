@@ -57,7 +57,7 @@ bun Tools/ScanConflicts.ts
 
 Surfaces anything already sitting in the target directories. Show your human. Nothing has changed yet.
 
-### 4. Deploy the skill, runtime, settings, and USER scaffold
+### 4. Deploy the skill, runtime, and USER scaffold
 
 Use the config root reported by `DetectEnv`; never infer one from the current
 shell. Preview first, then rerun with `--apply` after permission:
@@ -65,13 +65,23 @@ shell. Preview first, then rerun with `--apply` after permission:
 ```
 bun Tools/DeployCore.ts --skill-root . --config-root <configRoot>
 bun Tools/DeployCore.ts --skill-root . --config-root <configRoot> --apply
-bun Tools/InstallSettings.ts --skill-root . --config-root <configRoot>
-bun Tools/InstallSettings.ts --skill-root . --config-root <configRoot> --apply
 bun Tools/ScaffoldUser.ts --skill-root . --config-root <configRoot> --config-dir <dataRoot>
 bun Tools/ScaffoldUser.ts --skill-root . --config-root <configRoot> --config-dir <dataRoot> --apply
 bun Tools/LinkUser.ts --config-root <configRoot> --config-dir <dataRoot>
 bun Tools/LinkUser.ts --config-root <configRoot> --config-dir <dataRoot> --apply
 ```
+
+**Claude Code and OMP only** also consume the payload's Claude-shaped
+`settings.json`; preview and apply it after Core:
+
+```
+bun Tools/InstallSettings.ts --skill-root . --config-root <configRoot>
+bun Tools/InstallSettings.ts --skill-root . --config-root <configRoot> --apply
+```
+
+Codex and OpenCode use native configuration schemas, so `InstallSettings.ts`
+refuses them rather than writing inert JSON. Continue with their compatible
+context surface in step 6.
 
 PowerShell uses the same preview/apply sequence; quote concrete paths rather
 than angle-bracket placeholders:
@@ -85,9 +95,60 @@ bun .\Tools\LinkUser.ts --config-root $configRoot --config-dir $dataRoot
 bun .\Tools\LinkUser.ts --config-root $configRoot --config-dir $dataRoot --apply
 ```
 
+For a Claude Code or OMP profile, then preview and apply its settings:
+
+```powershell
+bun .\Tools\InstallSettings.ts --skill-root . --config-root $configRoot
+bun .\Tools\InstallSettings.ts --skill-root . --config-root $configRoot --apply
+```
+
 `<dataRoot>` defaults to `~/.pai`; `UAI_DATA_DIR` and `PAI_DATA_DIR` are
 compatible overrides. Existing files are preserved. Invalid JSON or an
 incomplete payload blocks before mutation.
+
+### 5. Upgrading from an existing PAI install
+
+If your human already runs an old PAI install (the `PAI/USER/` layout under
+`<configRoot>/PAI/`, plus an old data root at `~/.pai/USER/`), migrate it into
+the new LifeOS USER layout instead of re-entering everything. The migrator is
+additive and lossless: the OLD PAI tree is READ-ONLY (never renamed or deleted),
+and any destination that differs is preserved as `<file>.replaced-<stamp>`
+before the source overwrites it — the same live-wins semantics `LinkUser` uses.
+
+**Preview first, then apply.** Use the config root from `DetectEnv`:
+
+```
+bun Tools/MigrateFromPai.ts --config-root <configRoot>
+bun Tools/MigrateFromPai.ts --config-root <configRoot> --apply
+```
+
+Flags: `--pai-dir <path>` (default `<configRoot>/PAI`), `--old-data-dir <path>`
+(default `PAI_DATA_DIR` env else `~/.pai`), `--data-dir <path>` (new LifeOS
+data root, default `~/.pai`), `--apply` (mutate; default is preview),
+`--json` (machine-readable report).
+
+The preview prints the full migration plan — every source file with its
+destination, classified `mapped` (a known rename like `PRINCIPAL_IDENTITY.md` →
+`PRINCIPAL/PRINCIPAL_IDENTITY.md`), `unmapped-carried` (same relative path),
+`identical-skip` (byte-equal, left alone), or `conflict-preserve` (destination
+differs — the displaced file is kept as `.replaced-<stamp>`, with a numeric
+suffix when multiple source files collide, and the later authoritative source
+overwrites). `--apply` runs the merge via the shared single-file primitive and
+verifies each final destination is byte-equal to its authoritative source.
+
+The migrator never edits `CLAUDE.md` or `settings.json` automatically. Instead
+it emits an **ADVISORY** section listing detected `@PAI/USER/...` imports in
+`<configRoot>/CLAUDE.md` and PAI-path hook commands in
+`<configRoot>/settings.json`, each with its exact suggested replacement
+(`@LIFEOS/USER/...`, LIFEOS hook path). Apply those follow-ups via the existing
+`InstallSettings` / `ActivateImports` flow (step 6 onward). When you have
+verified the new tree, the advisory also lists the old source directories that
+can be manually removed.
+
+Exit codes: `0` ok / nothing-to-migrate, `1` failure, `2` refused (unsafe
+physical tree — a symlink/junction in a source or destination — or a source
+repo). A dangling junction at the destination root is refused, not treated as
+absent, so a migration never writes through a broken link.
 
 ### 6. Wire the integration — HARNESS-SPECIFIC, WITH PERMISSION
 

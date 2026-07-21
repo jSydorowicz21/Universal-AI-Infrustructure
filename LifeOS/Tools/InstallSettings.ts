@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
 /**
- * InstallSettings — Setup step 4's settings placement, as a deterministic tool.
- * Places the payload's `install/settings.system.json` into the harness
- * `settings.json` with the one transform the copy-by-hand step kept getting
- * wrong: **`env` values are expanded at write time** (`$HOME`/`${HOME}`/`~` →
- * the real home). The harness injects env values verbatim with NO shell
- * expansion (LifeOS#1404/#1451) — a literal `"$HOME/..."` value creates a real
- * `$HOME/` directory on disk that silently captures runtime state. Command
- * strings (hooks, statusLine) are shell-evaluated and ship untouched.
+ * InstallSettings — Setup step 4's Claude Code / OMP settings placement, as a
+ * deterministic tool. Places the payload's `install/settings.system.json` into
+ * the selected harness's `settings.json` with the one transform the copy-by-hand
+ * step kept getting wrong: **`env` values are expanded at write time**
+ * (`$HOME`/`${HOME}`/`~` → the real home). The harness injects env values
+ * verbatim with NO shell expansion (LifeOS#1404/#1451) — a literal
+ * `"$HOME/..."` value creates a real `$HOME/` directory on disk that silently
+ * captures runtime state. Command strings (hooks, statusLine) are
+ * shell-evaluated and ship untouched.
+ *
+ * Codex and OpenCode use native config files with different schemas; this tool
+ * refuses them rather than writing an inert Claude-shaped settings.json.
  *
  * Semantics match the sibling installers (DeployCore/InstallHooks):
  *   - settings.json absent → write the expanded template whole.
@@ -23,9 +27,9 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { detectDevTree, resolveHomeDir, resolveInstallRoots } from "./InstallEngine";
+import { detectDevTree, resolveHomeDir, resolveInstallRoots, resolveSelectedHarness, type Harness } from "./InstallEngine";
 
-interface Args { configRoot: string; skillRoot: string; apply: boolean; allowDev: boolean; }
+interface Args { configRoot: string; skillRoot: string; apply: boolean; allowDev: boolean; harness?: Harness; }
 
 function parseArgs(): Args {
   const a = process.argv.slice(2);
@@ -34,11 +38,13 @@ function parseArgs(): Args {
     return i >= 0 && a[i + 1] && !a[i + 1].startsWith("--") ? a[i + 1] : undefined;
   };
   const roots = resolveInstallRoots();
+  const configRoot = get("--config-root") || roots.configRoot;
   return {
-    configRoot: get("--config-root") || roots.configRoot,
+    configRoot,
     skillRoot: get("--skill-root") || join(import.meta.dir, ".."),
     apply: a.includes("--apply"),
     allowDev: a.includes("--allow-dev"),
+    harness: resolveSelectedHarness(configRoot),
   };
 }
 
@@ -115,6 +121,12 @@ function assertPhysicalPayloadFile(path: string, skillRoot: string): void {
 }
 
 export async function runInstallSettings(args = parseArgs()): Promise<Record<string, unknown>> {
+  if (args.harness === "unknown") {
+    return { ok: false, error: `cannot identify harness for ${args.configRoot}; set UAI_HARNESS before installing settings` };
+  }
+  if (args.harness && args.harness !== "claude-code" && args.harness !== "omp") {
+    return { ok: false, error: `${args.harness} does not consume settings.json; use its native configuration instead` };
+  }
   const home = resolveHomeDir();
   const templatePath = join(args.skillRoot, "install", "settings.system.json");
   const targetPath = join(args.configRoot, "settings.json");

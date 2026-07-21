@@ -189,7 +189,13 @@ A meaningful library of custom thinking skills — first principles, council deb
 
 ### Use your AI to install and run PAI
 
-We very much believe in AI-based installation and modification of PAI. Once you have a working install, point your AI at the system itself — upgrade versions, add skills, modify hooks, change settings, repair anything that breaks. The most important thing your AI can do for you up front is bring all of your existing custom context — notes, project state, preferences, identity, history — into the `PAI/USER/` directory so PAI knows who you are from day one. Tell your DA: *"Help me migrate my context into PAI/USER/."* The system was designed to be operated by AI; lean on it.
+We believe in AI-based installation and modification of PAI. Existing PAI
+profiles should migrate their custom context — notes, project state,
+preferences, identity, and history — into LifeOS's durable `USER/` data tree
+with `LifeOS/Tools/MigrateFromPai.ts`; it previews first, keeps the old tree
+read-only, preserves every collision, and reports any manual import/config
+follow-ups. Tell your DA: *"Preview my PAI-to-LifeOS migration, then apply it
+after I review the plan."*
 
 ### Install the current LifeOS runtime
 
@@ -248,6 +254,28 @@ before profile mutation. See [`LifeOS/INSTALL.md`](LifeOS/INSTALL.md) for the
 permission gates, component choices, verification, and rollback flow.
 
 After install, or any time startup reports a PAI self-check warning, run `k doctor` for AV-safe local diagnostics across the selected framework config, hooks/plugins, Pulse, and MCP profiles. Use `k doctor --smoke` for static source smoke checks, or `k doctor --deep` when you intentionally want child/session/install probes.
+
+### Migrate an existing old PAI install into LifeOS
+
+If you already run an old PAI install (the `PAI/USER/` layout under
+`<configRoot>/PAI/` plus an old data root at `~/.pai/USER/`), the
+`MigrateFromPai` tool moves your identity, TELOS, PROJECTS, and data into the
+new LifeOS USER layout. It is additive and lossless — the old PAI tree is
+read-only, and any destination that differs is preserved as
+`<file>.replaced-<stamp>` before the source overwrites it (live-wins semantics,
+matching `LinkUser`). Preview first, then apply:
+
+```bash
+bun Tools/MigrateFromPai.ts --config-root "$HOME/.claude"
+bun Tools/MigrateFromPai.ts --config-root "$HOME/.claude" --apply
+```
+
+The migrator never edits `CLAUDE.md` or `settings.json` itself — it prints an
+advisory listing detected `@PAI/USER/...` imports and PAI-path hook commands
+with their exact `@LIFEOS/...` replacements, which you apply via the existing
+`InstallSettings` / `ActivateImports` flow. See
+[`LifeOS/INSTALL.md`](LifeOS/INSTALL.md) step 5 for the full preview→apply and
+advisory-follow-up flow.
 
 ### Update an existing install
 

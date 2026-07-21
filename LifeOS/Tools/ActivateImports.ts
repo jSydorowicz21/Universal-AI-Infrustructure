@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /**
- * ActivateImports — Setup step 8. Uncomments the identity `@`-imports in the
- * harness CLAUDE.md, each guarded by existsSync of its resolved target. The
+ * ActivateImports — Setup step 8. Uncomments identity imports in the selected
+ * harness instruction file (`CLAUDE.md` for Claude/OMP, `AGENTS.md` for
+ * Codex/OpenCode), each guarded by existsSync of its resolved target. The
  * template ships imports commented (`<!-- @LIFEOS/USER/... -->`) so they don't
  * error before USER is scaffolded; this activates only the ones whose target
  * now resolves. Refuses on a dev tree unless --allow-dev.
@@ -11,7 +12,7 @@
  */
 
 import { join } from "node:path";
-import { activateImports, detectDevTree, resolveInstallRoots } from "./InstallEngine";
+import { activateImports, detectDevTree, resolveInstallRoots, resolveSelectedHarness } from "./InstallEngine";
 
 function main(): void {
   const a = process.argv.slice(2);
@@ -22,14 +23,20 @@ function main(): void {
   const roots = resolveInstallRoots();
   const configRoot = get("--config-root") || roots.configRoot;
   const apply = a.includes("--apply");
+  const harness = resolveSelectedHarness(configRoot);
+  if (harness === "unknown") {
+    console.log(JSON.stringify({ ok: false, error: `cannot identify harness for ${configRoot}; set UAI_HARNESS before activating imports` }, null, 2));
+    process.exit(1);
+  }
+  const instructionFile = harness === "codex" || harness === "opencode" ? "AGENTS.md" : "CLAUDE.md";
   const allowDev = a.includes("--allow-dev");
 
   if (detectDevTree(configRoot) && !allowDev) {
-    console.log(JSON.stringify({ ok: false, refused: "dev-tree", detail: `${configRoot} is a source tree — refusing to edit CLAUDE.md.` }, null, 2));
+    console.log(JSON.stringify({ ok: false, refused: "dev-tree", detail: `${configRoot} is a source tree — refusing to edit ${instructionFile}.` }, null, 2));
     process.exit(2);
   }
 
-  const claudeMd = join(configRoot, "CLAUDE.md");
+  const claudeMd = join(configRoot, instructionFile);
 
   if (!apply) {
     // Dry-run: report which commented imports WOULD activate without writing.
@@ -37,7 +44,7 @@ function main(): void {
     // in dry-run we read + classify against a copy by pointing at a temp scan.
     const { readFileSync, existsSync } = require("node:fs") as typeof import("node:fs");
     if (!existsSync(claudeMd)) {
-      console.log(JSON.stringify({ ok: false, error: `CLAUDE.md not found at ${claudeMd}` }, null, 2));
+      console.log(JSON.stringify({ ok: false, error: `${instructionFile} not found at ${claudeMd}` }, null, 2));
       process.exit(1);
     }
     const lines = readFileSync(claudeMd, "utf-8").split("\n");

@@ -3,7 +3,7 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
-import { detectDevTree, mergeHooks, resolveInstallRoots, validateHooksMap } from "./InstallEngine";
+import { detectDevTree, mergeHooks, resolveInstallRoots, resolveSelectedHarness, validateHooksMap } from "./InstallEngine";
 
 interface Args { configRoot: string; skillRoot: string; apply: boolean; allowDev: boolean; }
 
@@ -121,6 +121,10 @@ function referencedHookFiles(hooks: Record<string, unknown>): string[] {
 }
 
 export async function runInstallHooks(args = parseArgs()): Promise<{ ok: boolean; error?: string; added?: number; skipped?: number; hookFilesCopied?: number }> {
+	const harness = resolveSelectedHarness(args.configRoot);
+	if (harness === "codex" || harness === "opencode") {
+		return { ok: false, error: `${harness} does not consume Claude hooks; use its native compatible context surface instead` };
+	}
 	if (detectDevTree(args.configRoot) && !args.allowDev) return { ok: false, error: "dev tree detected — refusing to mutate" };
 	const hooksPayloadDir = join(args.skillRoot, "install", "hooks");
 	const hooksJsonPath = join(hooksPayloadDir, "hooks.json");

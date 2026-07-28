@@ -11,6 +11,12 @@ import type { ActorRunOptions } from '../../types'
 
 export const XQUIK_TWEET_ACTOR = 'xquik/x-tweet-scraper'
 export const XQUIK_FOLLOWER_ACTOR = 'xquik/x-follower-scraper'
+const XQUIK_PENDING_RUN_STATUSES = new Set([
+  'READY',
+  'RUNNING',
+  'TIMING-OUT',
+  'ABORTING'
+])
 
 export type XquikTweetMode =
   | 'legacy'
@@ -121,6 +127,10 @@ export interface XquikActorClient {
     input: Record<string, unknown>,
     options?: ActorRunOptions
   ): Promise<XquikActorRun>
+  waitForRun(
+    runId: string,
+    options?: { waitSecs?: number }
+  ): Promise<XquikActorRun>
   getDataset(datasetId: string): XquikDataset
 }
 
@@ -174,7 +184,12 @@ async function runXquikActor<T extends Record<string, unknown>>(
   maxItems: number | undefined,
   options: ActorRunOptions | undefined
 ): Promise<T[]> {
-  const run = await client.callActor(actorId, input, options)
+  let run = await client.callActor(actorId, input, options)
+
+  const pollWaitSecs = Math.max(1, Math.min(options?.waitSecs ?? 60, 60))
+  while (isXquikRunPending(run.status)) {
+    run = await client.waitForRun(run.id, { waitSecs: pollWaitSecs })
+  }
 
   if (run.status !== 'SUCCEEDED') {
     throw new Error(
@@ -188,6 +203,10 @@ async function runXquikActor<T extends Record<string, unknown>>(
   })
 
   return items as T[]
+}
+
+function isXquikRunPending(status: string): boolean {
+  return XQUIK_PENDING_RUN_STATUSES.has(status)
 }
 
 function validateXStartUrls(

@@ -14,12 +14,15 @@ interface CapturedCall {
   options?: ActorRunOptions
   datasetId?: string
   limit?: number
+  waitRunId?: string
+  waitSecs?: number
 }
 
 function createClient(
   captured: CapturedCall,
   rows: unknown[],
-  status = 'SUCCEEDED'
+  status = 'SUCCEEDED',
+  finalStatus = status
 ): XquikActorClient {
   return {
     async callActor(actorId, input, options) {
@@ -29,6 +32,15 @@ function createClient(
       return {
         id: 'run-1',
         status,
+        defaultDatasetId: 'dataset-1'
+      }
+    },
+    async waitForRun(runId, options) {
+      captured.waitRunId = runId
+      captured.waitSecs = options?.waitSecs
+      return {
+        id: runId,
+        status: finalStatus,
         defaultDatasetId: 'dataset-1'
       }
     },
@@ -87,6 +99,22 @@ describe('Xquik Actor wrappers', () => {
     expect(rows).toEqual([{ username: 'example' }])
   })
 
+  test('waits for a running Actor before reading its dataset', async () => {
+    expect.assertions(4)
+    const captured: CapturedCall = {}
+
+    const rows = await runXquikTweetScraper(
+      { tweetIds: ['123'], maxItems: 1 },
+      { waitSecs: 2 },
+      createClient(captured, [{ id: 'tweet-1' }], 'RUNNING', 'SUCCEEDED')
+    )
+
+    expect(captured.waitRunId).toBe('run-1')
+    expect(captured.waitSecs).toBe(2)
+    expect(captured.datasetId).toBe('dataset-1')
+    expect(rows).toEqual([{ id: 'tweet-1' }])
+  })
+
   test('rejects unsupported target URLs before starting a run', async () => {
     expect.assertions(2)
     const captured: CapturedCall = {}
@@ -104,7 +132,7 @@ describe('Xquik Actor wrappers', () => {
   })
 
   test('surfaces unsuccessful Actor runs without reading the dataset', async () => {
-    expect.assertions(2)
+    expect.assertions(3)
     const captured: CapturedCall = {}
 
     await expect(
@@ -116,6 +144,7 @@ describe('Xquik Actor wrappers', () => {
     ).rejects.toThrow(
       'Xquik Actor did not succeed: FAILED. Inspect Apify run run-1.'
     )
+    expect(captured.waitRunId).toBeUndefined()
     expect(captured.datasetId).toBeUndefined()
   })
 })

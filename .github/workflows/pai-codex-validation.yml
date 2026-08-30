@@ -1,35 +1,215 @@
-name: PAI Codex Validation
+name: LifeOS Universal Runtime Validation
 
 on:
   workflow_dispatch:
+    inputs:
+      live_adapter:
+        description: Optional non-blocking CLI discovery probe
+        required: false
+        type: choice
+        default: none
+        options:
+          - none
+          - claude
+          - omp
+          - codex
+          - opencode
   push:
-    branches:
-      - pai-codex-flawless-runtime
-      - pai-codex-windows-installer
+    paths:
+      - "LifeOS/install/LIFEOS/**"
+      - "LifeOS/install/hooks/**"
+      - "LifeOS/Tools/**"
+      - "LifeOS/install/skills/LifeOS/Tools/**"
+      - "LifeOS/install/LIFEOS/UNIVERSAL/package.json"
+      - "LifeOS/install/package.json"
+      - "LifeOS/install/install.ps1"
+      - "LifeOS/install/install.sh"
+      - "LifeOS/install/LIFEOS/UNIVERSAL/bootstrap.ts"
+      - "LifeOS/install/LIFEOS/UNIVERSAL/compile.ts"
+      - "LifeOS/install/LIFEOS/UNIVERSAL/workflow-probes.ts"
+      - "docs/prd/universal-runtime.md"
+      - "docs/prd/pr-1-stabilization.md"
+      - "LifeOS/INSTALL.md"
+      - "README.md"
+      - "LifeOS/install/LIFEOS/OMP/README.md"
+      - ".github/workflows/pai-codex-validation.yml"
+      - "ISA.md"
+      - "docs/roadmaps/**"
+      - "plans/**"
+      - ".gitignore"
   pull_request:
     paths:
-      - ".github/workflows/pai-codex-validation.yml"
+      - "LifeOS/install/LIFEOS/**"
+      - "LifeOS/install/hooks/**"
+      - "LifeOS/Tools/**"
+      - "LifeOS/install/skills/LifeOS/Tools/**"
+      - "LifeOS/install/LIFEOS/UNIVERSAL/package.json"
+      - "LifeOS/install/LIFEOS/UNIVERSAL/bootstrap.ts"
+      - "LifeOS/install/LIFEOS/UNIVERSAL/compile.ts"
+      - "LifeOS/install/LIFEOS/UNIVERSAL/workflow-probes.ts"
+      - "LifeOS/install/package.json"
+      - "LifeOS/install/install.ps1"
+      - "LifeOS/install/install.sh"
+      - "docs/prd/universal-runtime.md"
+      - "docs/prd/pr-1-stabilization.md"
+      - "LifeOS/INSTALL.md"
       - "README.md"
-      - "Releases/v5.0.0/**"
+      - "LifeOS/install/LIFEOS/OMP/README.md"
+      - ".github/workflows/pai-codex-validation.yml"
+      - "ISA.md"
+      - "docs/roadmaps/**"
+      - "plans/**"
+      - ".gitignore"
+
+permissions:
+  contents: read
+
+env:
+  UAI_RUNTIME_DIR: LifeOS/install/LIFEOS/UNIVERSAL
 
 jobs:
-  validate:
-    name: validate (${{ matrix.os }})
+  compile:
+    name: compile (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Verify current LifeOS layout
+        env:
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun run --cwd LifeOS/install/LIFEOS/UNIVERSAL ci:layout
+      - name: Compile explicit package entry points
+        working-directory: LifeOS/install/LIFEOS/UNIVERSAL
+        env:
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun run compile
+      - name: Compile integration entry points
+        env:
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun build LifeOS/install/LIFEOS/TOOLS/Services.ts LifeOS/install/LIFEOS/TOOLS/Inference.ts LifeOS/install/LIFEOS/PULSE/Conduit/InstallConduit.ts LifeOS/install/LIFEOS/PULSE/Conduit/InstallConduitInsight.ts LifeOS/install/hooks/MemoryReviewFire.hook.ts --outdir "${{ runner.temp }}/lifeos-integration-build" --target bun
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+  unit:
+    name: unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Run focused universal kernel unit tests
+        working-directory: LifeOS/install/LIFEOS/UNIVERSAL
+        env:
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun test tests/contract.test.ts tests/platform-lifecycle.test.ts tests/runtime.test.ts
+      - name: Run focused OMP stabilization gate
+        env:
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun test LifeOS/Tools/HarnessInstallerRouting.test.ts LifeOS/install/LIFEOS/OMP/stabilization.test.ts LifeOS/install/LIFEOS/OMP/extensions/lifeos-hooks/index.test.ts LifeOS/install/LIFEOS/OMP/extensions/lifeos-observability/index.test.ts
 
-      - name: Run Codex branch validation
-        run: bun Releases/v5.0.0/.claude/PAI/TOOLS/CodexBranchValidation.ts
+  fixtures:
+    name: fixtures (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Run deterministic adapter, platform, and first-party C1 bootstrap fixtures
+        working-directory: LifeOS/install/LIFEOS/UNIVERSAL
+        env:
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun test tests/fixtures.test.ts tests/first-party-bootstrap.test.ts
+
+  conformance:
+    name: conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Run credential-free negative-control suite
+        working-directory: LifeOS/install/LIFEOS/UNIVERSAL
+        env:
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun test tests/conformance.test.ts tests/codex-first-class.test.ts
+      - name: Smoke conformance entry point
+        working-directory: LifeOS/install/LIFEOS/UNIVERSAL
+        env:
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun run run-conformance.ts
+
+  optional-live-discovery:
+    name: optional live discovery (${{ inputs.live_adapter || 'none' }})
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.live_adapter != 'none' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Probe requested vendor CLI version only
+        working-directory: LifeOS/install/LIFEOS/UNIVERSAL
+        env:
+          LIVE_ADAPTER: ${{ inputs.live_adapter }}
+          HOME: ${{ runner.temp }}
+          USERPROFILE: ${{ runner.temp }}
+          UAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
+          UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+          PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
+        run: bun run ci:live-discovery

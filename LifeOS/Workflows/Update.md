@@ -1,0 +1,35 @@
+# Update — idempotent re-overlay after a version bump
+
+Brings an existing install up to the current LifeOS version without touching the user's data. Safe to run repeatedly.
+
+## Voice notification (first action)
+
+```bash
+curl -s -X POST http://localhost:31337/notify -H "Content-Type: application/json" \
+  -d '{"message": "Running the Update workflow in the LifeOS skill to update your install"}' > /dev/null 2>&1 &
+```
+
+> **`--apply` is not optional on any of these.** All three tools default to a
+> dry-run that prints a JSON plan and writes nothing. Documented without the flag
+> (2026-07-08 → 2026-07-31), the entire update path was a silent no-op: a user
+> following these steps saw success-shaped output and got no changes.
+
+## Steps
+
+1. **DetectEnv** — `bun Tools/DetectEnv.ts`. If `isDevTree` → STOP (the source repo updates itself via git, not this workflow).
+2. **Release check** (reworked per public PR #1519, @erf1nd0r — the old "version diff" compared the payload's version against the marker that same payload wrote, so it always said "already current" and never fetched) — the skill carries no version field and there is no plugin manifest; versioning lives at the distribution layer, so BOTH sides of the diff must come from it:
+   - **Installed version**: read `<configRoot>/LIFEOS/VERSION` (the install marker, shipped since 7.1.1). Absent → the install predates the marker; treat it as behind and continue.
+   - **Latest version**: read `tag_name` from `https://api.github.com/repos/<LIFEOS_REPO>/releases/latest` — the same endpoint the bootstrap resolves against (`LIFEOS_REPO` defaults in `install/install.sh`).
+   - **Equal** → report "already current" and exit.
+   - **Behind** → fetch the newer payload FIRST: run the shipped bootstrap, `bash <skillRoot>/install/install.sh`. It is additive — it replaces only the LifeOS skill dir and backs up the prior one. Then re-read the NEW skill's `Workflows/Update.md` and continue from its step 3 (steps may have changed between versions).
+   - **Network unreachable** → say so and stop after re-running the additive legs that work from the on-disk skill (steps 4–6). Step 3's overlay needs a full fetched payload: on an installed system `<skillRoot>/install/` holds only the bootstrap files, so `OverlaySystem.ts` will refuse with a `bootstrap-only` blocker until the fetch in the "Behind" branch has run. That refusal is expected, not a failure.
+
+   Never diff the on-disk payload's version against the install marker — the payload is what wrote the marker, so that comparison always says "already current" and the update never fetches anything.
+3. **Re-overlay system** — refresh every system-owned file that changed (which `copyMissing` cannot do — it only writes files that are absent, so an update otherwise leaves most of the machinery stale while `VERSION` bumps). Run `bun Tools/OverlaySystem.ts --config-root <configRoot>` first to preview, then `--apply`. It overwrites only system-owned paths (hooks, skills, agents, LIFEOS/{TOOLS,DOCUMENTATION,ALGORITHM,RULES,PULSE}, CLAUDE.md, the system prompt), never touches `USER/`, `LIFEOS/MEMORY/`, or `settings.json`, never deletes, skips symlinks, and writes `VERSION` last (only on a fully successful apply, so a partial update can't claim the new version). It backs up an existing CLAUDE.md and system prompt to a timestamped `.pre-overlay-*.bak` before overwriting — read the tool's `backups`/`note` output and reconcile any local edits from those, since step 6's `ActivateImports.ts --apply` then re-activates the identity imports the fresh CLAUDE.md ships commented.
+4. **Re-merge hooks** — `bun Tools/InstallHooks.ts --apply` (idempotent): adds new hook entries, leaves existing ones, never duplicates (normalized-command dedup). Backs up `settings.json` first.
+5. **Scaffold new USER templates only** — `bun Tools/ScaffoldUser.ts --apply` copyMissing: adds any NEW template files introduced by the version, never overwrites the user's existing files.
+6. **Re-activate imports** — `bun Tools/ActivateImports.ts --apply` for any newly-shipped identity import lines.
+7. **Verify** — two evidence classes (hooks fire + imports resolve), same as Setup step 9.
+
+## Rule
+Update is **additive and non-destructive**. It never removes user customizations, never overwrites user data, never deletes hooks the user added. The only files it overwrites are system-owned templates.

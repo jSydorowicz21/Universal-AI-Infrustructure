@@ -1,0 +1,42 @@
+# LIFEOS_CONFIG.toml — user-owned LifeOS configuration
+#
+# Bootstrap default. The LifeOS Setup + Interview fill in your real values.
+# Canonical source for principal identity, DA identity, voice config, integration
+# credentials, and path roots. System code reads these through
+# LIFEOS/TOOLS/LifeosConfig.ts (loadLifeosConfig()). Secrets stay in ~/.claude/.env — never here.
+#
+# This file lives under LIFEOS/USER/CONFIG/ (USER zone) — it never ships in a public
+# release with real values; this is the clean scaffold. It is yours; edit freely.
+#
+# Schema reference: the `LifeosConfig` interface in LIFEOS/TOOLS/LifeosConfig.ts.
+
+[principal]
+name = "Your Name"                 # required — your display name
+pronunciation = ""                 # optional — phonetic spelling if needed
+timezone = "America/Los_Angeles"   # required — IANA timezone
+hometown = ""                      # optional
+currency = "USD"                   # optional — ISO 4217, drives Pulse Finances tab formatting
+
+[da]
+name = "Aria"                      # required — your DA's name (rename to anything)
+full_name = ""
+display_name = ""
+color = "#3B82F6"
+
+[da.voices.main]
+voice_id = "21m00Tcm4TlvDq8ikWAM"  # required — ElevenLabs voice_id (public default; set yours in Interview)
+voice_name = "Rachel"
+stability = 0.85
+similarity_boost = 0.7
+style = 0.3
+speed = 1.0
+use_speaker_boost = true
+volume = 1.0
+
+[integrations.cloudflare]
+# Token lives in ~/.claude/.env (never here). Account ID is non-secret.
+token_env_var = "CLOUDFLARE_API_TOKEN"
+
+[paths]
+user_dir = "~/.claude/LIFEOS/USER"
+projects_dir = "~/Projects"

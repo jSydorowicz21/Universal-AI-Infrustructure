@@ -1,0 +1,150 @@
+#!/usr/bin/env bun
+/**
+ * InstallConveyorRunner.ts — Materialize com.lifeos.conveyor-runner.plist.template and bootstrap it.
+ *
+ *   bun ~/.claude/LIFEOS/TOOLS/InstallConveyorRunner.ts             # install
+ *   bun ~/.claude/LIFEOS/TOOLS/InstallConveyorRunner.ts --uninstall # remove
+ *   bun ~/.claude/LIFEOS/TOOLS/InstallConveyorRunner.ts --status    # check
+ *
+ * Reads $HOME, substitutes {{HOME}}/{{BUN}}/{{BUN_DIR}} in the template, writes
+ * ~/Library/LaunchAgents/com.lifeos.conveyor-runner.plist, and runs
+ * `launchctl bootstrap`.
+ *
+ * Idempotent. Re-running install bootouts the prior load before bootstrapping
+ * the fresh plist.
+ */
+
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "fs";
+import { join } from "path";
+import * as systemd from "./lib/SystemdUser";
+import { homedir } from "node:os";
+
+declare const Bun: { spawn: (cmd: string[], opts?: any) => any };
+
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
+const TEMPLATE_PATH = join(HOME, ".claude", "LIFEOS", "TOOLS", "com.lifeos.conveyor-runner.plist.template");
+const LAUNCH_AGENTS_DIR = join(HOME, "Library", "LaunchAgents");
+const TARGET_PLIST = join(LAUNCH_AGENTS_DIR, "com.lifeos.conveyor-runner.plist");
+const LABEL = "com.lifeos.conveyor-runner";
+
+async function uid(): Promise<string> {
+  const proc = Bun.spawn(["id", "-u"], { stdout: "pipe", stderr: "ignore" });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  return out.trim();
+}
+
+async function launchctl(args: string[]): Promise<{ ok: boolean; out: string; err: string }> {
+  const proc = Bun.spawn(["launchctl", ...args], { stdout: "pipe", stderr: "pipe" });
+  const out = await new Response(proc.stdout).text();
+  const err = await new Response(proc.stderr).text();
+  const exit = await proc.exited;
+  return { ok: exit === 0, out, err };
+}
+
+async function detectBun(): Promise<string> {
+  const proc = Bun.spawn(["which", "bun"], { stdout: "pipe", stderr: "ignore" });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  const path = out.trim();
+  if (!path) throw new Error("bun not found in PATH — install bun first");
+  return path;
+}
+
+async function install(): Promise<void> {
+  if (!existsSync(TEMPLATE_PATH)) {
+    console.error(`[InstallConveyorRunner] template missing at ${TEMPLATE_PATH}`);
+    process.exit(1);
+  }
+  const bunPath = await detectBun();
+  const bunDir = bunPath.replace(/\/bun$/, "");
+  console.log(`[InstallConveyorRunner] detected bun at ${bunPath}`);
+  const template = readFileSync(TEMPLATE_PATH, "utf-8");
+  const materialized = template
+    .replace(/\{\{HOME\}\}/g, HOME)
+    .replace(/\{\{BUN\}\}/g, bunPath)
+    .replace(/\{\{BUN_DIR\}\}/g, bunDir);
+  if (!existsSync(LAUNCH_AGENTS_DIR)) mkdirSync(LAUNCH_AGENTS_DIR, { recursive: true });
+
+  const u = await uid();
+  if (existsSync(TARGET_PLIST)) {
+    await launchctl(["bootout", `gui/${u}`, TARGET_PLIST]);
+  }
+
+  writeFileSync(TARGET_PLIST, materialized);
+  console.log(`[InstallConveyorRunner] wrote ${TARGET_PLIST}`);
+
+  const r = await launchctl(["bootstrap", `gui/${u}`, TARGET_PLIST]);
+  if (!r.ok) {
+    console.error(`[InstallConveyorRunner] bootstrap failed: ${r.err.trim()}`);
+    process.exit(1);
+  }
+  console.log(`[InstallConveyorRunner] launchd bootstrap OK — ${LABEL} active`);
+
+  const status = await launchctl(["print", `gui/${u}/${LABEL}`]);
+  if (status.ok) {
+    const stateLine = status.out.split("\n").find((l) => l.includes("state ="));
+    console.log(`[InstallConveyorRunner] ${stateLine?.trim() ?? "state unknown"}`);
+  }
+}
+
+async function uninstall(): Promise<void> {
+  const u = await uid();
+  if (existsSync(TARGET_PLIST)) {
+    const r = await launchctl(["bootout", `gui/${u}`, TARGET_PLIST]);
+    console.log(`[InstallConveyorRunner] bootout ${r.ok ? "OK" : "FAILED: " + r.err.trim()}`);
+    try { unlinkSync(TARGET_PLIST); console.log(`[InstallConveyorRunner] removed ${TARGET_PLIST}`); } catch {}
+  } else {
+    console.log(`[InstallConveyorRunner] no plist at ${TARGET_PLIST} — nothing to do`);
+  }
+}
+
+async function status(): Promise<void> {
+  const u = await uid();
+  const r = await launchctl(["print", `gui/${u}/${LABEL}`]);
+  if (!r.ok) {
+    console.log(`[InstallConveyorRunner] ${LABEL} not loaded`);
+    process.exit(1);
+  }
+  console.log(r.out);
+}
+
+/* ── systemd --user backend (Linux only) ────────────────────────────────────
+ * Strictly additive. Every line above is the launchd path and is unchanged;
+ * on darwin nothing in this section executes. KeepAlive + ThrottleInterval 30
+ * becomes Restart=always + RestartSec=30 on a Type=simple unit.
+ * ported from public PR #1698, @elhoim
+ * ------------------------------------------------------------------------- */
+
+async function linuxSpec(): Promise<systemd.UnitSpec> {
+  const bunPath = await systemd.which("bun");
+  if (!bunPath) throw new Error("bun not found in PATH - install bun first");
+  return {
+    label: LABEL,
+    description: "LifeOS Conveyor stage engine",
+    exec: [bunPath, join(HOME, ".claude", "LIFEOS", "TOOLS", "Conveyor", "Runner.ts")],
+    logPath: join(HOME, ".claude", "LIFEOS", "MEMORY", "STATE", "com.lifeos.conveyor-runner.log"),
+    workingDirectory: join(HOME, ".claude"),
+    schedule: { kind: "daemon", restartSec: 30 },
+  };
+}
+
+async function linuxMain(arg: string | undefined): Promise<void> {
+  const spec = await linuxSpec();
+  const log = (m: string) => console.log(`[InstallConveyorRunner] ${m}`);
+  if (arg === "--uninstall") { await systemd.uninstall(spec, log); return; }
+  if (arg === "--status") { if (!(await systemd.status(spec, log))) process.exit(1); return; }
+  if (!(await systemd.install(spec, log))) process.exit(1);
+}
+
+async function main(): Promise<void> {
+  const arg = process.argv[2];
+  if (systemd.isLinux()) return linuxMain(arg);
+  if (arg === "--uninstall") return uninstall();
+  if (arg === "--status") return status();
+  return install();
+}
+
+if (import.meta.main) {
+  main().catch((err) => { console.error(`[InstallConveyorRunner] Fatal: ${err}`); process.exit(1); });
+}

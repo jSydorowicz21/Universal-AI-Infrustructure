@@ -1,0 +1,272 @@
+# LifeOS Pulse — Unified Daemon Configuration
+#
+# Pulse is THE daemon for every LifeOS installation.
+# One process handles: cron jobs, voice, chat, observability, hooks, DA.
+#
+# type = "script" → runs command, $0 cost
+# type = "claude" → spawns claude --print, costs tokens
+# output = voice | ntfy | email | log
+# Sentinels: NO_ACTION, NO_URGENT, NO_EVENTS → suppress dispatch
+
+# ── Module Configuration ──
+
+# [modules] is the one place to switch a Pulse surface off. Every key defaults
+# to the value shown; delete a line and you get that default back. Disabling a
+# module stops it loading, stops its API routes answering, and (via
+# /api/config/modules) hides its tab in the dashboard instead of leaving a nav
+# entry that opens an empty page.
+#
+# Infrastructure Pulse needs to serve anything at all — observability, hooks,
+# tab-freshness, menubar, siri, doctor — is deliberately not listed: those are
+# how Pulse runs, not modules you use.
+#
+# The older `[section].enabled` flags below still work and still win over these
+# defaults, so an existing config needs no changes.
+# ported from public PR #1748, @elhoim
+[modules]
+# Life surfaces (the top nav)
+telos = true
+work = true
+content = true
+health = true
+finances = true
+business = true
+growth = true       # audience metrics; needs USER/CUSTOMIZATIONS/TOOLS/Growth.ts
+local = true        # LocalIntelligence civic digest; needs a Hometown set
+gear = true
+atlas = true
+memory = true
+synapse = true
+projects = true
+books = true
+# System surfaces
+algorithm = true
+bunker = true
+conduit = true
+upgrades = true
+hypotheses = true
+ledger = true
+usage = true
+performance = true
+evals = true
+threatmodel = true
+hermes = true
+docs = true
+# Opt-in surfaces. Each key here overrides its code default; omit a key to take
+# the default. voice defaults on; imessage, syslog, and da default off. Turn
+# syslog on only after wiring a router/firewall to the [syslog] listener below;
+# turn da on once a DA identity is configured (its heartbeat spawns agents).
+voice = true
+imessage = false
+syslog = false
+da = false
+
+[voice]
+enabled = true
+
+[imessage]
+enabled = false
+
+[observability]
+enabled = true
+dashboard_dir = "Observability/out"
+
+[observability.server]
+port = 31337
+enabled = true
+
+[notifications.ntfy]
+enabled = true
+topic = "${NTFY_TOPIC}"
+server = "ntfy.sh"
+
+[notifications.discord]
+enabled = true
+webhook = "${DISCORD_WEBHOOK}"
+
+[notifications.twilio]
+enabled = true
+to_number = "${TWILIO_TO_NUMBER}"
+
+[notifications.thresholds]
+long_task_minutes = 5
+
+[notifications.routing]
+task_complete = []
+long_task = ["ntfy"]
+background_agent = ["ntfy"]
+error = ["ntfy", "discord"]
+security = ["ntfy", "discord"]
+
+[performance]
+enabled = true
+
+[hooks]
+enabled = true
+blocked_skills = ["keybindings-help"]
+
+[work]
+enabled = true
+# Reads WORK.REPO from LIFEOS/USER/WORK/config.yaml.
+# When unset, the module starts in idle mode and serves a setup-template
+# response at /api/work instead of erroring. Polling cadence is also
+# config-driven via WORK.POLL_INTERVAL_SECONDS (default 60s).
+
+[bunker]
+enabled = true
+# Reads the app registry from ~/.claude/LIFEOS/PULSE/Bunker via its CLI (`bunker data`).
+# Override the harness location with the BUNKER_DIR env var.
+
+[syslog]
+enabled = false
+port = 5514
+# Off by default: enabling it opens a UDP listener on the port below. Turn it on
+# only after pointing a router/firewall's remote-syslog target at this host.
+# Captures router/firewall syslog to ~/.claude/LIFEOS/MEMORY/OBSERVABILITY/unifi-syslog.jsonl.
+# Controller-side setup: point your router/firewall's remote-syslog target at this
+# host on UDP 5514. Most consumer and prosumer gear exposes this as Settings →
+# System → Remote Logging (hostname + port).
+
+[local_intelligence]
+enabled = true
+# Reads LIFEOS/USER/PRINCIPAL/PRINCIPAL_IDENTITY.md Hometown line.
+# Daily digest at MEMORY/DATA/LocalIntelligence/latest.json.
+# Read-only — fetching happens in skills/LocalIntelligence/Tools/Refresh.ts.
+
+[telos]
+enabled = true
+# Reads LIFEOS/USER/TELOS/TELOS.md frontmatter + per-section <!-- updated --> markers
+# via LIFEOS/TOOLS/TelosFreshness.ts.
+# Endpoints: /api/telos/freshness, /api/telos/freshness/stale,
+#            /api/telos/freshness/summary, /api/telos/health.
+# Read-only — bumps go through skills/Interview which calls bumpTelosTimestamp().
+
+[da]
+enabled = false
+# DA display name (placeholder). Canonical name lives in LIFEOS/USER/CONFIG/LIFEOS_CONFIG.toml [da].name.
+primary = "Aria"
+heartbeat_schedule = "*/30 * * * *"
+heartbeat_model = "haiku"
+heartbeat_cost_ceiling = 0.01
+diary_schedule = "0 23 * * *"
+growth_schedule = "0 4 * * 0"
+
+# ── Cron Jobs ──
+# NOTE: Time-sensitive cron jobs (email triage, calendar reminders, morning
+# brief, schedule review, intel brief) may run on a worker-DA Pulse instance
+# on a separate host. The primary-DA Pulse here handles: healthcheck, memory
+# consolidation, DA subsystem.
+
+[[job]]
+name = "cost-aggregation"
+schedule = "*/15 * * * *"
+type = "script"
+command = "bun run Performance/cost-aggregator.ts"
+output = "log"
+enabled = true
+
+[[job]]
+name = "healthcheck"
+schedule = "*/5 * * * *"
+type = "script"
+command = "bun run checks/health.ts"
+output = "ntfy"
+enabled = true
+
+# NOTE: cost-tracker moved to LIFEOS/USER/CONFIG/PULSE.user.toml on 2026-05-03 —
+# scans a user-specific call-site fingerprint, doesn't belong in the public template.
+# NOTE: airgradient-poll moved to LIFEOS/USER/CONFIG/PULSE.user.toml on 2026-07-17 —
+# polls a user's own sensors; shipped default-on it polled nothing forever on
+# fresh installs (public issue #1504, @tzioup). Machine-specific jobs live in the
+# user layer, never here — this file is the public template.
+
+[[job]]
+name = "memory-consolidation"
+schedule = "0 3 * * *"
+# Deterministic tools, no LLM needed. Must be a script job: `type = "claude"`
+# spawns the CLI with `--tools ""` (see PULSE/lib.ts), so an agent asked to
+# *execute* these commands can't — it narrates and exits, logging "completed"
+# in a few seconds while running nothing. (public PR #1601, @asdf8675309)
+# timeout_ms is explicit because spawnScript's 60s default is far too short for
+# a 20-session harvest plus a week of pattern synthesis.
+type = "script"
+command = "bun run ~/.claude/LIFEOS/TOOLS/SessionHarvester.ts --recent 20 && bun run ~/.claude/LIFEOS/TOOLS/LearningPatternSynthesis.ts --week"
+timeout_ms = 600000
+output = "log"
+enabled = true
+
+[[job]]
+name = "proposal-gc"
+schedule = "45 3 * * *"
+# Applied proposals accreted in the always-loaded context files until someone
+# remembered to run /trim by hand (public issue #1669, @xmasyx). `--auto` implies
+# --apply and adds what an unattended run needs: BOUNDED (a file offering more
+# than MAX_AUTO_REMOVALS is left for a human — a pass that large is a signal, not
+# a chore) and FAIL-SILENT (always exit 0; a GC failure must never page). Removal
+# is provable-only: an entry goes only when it is already folded into the curated
+# section above it, which is why re-running finds nothing. Runs at :45 so it
+# collects whatever memory-consolidation (0 3) just wrote.
+type = "script"
+command = "bun run ~/.claude/LIFEOS/TOOLS/ProposalGC.ts --auto"
+output = "log"
+enabled = true
+
+# ── DA Subsystem Jobs ──
+# Default-disabled in the public template: these scripts live under
+# LIFEOS/PULSE/Assistant/, a private directory stripped from the public release
+# payload. Scheduling them on a fresh install would spawn broken jobs every
+# tick. Re-enable via LIFEOS/USER/CONFIG/PULSE.user.toml (merged by name) once
+# the Assistant subsystem is present. #1392.
+
+[[job]]
+name = "assistant-heartbeat"
+schedule = "*/30 * * * *"
+type = "script"
+command = "bun run Assistant/checks/heartbeat.ts"
+output = "log"
+enabled = false
+
+[[job]]
+name = "assistant-tasks"
+schedule = "* * * * *"
+type = "script"
+command = "bun run Assistant/checks/tasks.ts"
+output = "log"
+enabled = false
+
+[[job]]
+name = "assistant-diary"
+schedule = "0 23 * * *"
+type = "script"
+command = "bun run Assistant/checks/diary.ts"
+output = "log"
+enabled = false
+
+[[job]]
+name = "assistant-growth"
+schedule = "0 4 * * 0"
+type = "script"
+command = "bun run Assistant/checks/growth.ts"
+output = "log"
+enabled = false
+
+# ── Life Dashboard (Phase 0) ──
+
+[[job]]
+name = "life-morning-brief"
+schedule = "0 7 * * *"
+type = "script"
+command = "bun run checks/life-morning-brief.ts"
+output = "log"
+enabled = true
+
+# ── Migration note (2026-05-03) ──
+# All personal/{{PRINCIPAL_NAME}}-specific jobs (cost-tracker, monitor-*, lifelog-digest,
+# apple-health-ingest, local-intelligence-refresh, update-pai-state, the
+# disabled monitoring-spine scaffolding) moved to LIFEOS/USER/CONFIG/PULSE.user.toml.
+# Loader (lib.ts loadConfig) merges both files at runtime; user-tier overrides
+# system-tier by name. LIFEOS/USER/** is a containment-deletion zone, so shadow
+# releases automatically ship without personal jobs.
+#
+# This file (PULSE.toml) is the public template. Add only generic, framework-
+# default cron jobs here. User-specific monitors belong in PULSE.user.toml.

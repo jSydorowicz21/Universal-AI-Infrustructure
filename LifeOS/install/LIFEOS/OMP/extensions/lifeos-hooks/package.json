@@ -1,0 +1,12 @@
+{
+  "name": "lifeos-hooks",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CC-hook-protocol adapter — runs real LifeOS Claude Code hooks against mapped OMP events with a CLAUDE_* env shim and Pulse-availability gating.",
+  "scripts": {
+    "test": "bun test index.test.ts"
+  },
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}

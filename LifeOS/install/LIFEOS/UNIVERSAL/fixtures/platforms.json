@@ -1,0 +1,8 @@
+[
+  { "name": "macos-home-only", "input": { "platform": "darwin", "env": { "HOME": "/Users/fixture" } }, "expect": { "os": "darwin", "wsl": false, "container": false, "headless": false, "tier": "P1" } },
+  { "name": "macos-explicit-headless", "input": { "platform": "darwin", "env": { "HOME": "/Users/fixture", "UAI_HEADLESS": "1" } }, "expect": { "os": "darwin", "wsl": false, "container": false, "headless": true, "tier": "P4" } },
+  { "name": "linux-headless", "input": { "platform": "linux", "env": { "HOME": "/home/fixture", "UAI_HEADLESS": "1" } }, "expect": { "os": "linux", "wsl": false, "container": false, "headless": true, "tier": "P4" } },
+  { "name": "native-windows", "input": { "platform": "win32", "env": { "USERPROFILE": "C:\\Users\\fixture" } }, "expect": { "os": "win32", "wsl": false, "container": false, "headless": false, "tier": "P3" } },
+  { "name": "wsl", "input": { "platform": "linux", "release": "microsoft-standard-WSL2", "env": { "HOME": "/home/fixture", "WSL_DISTRO_NAME": "Ubuntu", "DISPLAY": ":0" } }, "expect": { "os": "linux", "wsl": true, "container": false, "headless": false, "tier": "P2" } },
+  { "name": "container", "input": { "platform": "linux", "env": { "HOME": "/home/fixture", "UAI_CONTAINER": "1" } }, "expect": { "os": "linux", "wsl": false, "container": true, "headless": true, "tier": "P4" } }
+]

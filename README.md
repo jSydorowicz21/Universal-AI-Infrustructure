@@ -1,6 +1,6 @@
 > ## 🍴 Universal AI Infrastructure (UAI)
 >
-> **UAI is a community fork of [Personal AI Infrastructure (PAI)](https://github.com/danielmiessler/Personal_AI_Infrastructure), created by [Daniel Miessler](https://danielmiessler.com).** The architecture, the Algorithm, Pulse, the skill and memory systems, and the overwhelming majority of the code are Daniel's work — all foundational credit belongs to him and the PAI community. This fork extends PAI toward cross-CLI feature parity (Claude Code + Codex).
+> **UAI is a community fork of [Personal AI Infrastructure (PAI)](https://github.com/danielmiessler/Personal_AI_Infrastructure), created by [Daniel Miessler](https://danielmiessler.com).** The architecture, the Algorithm, Pulse, the skill and memory systems, and the overwhelming majority of the code are Daniel's work — all foundational credit belongs to him and the PAI community. This fork adds explicit cross-CLI adapter and capability boundaries (Claude Code + Codex).
 >
 > UAI is **not affiliated with, sponsored by, or endorsed by** Daniel Miessler. Licensed under MIT (Daniel's original copyright preserved — see [LICENSE](LICENSE)). Upstream: https://github.com/danielmiessler/Personal_AI_Infrastructure
 
@@ -41,9 +41,9 @@
 
 <!-- Content -->
 [![Get Started](https://img.shields.io/badge/🚀_Get_Started-Install-22C55E?style=flat)](#-installation)
-[![Release v5.0.0](https://img.shields.io/badge/📦_Release-v5.0.0-8B5CF6?style=flat)](Releases/v5.0.0/)
-[![Algorithm v6.3.0](https://img.shields.io/badge/Algorithm-v6.3.0-D97706?style=flat)](Releases/v5.0.0/.claude/PAI/ALGORITHM/v6.3.0.md)
-[![Pulse](https://img.shields.io/badge/Pulse-included-3B82F6?style=flat)](Releases/v5.0.0/.claude/PAI/PULSE/)
+[![Release v5.0.0](https://img.shields.io/badge/📦_Release-v5.0.0-8B5CF6?style=flat)](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v5.0.0/)
+[![Algorithm v6.3.0](https://img.shields.io/badge/Algorithm-v6.3.0-D97706?style=flat)](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v5.0.0/.claude/PAI/ALGORITHM/v6.3.0.md)
+[![Pulse](https://img.shields.io/badge/Pulse-included-3B82F6?style=flat)](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v5.0.0/.claude/PAI/PULSE/)
 [![Contributors](https://img.shields.io/github/contributors/jSydorowicz21/Universal-AI-Infrustructure?style=flat&logo=githubsponsors&logoColor=white&label=Contributors&color=EC4899)](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/graphs/contributors)
 
 <!-- Tech Stack -->
@@ -56,7 +56,7 @@
 
 **Overview:** [What PAI Is](#what-pai-is) · [Principles](#principles) · [Features](#features)
 
-**Get Started:** [Installation](#-installation) · [Releases](Releases/) · [Packs](Packs/)
+**Get Started:** [Installation](#-installation) · [Releases](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/) · [Packs](Packs/)
 
 **Resources:** [FAQ](#-faq) · [Roadmap](#-roadmap) · [Community](#-community) · [Contributing](#-contributing)
 
@@ -75,7 +75,8 @@
 **Universal AI Infrastructure (UAI)** is a community fork of **[Personal AI Infrastructure (PAI)](https://github.com/danielmiessler/Personal_AI_Infrastructure)**, originally created by **[Daniel Miessler](https://danielmiessler.com)**.
 
 - **Original author & credit:** PAI — its architecture, the Algorithm, Pulse, the skill/memory systems, and nearly all of the code — is the work of Daniel Miessler and the PAI community. All credit for the foundation belongs to them.
-- **Why this fork exists:** UAI focuses on bringing the full PAI ecosystem to feature parity across multiple agent CLIs (Claude Code and Codex), so the same Life OS works behind either.
+- **Why this fork exists:** UAI is incrementally adapting PAI across Claude Code, Codex, OpenCode, and [OMP (Oh My Pi)](LifeOS/install/LIFEOS/OMP/README.md). Adapter discovery and compatible context surfaces are broader than behavioral certification; unsupported surfaces remain explicit.
+- **OMP harness:** `LifeOS/install/LIFEOS/OMP/` provides additive constitution, hook-adapter, memory, safety, observability, command, and inference wiring. The checked-in gate proves install/status/uninstall and bounded load probes in isolated profiles. Current status is **wired/loadable, C0 without live evidence**; it is not a claim of Claude parity, native C3 enforcement, or production activity.
 - **License:** MIT, unchanged. Daniel's original copyright notice is preserved in [LICENSE](LICENSE), exactly as MIT requires.
 - **Not official:** UAI is an independent fork and is **not affiliated with, sponsored by, or endorsed by** Daniel Miessler. For the canonical project, see the [upstream repository](https://github.com/danielmiessler/Personal_AI_Infrastructure).
 
@@ -86,11 +87,11 @@ Most documentation below is inherited from upstream PAI and describes the PAI sy
 > [!IMPORTANT]
 > **PAI v5.0.0 — Life Operating System** — the biggest release in PAI history. PAI is no longer "AI scaffolding" — it's a **Life Operating System** with the unified **Pulse** daemon (Life Dashboard at `localhost:31337`), a **DA** (Digital Assistant) identity layer, **Algorithm v6.3.0** (Current State → Ideal State, seven phases, classifier-driven mode + tier), the **ISA** primitive (universal "ideal state" articulation), 45 skills, 171 workflows, 37 hooks, and structural privacy via containment zones.
 >
-> **[v5.0.0 release notes →](Releases/v5.0.0/README.md)** | **[All releases →](Releases/)**
+> **[v5.0.0 release notes →](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v5.0.0/README.md)** | **[All releases →](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/)**
 >
 > **One-line install:** `curl -sSL https://ourpai.ai/install.sh | bash`
 >
-> Upgrading from v4.x? This is a different system, not a patch. Read the [migration guide](Releases/v5.0.0/README.md#migration-guide-from-v4x) first.
+> Upgrading from v4.x? This is a different system, not a patch. Read the [migration guide](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v5.0.0/README.md#migration-guide-from-v4x) first.
 
 <div align="center">
 
@@ -184,122 +185,114 @@ A meaningful library of custom thinking skills — first principles, council deb
 ## 🚀 Installation
 
 > [!CAUTION]
-> **Project in Active Development** — PAI is evolving rapidly. Expect breaking changes, restructuring, and frequent updates.
+> **Project Under Development** — PAI is evolving rapidly. Expect breaking changes, restructuring, and frequent updates.
 
 ### Use your AI to install and run PAI
 
-We very much believe in AI-based installation and modification of PAI. Once you have a working install, point your AI at the system itself — upgrade versions, add skills, modify hooks, change settings, repair anything that breaks. The most important thing your AI can do for you up front is bring all of your existing custom context — notes, project state, preferences, identity, history — into the `PAI/USER/` directory so PAI knows who you are from day one. Tell your DA: *"Help me migrate my context into PAI/USER/."* The system was designed to be operated by AI; lean on it.
+We believe in AI-based installation and modification of PAI. Existing PAI
+profiles should migrate their custom context — notes, project state,
+preferences, identity, and history — into LifeOS's durable `USER/` data tree
+with `LifeOS/Tools/MigrateFromPai.ts`; it previews first, keeps the old tree
+read-only, preserves every collision, and reports any manual import/config
+follow-ups. Tell your DA: *"Preview my PAI-to-LifeOS migration, then apply it
+after I review the plan."*
 
-### Install (clone + run)
+### Install the current LifeOS runtime
 
-UAI has no hosted one-line installer of its own — clone this repo and run the bundled installer:
+Clone the current branch and run the Bun installer tools from `LifeOS/`. Do **not**
+check out the retired `Releases/v5.0.0` bundle: it predates this LifeOS runtime and
+does not deploy the OMP adapter in this repository.
 
 ```bash
 git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git
-cd Universal-AI-Infrustructure/Releases/v5.0.0
-cp -R .claude ~/ && cd ~/.claude && ./install.sh
+cd Universal-AI-Infrustructure/LifeOS
+bun Tools/DetectEnv.ts
+bun Tools/DeployCore.ts --skill-root . --config-root "$HOME/.claude" --apply
+bun Tools/InstallSettings.ts --skill-root . --config-root "$HOME/.claude" --apply
+bun Tools/ScaffoldUser.ts --skill-root . --config-root "$HOME/.claude" --config-dir "$HOME/.pai" --apply
+bun Tools/LinkUser.ts --config-root "$HOME/.claude" --config-dir "$HOME/.pai"
+bun Tools/LinkUser.ts --config-root "$HOME/.claude" --config-dir "$HOME/.pai" --apply
 ```
 
-Windows PowerShell from the cloned release bundle:
+Review the proposed hook changes before granting the trust-gated approved-hook install:
+
+```bash
+bun Tools/InstallHooks.ts --skill-root . --config-root "$HOME/.claude"
+bun Tools/InstallHooks.ts --skill-root . --config-root "$HOME/.claude" --apply
+```
+
+Windows PowerShell uses the same TypeScript tools without Bash:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\.claude\install.ps1
+git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git
+Set-Location .\Universal-AI-Infrustructure\LifeOS
+$root = Join-Path $env:USERPROFILE ".claude"
+bun .\Tools\DetectEnv.ts
+bun .\Tools\DeployCore.ts --skill-root . --config-root $root --apply
+bun .\Tools\InstallSettings.ts --skill-root . --config-root $root --apply
+bun .\Tools\ScaffoldUser.ts --skill-root . --config-root $root --config-dir (Join-Path $env:USERPROFILE ".pai") --apply
+bun .\Tools\LinkUser.ts --config-root $root --config-dir (Join-Path $env:USERPROFILE ".pai")
+bun .\Tools\LinkUser.ts --config-root $root --config-dir (Join-Path $env:USERPROFILE ".pai") --apply
+bun .\Tools\InstallHooks.ts --skill-root . --config-root $root
+# After reviewing the dry-run:
+bun .\Tools\InstallHooks.ts --skill-root . --config-root $root --apply
+bun (Join-Path $root "LIFEOS\OMP\manage.ts") install
+bun (Join-Path $root "LIFEOS\OMP\manage.ts") status
 ```
 
-That's it. The installer wizard handles Bun, Git, framework selection, agent CLI verification, ElevenLabs key (optional), DA identity setup, voice picker, Pulse launchd registration, and validation. You can target Claude Code, Codex, or OpenCode. The selected framework home is auto-backed-up before anything is overwritten.
+To add OMP wiring after the runtime and approved hook set are present:
 
-> **Note:** Upstream PAI offers a hosted one-liner (`curl -sSL https://ourpai.ai/install.sh | bash`) that installs the **original PAI**, not this fork. Always inspect `Releases/v5.0.0/.claude/install.sh` in your clone before running it.
+```bash
+bun "$HOME/.claude/LIFEOS/OMP/manage.ts" install
+bun "$HOME/.claude/LIFEOS/OMP/manage.ts" status
+```
 
-After install, or any time startup reports a PAI self-check warning, run `k doctor` for AV-safe local diagnostics across the active framework config, hooks/plugins, Pulse, and MCP profiles. Use `k doctor --smoke` for static source smoke checks, or `k doctor --deep` when you intentionally want child/session/install probes.
+`status` distinguishes installed/wired/loadable from certified behavior. The
+repository fixture gate does not produce live C3 evidence.
+Missing hooks, classifiers, parsers, or extension manifests block installation
+before profile mutation. See [`LifeOS/INSTALL.md`](LifeOS/INSTALL.md) for the
+permission gates, component choices, verification, and rollback flow.
+
+After install, or any time startup reports a PAI self-check warning, run `k doctor` for AV-safe local diagnostics across the selected framework config, hooks/plugins, Pulse, and MCP profiles. Use `k doctor --smoke` for static source smoke checks, or `k doctor --deep` when you intentionally want child/session/install probes.
+
+### Migrate an existing old PAI install into LifeOS
+
+If you already run an old PAI install (the `PAI/USER/` layout under
+`<configRoot>/PAI/` plus an old data root at `~/.pai/USER/`), the
+`MigrateFromPai` tool moves your identity, TELOS, PROJECTS, and data into the
+new LifeOS USER layout. It is additive and lossless — the old PAI tree is
+read-only, and any destination that differs is preserved as
+`<file>.replaced-<stamp>` before the source overwrites it (live-wins semantics,
+matching `LinkUser`). Preview first, then apply:
+
+```bash
+bun Tools/MigrateFromPai.ts --config-root "$HOME/.claude"
+bun Tools/MigrateFromPai.ts --config-root "$HOME/.claude" --apply
+```
+
+The migrator never edits `CLAUDE.md` or `settings.json` itself — it prints an
+advisory listing detected `@PAI/USER/...` imports and PAI-path hook commands
+with their exact `@LIFEOS/...` replacements, which you apply via the existing
+`InstallSettings` / `ActivateImports` flow. See
+[`LifeOS/INSTALL.md`](LifeOS/INSTALL.md) step 5 for the full preview→apply and
+advisory-follow-up flow.
 
 ### Update an existing install
 
-For small fixes after PAI is already installed, use the hotfix updater instead of re-running the full installer. It fetches the release bundle, reads `hotfix-manifest.json`, backs up touched files under `~/.pai/BACKUPS/`, and overlays only managed PAI files. It does not overwrite `USER`, `MEMORY`, auth, env files, framework config, or hook trust state.
+The retired `Releases/v5.0.0` hotfix scripts do not update the current LifeOS
+layout and must not be used. Until a journaled current-layout updater ships,
+install a fresh checkout into an isolated staging profile, run the focused
+verification, and then use the ownership-aware adapter uninstall/install flow.
+Back up the harness configuration root first; durable USER/MEMORY data under
+`~/.pai` is retained.
 
-From a cloned checkout:
+### Migrate an existing PAI install
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\Releases\v5.0.0\.claude\update-installed.ps1 -Framework codex -SourceDir .
-```
-
-macOS/Linux/WSL:
-
-```bash
-bash ./Releases/v5.0.0/.claude/update-installed.sh --framework codex --source-dir .
-```
-
-From a machine that already has PAI installed but needs the latest updater from this branch:
-
-```powershell
-$u = "https://raw.githubusercontent.com/jSydorowicz21/Universal-AI-Infrustructure/main/Releases/v5.0.0/.claude/update-installed.ps1"
-$p = Join-Path $env:TEMP "pai-update-installed.ps1"
-Invoke-WebRequest $u -OutFile $p
-powershell -NoProfile -ExecutionPolicy Bypass -File $p -Framework codex
-```
-
-macOS/Linux/WSL:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jSydorowicz21/Universal-AI-Infrustructure/main/Releases/v5.0.0/.claude/update-installed.sh | bash -s -- --framework codex
-```
-
-Use `-Framework claude` or `-Framework opencode` for those targets, or omit `-Framework` to let the updater read `~/.pai/framework.json`.
-
-Use `--framework claude` or `--framework opencode` with the shell updater. When the source directory points at a git checkout, the updater runs `git fetch --prune` and `git pull --ff-only` before copying files. Pass `-NoPull` in PowerShell or `--no-pull` in Bash when testing uncommitted local changes.
-
-Rollback restores the files touched by the hotfix from the newest backup:
-
-```bash
-BACKUP="$(ls -dt ~/.pai/BACKUPS/hotfix-* | head -1)"
-cp -a "$BACKUP"/. "$CODEX_HOME"/
-```
-
-PowerShell:
-
-```powershell
-$backup = Get-ChildItem "$HOME\.pai\BACKUPS" -Directory -Filter "hotfix-*" | Sort-Object Name -Descending | Select-Object -First 1
-Get-ChildItem -LiteralPath $backup.FullName -Force | Copy-Item -Destination $env:CODEX_HOME -Recurse -Force
-```
-
-### Convert an existing PAI install to UAI
-
-Already running upstream PAI and want to switch it to UAI? Clone this repo and run the converter — a thin wrapper over the hotfix updater that overlays UAI's managed files onto the framework install recorded in `~/.pai/framework.json` and writes a `~/.pai/distribution.json` marker. It preserves `USER`, `MEMORY`, settings, config, auth, env files, and hook trust state.
-
-```bash
-git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git
-cd Universal-AI-Infrustructure/Releases/v5.0.0/.claude
-bash ./convert-to-uai.sh            # --dry-run to preview, --fetch to pull latest
-```
-
-Windows PowerShell:
-
-```powershell
-cd Universal-AI-Infrustructure\Releases\v5.0.0\.claude
-powershell -ExecutionPolicy Bypass -File .\convert-to-uai.ps1   # -DryRun to preview, -Fetch for latest
-```
-
-Restart your agent session afterward so instructions reload.
-
-### Manual install (clone + run)
-
-```bash
-git clone https://github.com/jSydorowicz21/Universal-AI-Infrustructure.git
-cd Universal-AI-Infrustructure/Releases/v5.0.0
-cp -R .claude ~/
-cd ~/.claude && ./install.sh
-```
-
-On Windows, run `.\.claude\install.ps1` from `Releases\v5.0.0` instead of `install.sh`.
-
-**The installer will:**
-- Ask which agent framework to target: Claude Code, Codex, or OpenCode
-- Verify Bun, Git, and the selected agent CLI are installed
-- Generate native framework files: `CLAUDE.md`/`settings.json`, Codex `AGENTS.md`/`config.toml`/`hooks.json`, or OpenCode `AGENTS.md`/`opencode.json` plus the PAI plugin
-- Link memory and USER context through `~/.pai/` so state survives framework switches
-- Prompt for your ElevenLabs API key (skippable — voice falls back to desktop notifications)
-- Launch the DA identity wizard (name + voice + personality)
-- Set up Pulse as a launchd service (`com.pai.pulse`)
-- Run validation
+The retired release converter is not compatible with the current LifeOS layout.
+Do not run it against an existing profile. Preserve the current harness root and
+`~/.pai`, deploy this checkout into a separate staging root with the current Bun
+commands above, and compare the dry-run/verification output before switching.
+UAI installation is additive; USER and MEMORY remain durable under `~/.pai`.
 
 ### After install
 
@@ -318,23 +311,16 @@ This is the most important step. **Without TELOS, your DA has nothing to optimiz
 
 ### Switching agent frameworks
 
-PAI can switch the active CLI after setup while keeping the same memory store:
-
-```bash
-pai framework status
-pai framework switch codex
-pai framework switch claude
-pai framework switch opencode
-```
-
-Framework switching changes which CLI `pai` launches and regenerates that framework's native config. PAI memory and USER context remain under `~/.pai/MEMORY` and `~/.pai/USER`.
-
-MCP profile selection also follows the active framework: `pai -m ...` and `pai mcp set ...` keep Claude on `.mcp.json`, project MCP servers into Codex `config.toml`, and project them into OpenCode `opencode.json`.
+This repository does not yet ship a packaged `pai framework switch` or
+`pai mcp` launcher. Select the target harness explicitly during installation
+and use that harness's own configuration. Durable USER data can be shared
+through the documented root/link contract, but configuration projection and
+framework switching are not advertised until a launcher is packaged and tested.
 
 ### Upgrading from v4.x
 
 > [!IMPORTANT]
-> v5.0.0 is a different system, not a patch. Read the **[full migration guide](Releases/v5.0.0/README.md#migration-guide-from-v4x)** before installing.
+> v5.0.0 is a different system, not a patch. Read the **[full migration guide](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v5.0.0/README.md#migration-guide-from-v4x)** before installing.
 
 Quick path:
 
@@ -521,26 +507,26 @@ MIT License - see [LICENSE](LICENSE) for details.
 - **Memory v7.6** — structured by purpose: WORK (active task ISAs), KNOWLEDGE (typed graph: People, Companies, Ideas, Research, Blogs), LEARNING (meta-patterns), RELATIONSHIP (DA-Principal notes), OBSERVABILITY (every tool call + hook firing + satisfaction signal), STATE (session registry).
 - **45 public skills, 171 workflows, 37 hooks** — skills are self-activating composable domain units; hooks fire across SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStop, PreCompact, SessionEnd.
 - **One-line installer** — `curl -sSL https://ourpai.ai/install.sh | bash`. Auto-backs-up existing `~/.claude/`, runs the DA identity wizard, registers Pulse as a launchd service, validates.
-- [Full release notes + migration guide](Releases/v5.0.0/README.md)
+- [Full release notes + migration guide](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v5.0.0/README.md)
 
 **v4.0.3 (2026-03-01) — Community PR Patch**
 - JSON array parsing fix in Inference.ts
 - 29 dead references removed from CONTEXT_ROUTING.md
 - WorldThreatModelHarness PAI_DIR portability
 - User context migration for v2.5/v3.0 upgraders
-- [Release Notes](Releases/v4.0.3/README.md)
+- [Release Notes](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v4.0.3/README.md)
 
 **v4.0.2 (2026-03-01) — Bug Fix Patch**
 - 13 surgical fixes: Linux compatibility, installer, statusline, hooks
 - Cross-platform OAuth token extraction, GNU coreutils tr fix
 - Inference guard (~15s savings), lineage tracking, dead code removal
-- [Release Notes](Releases/v4.0.2/README.md)
+- [Release Notes](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v4.0.2/README.md)
 
 **v4.0.1 (2026-02-28) — Upgrade Path & Preferences**
 - Upgrade documentation with backup, merge, and post-upgrade checklist
 - Configurable temperature unit (Fahrenheit/Celsius) in statusline and installer
 - FAQ fixes: removed stale Python reference, improved recovery guidance
-- [Release Notes](Releases/v4.0.1/README.md)
+- [Release Notes](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v4.0.1/README.md)
 
 **v4.0.0 (2026-02-27) — Lean and Mean**
 - 38 flat skill directories → 12 hierarchical categories (-68% top-level dirs)
@@ -550,7 +536,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 - Comprehensive security sanitization (33+ files cleaned)
 - All version refs updated, Electron crash fix
 - 63 skills, 21 hooks, 180 workflows, 14 agents
-- [Release Notes](Releases/v4.0.0/README.md)
+- [Release Notes](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v4.0.0/README.md)
 
 **v3.0.0 (2026-02-15) — The Algorithm Matures**
 - Algorithm v1.4.0 with constraint extraction and build drift prevention
@@ -558,28 +544,28 @@ MIT License - see [LICENSE](LICENSE) for details.
 - Full installer with GUI wizard
 - 10 new skills, agent teams/swarm, voice personality system
 - 38 skills, 20 hooks, 162 workflows
-- [Release Notes](Releases/v3.0/README.md)
+- [Release Notes](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v3.0/README.md)
 
 **v2.5.0 (2026-01-30) — Think Deeper, Execute Faster**
 - Two-Pass Capability Selection: Hook hints validated against ISC in THINK phase
 - Thinking Tools with Justify-Exclusion: Opt-OUT, not opt-IN for Council, RedTeam, FirstPrinciples, etc.
 - Parallel-by-Default Execution: Independent tasks run concurrently via parallel agent spawning
 - 28 skills, 17 hooks, 356 workflows
-- [Release Notes](Releases/v2.5/README.md)
+- [Release Notes](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v2.5/README.md)
 
 **v2.4.0 (2026-01-23) — The Algorithm**
 - Universal problem-solving system with ISC (Ideal State Criteria) tracking
 - 29 skills, 15 hooks, 331 workflows
 - Euphoric Surprise as the outcome metric
 - Enhanced security with AllowList enforcement
-- [Release Notes](Releases/v2.4/README.md)
+- [Release Notes](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v2.4/README.md)
 
 **v2.3.0 (2026-01-15) — Full Releases Return**
 - Complete `.claude/` directory releases with continuous learning
 - Explicit and implicit rating capture
 - Enhanced hook system with 14 production hooks
 - Status line with learning signal display
-- [Release Notes](Releases/v2.3/README.md)
+- [Release Notes](https://github.com/jSydorowicz21/Universal-AI-Infrustructure/tree/68f501b23b2fc240331ffd698236c3bf8a50b57a/Releases/v2.3/README.md)
 
 **v2.1.1 (2026-01-09) — MEMORY System Migration**
 - History system merged into core as MEMORY System

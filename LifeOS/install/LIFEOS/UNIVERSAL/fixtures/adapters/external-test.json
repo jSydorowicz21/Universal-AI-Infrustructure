@@ -1,0 +1,10 @@
+{
+  "contract": "uai.adapter.v1",
+  "adapter": { "id": "external:test", "version": "1.0.0", "class": "discovery-only" },
+  "discovery": { "state": "detected", "confidence": 1, "cliVersion": "fixture-1.0.0", "roots": ["fixture://external-test"] },
+  "capabilities": {
+    "instructionBootstrap": { "state": "installed", "losses": ["sentinel must be observed before C1 evidence"] }
+  },
+  "certification": "C0",
+  "losses": ["unsupported capabilities remain absent"]
+}

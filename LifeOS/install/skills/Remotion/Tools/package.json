@@ -1,0 +1,28 @@
+{
+  "name": "@pai/remotion",
+  "version": "1.0.0",
+  "description": "LifeOS Remotion skill - programmatic video creation with React",
+  "main": "Render.ts",
+  "type": "module",
+  "scripts": {
+    "render": "bun run Render.ts render",
+    "list": "bun run Render.ts list",
+    "create": "bun run Render.ts create"
+  },
+  "keywords": [
+    "remotion",
+    "video",
+    "react",
+    "animation",
+    "pai",
+    "skill"
+  ],
+  "dependencies": {},
+  "peerDependencies": {
+    "remotion": ">=4.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}

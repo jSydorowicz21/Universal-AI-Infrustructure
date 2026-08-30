@@ -1,0 +1,7 @@
+{
+  "name": "lifeos-runtime",
+  "private": true,
+  "type": "module",
+  "description": "Dependency-free LifeOS hook and TOOL runtime manifest. Built-in Bun.YAML supplies structured parsing; future external dependencies must be provisioned before lifecycle-planned deployment.",
+  "dependencies": {}
+}

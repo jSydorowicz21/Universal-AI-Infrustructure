@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# PreflightIsolation.sh — hard gate before any browser command lands in Chrome.
+#
+# Guarantees, enforced in code, that an interceptor browser verb cannot route to
+# the operator's Default Chrome window or any working/monitoring profile:
+#
+#   1. Binary present + version >= MIN_VERSION. Older builds silently ignore
+#      --context, so the daemon falls back to whatever Chrome it can find. Hard fail.
+#
+#   2. Pinned test context is connected — exact whole-field match on the UUID
+#      (or friendly name) from preferences.env. A substring/header collision can't
+#      false-pass. Hard fail if absent.
+#
+#   3. Target-deny: the resolved target is NOT Default and NOT in the
+#      INTERCEPTOR_WORKING_PROFILE_IDS deny-list, and its name does not match a
+#      Default/working pattern. This is the new guarantee — "connected" was the
+#      old check; "target is provably not a working profile" is the contract now.
+#
+#   4. Extension present, then fresh. Absent Extension/ → hard fail (browser
+#      control cannot work without it, and the freshness check below cannot see
+#      this case: it is guarded on PINNED_FROM.txt, which is gone too). Then,
+#      graceful: compare the pinned copy's PINNED_FROM.txt against the upstream
+#      dist IF present. Mismatch → fail with re-pin remediation. Upstream absent
+#      → WARN and continue (do not hard-fail on a missing reference).
+#
+# There is NO fallback path. A missing/stale pinned context is a hard stop with
+# remediation, never an auto-route to Default. The old "fall back to the first
+# available / Default context" behavior is DELETED and must never be re-derived.
+#
+# Every browser workflow's first step. Source from a workflow:
+#
+#   if ! bash ~/.claude/skills/Interceptor/Tools/PreflightIsolation.sh; then
+#     exit 1   # surface to operator; do NOT fall back
+#   fi
+#
+# Exit codes: 0 cleared; 2 binary missing; 3 version-parse fail; 4 version too low;
+# 5 no contexts connected; 6 pinned context not connected (UUID rot) OR pinned
+# Extension stale; 7 target is a Default/working profile (deny); 8 test-context
+# unset in preferences; 9 no pinned Extension at all.
+
+set -euo pipefail
+
+# Source per-machine USER customizations if present (Chrome profile dir name,
+# pinned context ID, working-profile deny-list). Lives outside the public skill
+# body so the skill stays generic.
+USER_PREFS="${HOME}/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/Interceptor/preferences.env"
+if [ -f "$USER_PREFS" ]; then
+    # shellcheck disable=SC1090
+    . "$USER_PREFS"
+fi
+
+MIN_VERSION="0.16.9"
+
+# The pinned test context. No friendly default — an unset value is a hard stop,
+# never a fall-through to a default name that might resolve to the wrong profile.
+REQUIRED_CONTEXT="${INTERCEPTOR_TEST_CONTEXT_ID:-}"
+
+if [ -z "$REQUIRED_CONTEXT" ]; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: INTERCEPTOR_TEST_CONTEXT_ID is not set.
+
+REMEDIATION:
+  Set INTERCEPTOR_TEST_CONTEXT_ID in
+    ~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/Interceptor/preferences.env
+  to the pinned Interceptor test context (raw UUID today; durable fix is the
+  friendly name "interceptor-test" set once in the extension popup). There is
+  no default — running without an explicit pinned context could route a tab to
+  the operator's working profile.
+EOF
+    exit 8
+fi
+
+# Comma-separated Default/working-profile context IDs to hard-deny. Machine-specific,
+# kept in preferences.env. "Default" is always denied regardless of this list.
+WORKING_PROFILE_IDS="${INTERCEPTOR_WORKING_PROFILE_IDS:-}"
+
+# --- 1. Binary present + version >= MIN_VERSION ---
+
+if ! command -v interceptor >/dev/null 2>&1; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: interceptor not found on PATH.
+
+REMEDIATION:
+  Build and install per Workflows/Update.md, then verify with:
+    interceptor --version
+EOF
+    exit 2
+fi
+
+raw_version="$(interceptor --version 2>&1 | head -1)"
+# Expected shape: "interceptor 0.16.9 (sha, date)"
+current_version="$(printf '%s\n' "$raw_version" | awk '{print $2}')"
+
+if [ -z "$current_version" ]; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: could not parse interceptor version.
+  raw output: $raw_version
+
+REMEDIATION:
+  Run \`interceptor --version\` manually and confirm output shape
+  matches "interceptor X.Y.Z (sha, date)". If not, rebuild per Workflows/Update.md.
+EOF
+    exit 3
+fi
+
+# Compare semver-style (major.minor.patch) by sorting.
+lowest="$(printf '%s\n%s\n' "$current_version" "$MIN_VERSION" | sort -V | head -1)"
+if [ "$lowest" != "$MIN_VERSION" ] && [ "$current_version" != "$MIN_VERSION" ]; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: interceptor $current_version is below required $MIN_VERSION.
+
+WHY THIS MATTERS:
+  Builds before $MIN_VERSION silently ignore the --context flag. The daemon
+  then falls back to whatever Chrome connection it can find — which is
+  usually the operator's Default profile. A tab opens in the wrong window.
+
+REMEDIATION:
+  Upgrade via Workflows/Update.md, then:
+    interceptor --version          # confirm >= $MIN_VERSION
+EOF
+    exit 4
+fi
+
+# --- 2. Pinned test context is connected (exact whole-field match) ---
+
+# `interceptor contexts` exits 0 even when no contexts are connected, emitting
+# "no browser contexts connected" to stdout. Capture and inspect.
+contexts_output="$(interceptor contexts 2>&1 || true)"
+
+if printf '%s\n' "$contexts_output" | grep -qi "no browser contexts connected"; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: no browser contexts connected.
+
+WHY THIS MATTERS:
+  The Interceptor extension is not currently loaded in any Chrome profile, or
+  the daemon was restarted after Chrome (so the extension hasn't re-handshaked).
+  Without a connection, browser commands fail or hang.
+
+REMEDIATION (operator action — no auto-launch):
+  1. Open the dedicated Interceptor test profile window.
+  2. In that profile, open chrome://extensions/. If the Interceptor card is
+     missing or shows an error: Load Unpacked
+       -> ~/.claude/skills/Interceptor/Extension/
+     and accept any new permissions.
+  3. Click the Interceptor toolbar icon, set Context ID to the friendly name
+     "interceptor-test", Save. Friendly names survive extension reloads; raw
+     UUIDs rot on every reload (see preferences.env header).
+  4. Set INTERCEPTOR_TEST_CONTEXT_ID in preferences.env to match, then re-run.
+EOF
+    exit 5
+fi
+
+# Whole-field exact match: strip the "[id] → contexts" header line, trim each row,
+# and require an exact equality against REQUIRED_CONTEXT. A substring match (old
+# behavior) could false-pass on a header or a partial-UUID collision.
+if ! printf '%s\n' "$contexts_output" \
+    | grep -v '→ contexts' \
+    | awk -v want="$REQUIRED_CONTEXT" '
+        { gsub(/^[ \t]+|[ \t]+$/, "", $0) }
+        $0 == want { found = 1 }
+        END { exit(found ? 0 : 1) }
+    '; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: required context "$REQUIRED_CONTEXT" is not connected.
+
+CURRENT CONTEXTS:
+$(printf '%s\n' "$contexts_output" | sed 's/^/  /')
+
+WHY THIS MATTERS:
+  The whole point of the pinned test context is to give browser commands a known
+  target that is NEVER the operator's working window. Without it connected, a
+  command could land in the wrong profile or fail ambiguously. There is no
+  fallback — this is a hard stop.
+
+LIKELY CAUSE: UUID rotation. When Chrome's Interceptor extension reloads
+(manifest version bump, "Load Unpacked" again, fresh profile), the auto-assigned
+UUID changes and preferences.env still holds the OLD one. The live context in
+CURRENT CONTEXTS above is the NEW one.
+
+REMEDIATION (UUID rot — most common):
+  1. Compare the UUID(s) above against INTERCEPTOR_TEST_CONTEXT_ID in
+       ~/.claude/LIFEOS/USER/CUSTOMIZATIONS/SKILLS/Interceptor/preferences.env
+  2. If the live UUID is the same test profile under a new value, copy it into
+     preferences.env and re-run this preflight.
+
+DURABLE FIX (end UUID rot):
+  Set the friendly name "interceptor-test" in the extension popup once and pin
+  that string in preferences.env. Friendly names survive reloads; raw UUIDs do not.
+EOF
+    exit 6
+fi
+
+# --- 3. Target-deny: pinned target must NOT be Default or a working profile ---
+
+# Defense in depth. REQUIRED_CONTEXT is what every command will target; refuse if
+# it is, or resolves to, a Default/working profile. "Default" is always denied.
+deny_hit=""
+if printf '%s\n' "$REQUIRED_CONTEXT" | grep -qiE '(^|[^a-z])default([^a-z]|$)'; then
+    deny_hit="name matches Default"
+fi
+if [ -z "$deny_hit" ] && [ -n "$WORKING_PROFILE_IDS" ]; then
+    # Comma is the documented separator, but a whitespace-separated value must not
+    # fail open here (it arrives as one token), and a single entry that itself
+    # contains spaces must still match whole. Test the whole value and both splits:
+    # a superset of the comma-only parse, so this can only add a refusal.
+    # public issue #1802, @catchingknives
+    _deny_raw="$(printf '%s' "$WORKING_PROFILE_IDS" | sed 's/^[ \t]*//;s/[ \t]*$//')"
+    [ "$_deny_raw" = "$REQUIRED_CONTEXT" ] && deny_hit="matches working-profile deny-list entry ($_deny_raw)"
+    for _sep in ',' $', \t'; do
+        [ -n "$deny_hit" ] && break
+        IFS="$_sep" read -ra _deny_ids <<< "$_deny_raw"
+        for _id in "${_deny_ids[@]:-}"; do
+            _id="$(printf '%s' "$_id" | sed 's/^[ \t]*//;s/[ \t]*$//')"
+            [ -z "$_id" ] && continue
+            if [ "$_id" = "$REQUIRED_CONTEXT" ]; then
+                deny_hit="matches working-profile deny-list entry ($_id)"
+                break
+            fi
+        done
+    done
+fi
+
+if [ -n "$deny_hit" ]; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: pinned target "$REQUIRED_CONTEXT" is a denied profile ($deny_hit).
+
+WHY THIS MATTERS:
+  The pinned test context must never be the operator's Default or any
+  working/monitoring profile. This is the isolation contract — a denied target
+  is a hard stop, never a "proceed anyway."
+
+REMEDIATION:
+  Repin INTERCEPTOR_TEST_CONTEXT_ID in preferences.env to the dedicated
+  Interceptor test context, and confirm INTERCEPTOR_WORKING_PROFILE_IDS lists
+  every Default/working-profile context ID to keep them denied.
+EOF
+    exit 7
+fi
+
+# --- 4. Extension freshness (graceful — warn if upstream reference is absent) ---
+
+# The extension is not always the from-source pin beside the skill. The signed
+# installer — the recommended install route — puts it under /Library/Application
+# Support and never creates a source checkout, so knowing only the pin path made
+# this gate exit 9 on such a machine and print remediation it cannot perform
+# (Pin.sh needs $INTERCEPTOR_SRC/extension/dist to copy from). Resolve from an
+# ordered candidate list instead, and hard-fail below only when none exists.
+# public issue #1802, @catchingknives
+EXT_PIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/Extension"
+EXT_DIR=""
+for _cand in "${INTERCEPTOR_EXT_DIR:-}" "$EXT_PIN_DIR" "/Library/Application Support/Interceptor/extension"; do
+    [ -n "$_cand" ] || continue
+    if [ -f "$_cand/manifest.json" ]; then
+        EXT_DIR="$_cand"
+        break
+    fi
+done
+# No candidate found: fall back to the pin so the hard-fail below names the path
+# Pin.sh writes and Load Unpacked wants.
+[ -n "$EXT_DIR" ] || EXT_DIR="$EXT_PIN_DIR"
+PINNED_FROM="$EXT_DIR/PINNED_FROM.txt"
+UPSTREAM_DIST="${INTERCEPTOR_SRC:-$HOME/Projects/interceptor}/extension/dist"
+UPSTREAM_MANIFEST="$UPSTREAM_DIST/manifest.json"
+
+# Relativize a $HOME-rooted path to ~ for display. Same helper (and same reason)
+# as Tools/Pin.sh: do NOT use ${x/#$HOME/~} — bash 5.2+ tilde-expands the
+# replacement back to an absolute path, so the substitution prints the very
+# thing it is meant to hide. bash 3.2 -> "~/...", bash 5.3 -> absolute.
+# public PR #1602, @asdf8675309
+rel_home() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}";; *) printf '%s' "$1";; esac; }
+EXT_DIR_DISP="$(rel_home "$EXT_DIR")"
+UPSTREAM_DIST_DISP="$(rel_home "$UPSTREAM_DIST")"
+PIN_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/Pin.sh"
+
+# 4a. Extension present at all? The freshness comparison below is guarded on
+# PINNED_FROM.txt existing, so a WHOLLY MISSING Extension/ takes the
+# warn-and-continue branch and preflight exits 0 — it detects a STALE pin but
+# never an ABSENT one. Chrome keeps an already-loaded unpacked extension alive
+# from memory after its directory disappears, so the gap stays invisible until
+# the next Chrome restart, then presents as unrelated runner/injection errors.
+# public PR #1602, @asdf8675309
+if [ ! -f "$EXT_DIR/manifest.json" ]; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: no Extension found. Checked \$INTERCEPTOR_EXT_DIR, the pin
+at $EXT_DIR_DISP, and the signed-install path
+/Library/Application Support/Interceptor/extension
+
+WHY THIS MATTERS:
+  Browser control needs the unpacked extension loaded from this directory. It is
+  a local pin of the built extension and is deliberately NOT shipped with the
+  skill, so anything that replaces the skill directory removes it with no
+  replacement. Chrome may still be running a copy from memory right now; that
+  copy does not survive a restart.
+
+REMEDIATION:
+  1. Re-pin:  bash "$(rel_home "$PIN_SH")"
+     (needs the built extension at $UPSTREAM_DIST_DISP; override with INTERCEPTOR_SRC)
+  2. In the test profile: chrome://extensions/ -> Load Unpacked
+       from $EXT_DIR_DISP
+  3. Re-run this preflight.
+EOF
+    exit 9
+fi
+
+# Prefer the origin the pin was actually taken from (recorded in
+# PINNED_FROM.txt) when INTERCEPTOR_SRC is unset — the default checkout path
+# can hold a stale, unrelated tree (e.g. a leftover clone on a .pkg install),
+# and comparing the pin against it judges freshness against the wrong
+# reference. (public issue #1824, @xmasyx)
+if [ -z "${INTERCEPTOR_SRC:-}" ] && [ -f "$PINNED_FROM" ]; then
+    pinned_origin="$(grep -i '^Pinned from:' "$PINNED_FROM" | sed -E 's/^[^:]*: *//')"
+    case "$pinned_origin" in "~"*) pinned_origin="$HOME${pinned_origin#\~}";; esac
+    if [ -n "$pinned_origin" ] && [ -f "$pinned_origin/manifest.json" ]; then
+        UPSTREAM_DIST="$pinned_origin"
+        UPSTREAM_MANIFEST="$UPSTREAM_DIST/manifest.json"
+        UPSTREAM_DIST_DISP="$(rel_home "$UPSTREAM_DIST")"
+    fi
+fi
+
+if [ -f "$PINNED_FROM" ] && [ -f "$UPSTREAM_MANIFEST" ]; then
+    pinned_version="$(grep -i '^Manifest version:' "$PINNED_FROM" | sed -E 's/.*: *//' | tr -d ' ')"
+    upstream_version="$(grep '"version"' "$UPSTREAM_MANIFEST" | head -1 | sed -E 's/.*"version" *: *"([^"]+)".*/\1/')"
+    # "Stale" means upstream is NEWER than the pin. Plain inequality also fired
+    # when the reference tree was OLDER (the stale-checkout case above), telling
+    # the user to re-pin DOWN to an older build. (public issue #1824, @xmasyx)
+    newest="$(printf '%s\n%s\n' "$pinned_version" "$upstream_version" | sort -V | tail -1)"
+    if [ -n "$pinned_version" ] && [ -n "$upstream_version" ] && [ "$pinned_version" != "$upstream_version" ] && [ "$newest" = "$upstream_version" ]; then
+        cat >&2 <<EOF
+[PreflightIsolation] FAIL: pinned Extension (manifest $pinned_version) is stale vs upstream ($upstream_version).
+
+WHY THIS MATTERS:
+  Chrome disables unpacked extensions on every manifest bump, and a stale loaded
+  extension whose bundled screenshot-runner.js doesn't match the daemon produces
+  "screenshot-runner.js could not load" failures.
+
+REMEDIATION:
+  1. Re-pin via the Update workflow (runs Tools/Pin.sh).
+  2. In the test profile: chrome://extensions/ -> Interceptor -> Load Unpacked
+       from ~/.claude/skills/Interceptor/Extension/ (or reload if already loaded).
+  3. Re-run this preflight.
+EOF
+        exit 6
+    fi
+else
+    # Upstream dist absent (currently true on this machine) — cannot compare.
+    # Warn, do not hard-fail on a missing reference.
+    printf '[PreflightIsolation] WARN: cannot verify extension freshness ' >&2
+    printf '(upstream dist %s absent or PINNED_FROM.txt missing). Proceeding.\n' \
+        "$UPSTREAM_DIST_DISP" >&2
+fi
+
+# --- All checks passed ---
+printf '[PreflightIsolation] OK — interceptor %s, pinned context "%s" connected and not denied.\n' \
+    "$current_version" "$REQUIRED_CONTEXT"
+exit 0

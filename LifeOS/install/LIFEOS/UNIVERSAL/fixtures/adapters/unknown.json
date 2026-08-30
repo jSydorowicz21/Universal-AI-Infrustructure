@@ -1,0 +1,7 @@
+{
+  "contract": "uai.adapter.v1",
+  "adapter": { "id": "unknown", "version": "unknown", "class": "unsupported" },
+  "discovery": { "state": "unsupported", "confidence": 0 },
+  "certification": "C0",
+  "losses": ["no stable public integration surface discovered"]
+}

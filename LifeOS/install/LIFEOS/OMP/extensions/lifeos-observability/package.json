@@ -1,0 +1,12 @@
+{
+  "name": "lifeos-observability",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Native port of ToolActivityTracker + ToolFailureTracker (Pulse observability feed) plus the LifeOS statusline.",
+  "scripts": {
+    "test": "bun test index.test.ts"
+  },
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}

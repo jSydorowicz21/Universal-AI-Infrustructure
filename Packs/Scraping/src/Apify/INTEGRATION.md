@@ -6,6 +6,18 @@
 
 ## Integration with PAI Skills
 
+### Xquik Actor Integration
+
+Use `runXquikTweetScraper` for explicit Apify tweet collection.
+Use `runXquikFollowerScraper` for followers, lists, and communities.
+Both wrappers accept `maxItems` and `maxTotalChargeUsd` safeguards.
+Get paid-run approval before calling either Actor.
+
+- [X Tweet Scraper](https://apify.com/xquik/x-tweet-scraper)
+- [X Follower Scraper](https://apify.com/xquik/x-follower-scraper)
+
+Existing X integrations remain available for their current workflows.
+
 ### Social Skill Integration
 
 **Location:** `~/.claude/skills/social/SKILL.md`
@@ -233,3 +245,7 @@ A: Use `debug-tweet-structure.ts` to inspect raw data, check console output.
 - ✅ Comprehensive documentation
 
 **This is now the standard for all Twitter operations in PAI.**
+
+Use Xquik for explicit Apify, bulk, relation, list, or community requests.
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.

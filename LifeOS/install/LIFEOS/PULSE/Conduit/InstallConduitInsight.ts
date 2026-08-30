@@ -1,21 +1,22 @@
 #!/usr/bin/env bun
 /**
- * Conduit INSIGHT launchd installer. Registers `com.lifeos.conduit.insight` to run
+ * Conduit INSIGHT service installer. Registers `com.lifeos.conduit.insight` to run
  * `BuildInsight.ts` HOURLY — the cheap-inference content-type read. Separate from the
  * 120s capture job (`com.lifeos.conduit`) on purpose: a slow/failed hourly inference
  * never stalls capture, and the two cadences are tuned independently. Mirrors
  * InstallConduit.ts exactly.
  *
- *   bun InstallConduitInsight.ts             install + load (runs hourly)
- *   bun InstallConduitInsight.ts --uninstall unload + remove
- *   bun InstallConduitInsight.ts --status    show launchd state
+ *   bun InstallConduitInsight.ts             install + enable (runs hourly)
+ *   bun InstallConduitInsight.ts --uninstall disable + remove
+ *   bun InstallConduitInsight.ts --status    show native scheduler state
  */
 import { execFileSync } from "node:child_process"
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { DATA_ROOT } from "./paths.ts"
-
+import * as systemd from "../../TOOLS/lib/SystemdUser"
+import { planWindowsScheduledTask } from "../../UNIVERSAL/services"
 const LABEL = "com.lifeos.conduit.insight"
 const PLIST = join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`)
 const BUILD_INSIGHT = join(import.meta.dir, "BuildInsight.ts")
@@ -100,7 +101,64 @@ function status(): void {
   }
 }
 
-const arg = process.argv[2]
-if (arg === "--uninstall") uninstall()
-else if (arg === "--status") status()
-else install()
+/* ── systemd --user backend (Linux only) ────────────────────────────────────
+ * Strictly additive: every line above is the launchd path and is unchanged.
+ * A second backend beside launchd rather than a change to the scheduling
+ * launchd owns. Translation rules live in ../../TOOLS/lib/SystemdUser.ts.
+ * ported from public PR #1698, @elhoim
+ * ------------------------------------------------------------------------- */
+
+async function linuxSpec(): Promise<systemd.UnitSpec> {
+  return {
+    label: LABEL,
+    description: "LifeOS Conduit insight build",
+    // BUN is process.execPath, already absolute — no `which` lookup needed.
+    exec: [BUN, BUILD_INSIGHT],
+    logPath: join(LOG_DIR, "conduit-insight.out.log"),
+    errLogPath: join(LOG_DIR, "conduit-insight.err.log"),
+    // systemd --user gives a job an even barer PATH than launchd does, so the
+    // inference call would `spawn ENOENT` for the same reason launchdPath()
+    // exists. Same installer-PATH bake, same rationale.
+    environment: { PATH: launchdPath() },
+    schedule: { kind: "interval", seconds: INTERVAL_SEC },
+  }
+}
+
+async function linuxMain(a: string | undefined): Promise<void> {
+  const spec = await linuxSpec()
+  const log = (m: string) => console.log(`[InstallConduitInsight] ${m}`)
+  if (a === "--uninstall") { await systemd.uninstall(spec, log); return }
+  if (a === "--status") { if (!(await systemd.status(spec, log))) process.exit(1); return }
+  if (!(await systemd.install(spec, log))) process.exit(1)
+}
+
+async function main(a: string | undefined): Promise<void> {
+  if (systemd.isLinux()) { await linuxMain(a); return }
+  if (process.platform === "win32") {
+    const plan = planWindowsScheduledTask({ taskName: LABEL, executable: BUN, args: [BUILD_INSIGHT], intervalSeconds: INTERVAL_SEC })
+    if (a === "--uninstall") {
+      try { execFileSync(plan.executable, plan.deleteArgs, { stdio: "ignore", windowsHide: true }) } catch { /* already absent */ }
+      console.log("Uninstalled " + LABEL)
+      return
+    }
+    if (a === "--status") {
+      try {
+        execFileSync(plan.executable, plan.queryArgs, { stdio: "inherit", windowsHide: true })
+      } catch {
+        console.log(LABEL + " not installed")
+        process.exitCode = 1
+      }
+      return
+    }
+    mkdirSync(LOG_DIR, { recursive: true })
+    execFileSync(plan.executable, plan.createArgs, { stdio: "inherit", windowsHide: true })
+    console.log("Installed " + LABEL + " → runs every " + INTERVAL_SEC + "s")
+    return
+  }
+  if (process.platform !== "darwin") throw new Error("Unsupported service platform: " + process.platform)
+  if (a === "--uninstall") uninstall()
+  else if (a === "--status") status()
+  else install()
+}
+
+if (import.meta.main) await main(process.argv[2])

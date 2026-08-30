@@ -17,14 +17,14 @@ LIFEOS/USER/
 ├── DA_IDENTITY.md          # Your DA's name, voice, personality (loaded at startup)
 ├── PROJECTS/PROJECTS.md    # Project registry + routing aliases (loaded at startup)
 ├── TELOS/PRINCIPAL_TELOS.md # Goals, missions, strategies (loaded at startup)
-├── Config/LIFEOS_CONFIG.yaml  # Credentials and config keys
+├── CONFIG/LIFEOS_CONFIG.toml  # Main config (secrets live in ~/.claude/.env)
 ├── RESUME.md               # Career detail
 ├── CONTACTS.md             # People you work with
 ├── WRITINGSTYLE.md         # How you write
 ├── RHETORICALSTYLE.md      # How you argue
 ├── OPINIONS.md             # Your DA's opinions on working with you
 ├── DEFINITIONS.md          # Canonical terms in your vocabulary
-├── CORECONTENT.md          # The themes you write/talk about
+├── CANONICAL_CONTENT.md    # The themes you write/talk about
 ├── AI_WRITING_PATTERNS.md  # Writing patterns to avoid
 ├── ARCHITECTURE.md         # How your LifeOS fits together
 ├── FEED.md                 # Sources you read
@@ -40,6 +40,6 @@ real answers. The interview is incremental — you can stop and resume.
 ## Privacy
 
 Everything in this directory is **private** and never ships in any LifeOS
-release. The release builder (`skills/_LIFEOS/Tools/ShadowRelease.ts`)
+release. The release builder
 deletes the entire `USER/` tree from staging and overlays generic
 scaffolds in its place.

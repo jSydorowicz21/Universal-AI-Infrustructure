@@ -16,9 +16,8 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
  * Other Pulse pollers route their proactive notifications through this governor
  * instead of hitting /notify directly. The governor enforces:
  *   - Max 3 voice pings per day
- *   - Max 1 telegram per hour
  *   - 24h dedup by content fingerprint
- *   - Quiet hours 22:00–07:00 (no voice; telegram queued for morning)
+ *   - Quiet hours 22:00–07:00 (no voice; non-critical queued for morning)
  *   - Per-source auto-suppression: 2 false alerts in 7d → that source suppressed 7d
  *
  * Usage:
@@ -38,6 +37,8 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from "fs";
 import { join, dirname } from "path";
 import { createHash } from "crypto";
+import { PULSE_BASE } from "../endpoint";
+import { homedir } from "node:os";
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
 for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
@@ -46,15 +47,16 @@ for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 }
 
 
-const HOME = process.env.HOME || "";
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
 const LIFEOS_DIR = process.env.LIFEOS_DIR || join(HOME, ".claude", "LIFEOS");
 const STATE_FILE = join(LIFEOS_DIR, "PULSE", "state", "notification-governor.json");
 const LOG_FILE = join(LIFEOS_DIR, "MEMORY", "OBSERVABILITY", "notification-governor.jsonl");
-const NOTIFY_URL = "http://localhost:31337/notify";
-const VOICE_ID = "fTtv3eikoepIosk8dTZ5";
+const NOTIFY_URL = `${PULSE_BASE}/notify`;
+// No hardcoded voice_id: /notify speaks in the configured default voice.
+// (The dedicated Algorithm phase-transition voice was retired 2026-08-05.)
 
 type Priority = "critical" | "event" | "light";
-type Channel = "voice" | "telegram" | "ntfy" | "email";
+type Channel = "voice" | "ntfy" | "email";
 
 type GovernorState = {
   dispatched: Array<{ ts: string; channel: Channel; source: string; fingerprint: string; priority: Priority }>;
@@ -137,13 +139,6 @@ function shouldDispatch(
     ).length;
     if (voiceToday >= 3) return { allow: false, reason: "voice daily cap (3) reached" };
   }
-  if (channel === "telegram") {
-    const telegramLastHour = state.dispatched.filter(
-      (d) => d.channel === "telegram" && hoursSince(d.ts) < 1 && d.priority !== "critical"
-    ).length;
-    if (telegramLastHour >= 1) return { allow: false, reason: "telegram hourly cap (1) reached" };
-  }
-
   return { allow: true };
 }
 
@@ -153,7 +148,7 @@ async function dispatch(channel: Channel, message: string): Promise<boolean> {
       const res = await fetch(NOTIFY_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, voice_id: VOICE_ID, voice_enabled: true }),
+        body: JSON.stringify({ message, voice_enabled: true }),
       });
       return res.ok;
     } catch {
@@ -227,12 +222,8 @@ function cmdStatus(): void {
   pruneOld(state);
   const today = new Date().toISOString().slice(0, 10);
   const voiceToday = state.dispatched.filter((d) => d.channel === "voice" && d.ts.startsWith(today)).length;
-  const telegramLastHour = state.dispatched.filter(
-    (d) => d.channel === "telegram" && hoursSince(d.ts) < 1
-  ).length;
   console.log("═══ Notification Governor ═══");
   console.log(`Voice today:     ${voiceToday}/3`);
-  console.log(`Telegram last h: ${telegramLastHour}/1`);
   console.log(`Quiet hours:     ${inQuietHours() ? "YES" : "no"}`);
   const sups = Object.entries(state.sourceSuppressions);
   if (sups.length) {

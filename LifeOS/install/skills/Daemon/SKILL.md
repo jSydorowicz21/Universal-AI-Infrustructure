@@ -1,8 +1,7 @@
 ---
 name: Daemon
-version: 1.0.15
-description: "Manage the public daemon profile — a digital representation of what you're working on. DaemonAggregator reads LifeOS sources (TELOS, KNOWLEDGE, PROJECTS, MEMORY/WORK, identity) → daemon-data.json. SecurityFilter strips names/paths/credentials via deterministic patterns (NOT LLM). Workflows: UpdateDaemon, ReadDaemon, PreviewDaemon, DeployDaemon. USE WHEN daemon, update daemon, daemon profile, deploy daemon, preview daemon, read daemon, public profile, digital presence. NOT FOR LifeOS system management (use _LIFEOS)."
-effort: medium
+version: 1.0.25
+description: "Manage the public daemon profile — a digital representation of what you're working on. DaemonAggregator reads LifeOS sources (TELOS, KNOWLEDGE, PROJECTS, MEMORY/WORK, identity) → daemon-data.json. SecurityFilter strips names/paths/credentials via deterministic patterns (NOT LLM). Workflows: UpdateDaemon, ReadDaemon, PreviewDaemon, DeployDaemon. USE WHEN daemon, update daemon, daemon profile, deploy daemon, preview daemon, read daemon, public profile, digital presence. NOT FOR LifeOS system management."
 ---
 
 ## Customization
@@ -64,9 +63,26 @@ LifeOS SOURCES (private, read-only)
     │
     └──→ daemon-data.json → ~/Projects/daemon-dm/ (PRIVATE repo)
               │
-              └──[deploy.sh]──→ Copies JSON into framework → VitePress build → Cloudflare Pages
+              ├──[Tools/DeployGate.ts]──→ Deterministic pre-deploy gate (blocks on
+              │                            expired/ungated ephemera, street-address/ZIP/
+              │                            coordinate/home-area strings, unapproved
+              │                            real-time phrasing, credentials, private feed URLs)
+              │
+              └──[deploy.sh]──→ Copies JSON into framework → VitePress build → Cloudflare WORKER
                                     │
                               ~/Projects/daemon/ (PUBLIC repo — forkable framework)
+                                    │
+                              src/worker.ts (generic):
+                                • /daemon-data.json — served through the edge with expired
+                                  ephemera STRIPPED at request time (status/now/offerings/
+                                  requesting items with past `expires`; non-default location
+                                  falls back to location_default)
+                                • /feed.json — live-activity items aggregated every 30 min
+                                  (cron + lazy refresh) from PUBLIC sources only, configured
+                                  in daemon-data.json `feeds` (rss | beehiiv | github | x);
+                                  cached in KV FEED_KV
+                                • secrets (CF worker secrets, never in code): X_BEARER_TOKEN,
+                                  BEEHIIV_API_KEY
 
     STRUCTURALLY EXCLUDED (never read):
           CONTACTS.md, FINANCES/, HEALTH/, TRAUMAS.md,
@@ -99,7 +115,7 @@ skills/Daemon/
 | **Deploy script** | `~/Projects/daemon-dm/deploy.sh` |
 | **Public framework repo** | `~/Projects/daemon/` |
 | **Security classification** | `${LIFEOS_SKILL_DIR}/Docs/SecurityClassification.md` |
-| **Security overrides** | `${LIFEOS_USER_DIR}/SKILLCUSTOMIZATIONS/Daemon/SecurityOverrides.md` |
+| **Security overrides** | `${LIFEOS_USER_DIR}/CUSTOMIZATIONS/SKILLS/Daemon/SecurityOverrides.md` |
 
 ## Live Endpoints
 
@@ -117,7 +133,7 @@ skills/Daemon/
 
 ## Data Sources
 
-The DaemonAggregator reads from these LifeOS sources:
+The DaemonAggregator reads from these LifeOS sources. Every source is read only if present (`existsSync`-guarded) — installs using the unified single-file `TELOS.md` layout won't have the per-file TELOS sources below, and the aggregator skips them cleanly (`--sources` shows per-source OK/MISSING status):
 
 | Source | What's Extracted | Section |
 |--------|-----------------|---------|
@@ -172,9 +188,14 @@ User: "preview daemon"
 ## Gotchas
 
 - **Two repos:** Public framework (`~/Projects/daemon/`) and private content (`~/Projects/daemon-dm/`). The framework is forkable. The content is yours.
-- **deploy.sh copies data into the framework at build time, then cleans up.** Personal data never gets committed to the public repo.
+- **deploy.sh runs DeployGate FIRST, then copies data into the framework at build time, then cleans up.** A gate failure blocks the deploy — fix the data, never bypass the gate. Personal data never gets committed to the public repo.
 - **SecurityFilter is code, not prompts.** If you need to add new blocked patterns, edit SecurityFilter.ts, not the workflow markdown.
-- **Site is fully static.** Data is embedded at build time. Changes require running `deploy.sh`.
+- **Ephemera needs `expires`.** status, `now` (via now_meta), time-bound offerings/requesting items, and any non-default location all carry ISO `expires` fields. Three enforcement layers: DeployGate (blocks), the worker (strips at serve time), the dashboard (hides client-side). Refreshing a stale status = edit daemon-data.json with a new `expires` and run deploy.sh.
+- **Location doctrine: coarse by default, real-time by exception.** City/region granularity only; street/ZIP/coordinate/home-area strings are gate-blocked. "Tonight/I'm at" phrasing requires an explicit `realtime_approved: true` on that item — reserved for events where the principal WANTS to be findable. No automatic GPS/calendar pipeline; location changes only on explicit command.
+- **The live feed is public-exhaust only.** The worker polls blog RSS, Beehiiv (official API), YouTube RSS, GitHub public events, and the owner's own X posts — already-published content, zero privacy risk by construction. Never add a LifeOS-internal source to `feeds`.
+- **Beehiiv blocks RSS scrapers (403).** The newsletter source uses the official Beehiiv API (`type: "beehiiv"` + BEEHIIV_API_KEY worker secret), not the /feed URL.
+- **Serving is edge-dynamic, page shell is static.** /daemon-data.json and /feed.json are computed per-request by the worker (`run_worker_first`); the rest is static assets. Data changes still require `deploy.sh`; feed content refreshes itself.
+- **The upstream framework repo publishes a GENERATED template (merge-back doctrine).** Its main branch is a clean generic template published from a scrubbed staging copy, never a working tree pushed directly: the template excludes analytics, licensed fonts, favicons, and all personal content, and its identity is data-driven (owner_name/owner_handle/fork_url in daemon-data.json). The publish workflow is maintainer-side and does not ship; on an installed system your daemon content lives in your own private repo and only the framework is forkable.
 
 ## Execution Log
 

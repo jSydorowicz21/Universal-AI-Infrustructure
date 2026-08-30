@@ -5,7 +5,7 @@
  * Usage:
  *   bun LIFEOS/TOOLS/DASchedule.ts list              # Active tasks
  *   bun LIFEOS/TOOLS/DASchedule.ts add --desc "..." --at "2026-04-07T09:00:00" --channel voice
- *   bun LIFEOS/TOOLS/DASchedule.ts add --desc "..." --cron "0 15 * * 5" --channel telegram
+ *   bun LIFEOS/TOOLS/DASchedule.ts add --desc "..." --cron "0 15 * * 5" --channel voice
  *   bun LIFEOS/TOOLS/DASchedule.ts cancel <id>
  *   bun LIFEOS/TOOLS/DASchedule.ts history            # Completed/cancelled
  */
@@ -13,8 +13,9 @@
 import { join } from "path"
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "fs"
 import { getDAName } from "../../hooks/lib/identity"
+import { homedir } from "node:os";
 
-const HOME = process.env.HOME ?? "~"
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir()
 const LIFEOS_DIR = join(HOME, ".claude", "LIFEOS")
 const TASKS_DIR = join(LIFEOS_DIR, "PULSE", "state", "da")
 const TASKS_PATH = join(TASKS_DIR, "scheduled-tasks.jsonl")
@@ -245,7 +246,7 @@ Options:
   --desc      Task description (required)
   --at        ISO datetime for one-time tasks
   --cron      5-field cron for recurring tasks
-  --channel   voice | telegram (default: voice)
+  --channel   voice (default: voice)
   --type      notify | prompt | script (default: notify)
   --message   Notification message (default: desc)
   --prompt    Prompt text (for type=prompt)

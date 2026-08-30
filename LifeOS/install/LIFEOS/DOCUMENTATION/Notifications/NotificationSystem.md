@@ -1,5 +1,5 @@
 ---
-version: 1.2.14
+version: 1.4.1
 ---
 
 # The Notification System
@@ -10,7 +10,7 @@ version: 1.2.14
 
 > **Infrastructure:** The voice notification endpoint (`http://localhost:31337/notify`) is served by the unified Pulse daemon (`~/.claude/LIFEOS/PULSE/`). Voice is implemented at `~/.claude/LIFEOS/PULSE/VoiceServer/voice.ts` and routed through Pulse -- there is no separate VoiceServer process. One daemon, one port, one launchd plist (`com.lifeos.pulse`).
 
-> **Pronunciation normalization:** Before any text reaches ElevenLabs it passes through two transforms — `applyPronunciations()` (literal term map from `LIFEOS/USER/PRINCIPAL/PRONUNCIATIONS.json`) wrapped around `disambiguateHomographs()` (`LIFEOS/PULSE/lib/homographs.ts`). The homograph stage exists because ElevenLabs guesses a reading from context and gets some words wrong; the worst offender is "live", where the broadcast/adjective sense (/laɪv/ — "the site is live", "live-verified") otherwise reads as the verb (/lɪv/ — "where you live"). It respells **only** context-matched broadcast occurrences to `lyve`, never a flat substitution, so verb uses ("live freely") stay correct. Adding a new spoken phrasing that reads wrong means adding a context regex, not a global replace. Shared by both the VoiceServer (`voice.ts`) and the Telegram voice path (`modules/telegram.ts`) so every spoken channel reads identically.
+> **Pronunciation normalization:** Before any text reaches ElevenLabs it passes through two transforms — `applyPronunciations()` (literal term map from `LIFEOS/USER/PRINCIPAL/PRONUNCIATIONS.json`) wrapped around `disambiguateHomographs()` (`LIFEOS/PULSE/lib/homographs.ts`). The homograph stage exists because ElevenLabs guesses a reading from context and gets some words wrong; the worst offender is "live", where the broadcast/adjective sense (/laɪv/ — "the site is live", "live-verified") otherwise reads as the verb (/lɪv/ — "where you live"). It respells **only** context-matched broadcast occurrences to `lyve`, never a flat substitution, so verb uses ("live freely") stay correct. Adding a new spoken phrasing that reads wrong means adding a context regex, not a global replace. Applied by the VoiceServer (`voice.ts`) so every spoken notification reads identically.
 
 This system provides:
 - Voice feedback when workflows start
@@ -90,26 +90,20 @@ curl -s -X POST http://localhost:31337/notify \
 - `message` - The spoken text (workflow and skill name)
 - `voice_id` - ElevenLabs voice ID (default: {DA_IDENTITY.NAME}'s voice)
 - `title` - Display name for the notification
-- `phase` (optional, 2026-04-16+) - Uppercase Algorithm phase (`OBSERVE`, `THINK`, `PLAN`, `BUILD`, `EXECUTE`, `VERIFY`, `LEARN`, `COMPLETE`). When present, triggers dual-source phase tracking — the endpoint (a) appends a `phaseHistory` entry with `source: "voice"`, (b) updates top-level `session.phase` (lowercase), and (c) calls `setPhaseTab(phase, sessionUUID)` to update the terminal tab icon/color. All three fire together so the UI never goes stale between ISA edits.
-- `slug` (optional, 2026-04-16+) - The ISA session slug. Used to route the phase write to the correct session. When absent, falls back to most-recently-updated non-complete session within 2-hour window.
+- `phase` (optional) - ISA phase marker for session tracking. The phase vocabulary lives in ONE place — `LIFEOS/TOOLS/ascent.ts` (see `LIFEOS/DOCUMENTATION/Algorithm/AscentStates.md`); it is never hand-listed in a consumer or a doc. (The 8-station uppercase enum this parameter originally carried was retired 2026-07-14.)
+- `slug` (optional) - The ISA session slug. Used to route the phase write to the correct session. When absent, falls back to most-recently-updated non-complete session within 2-hour window.
 
-**Dual-source phase tracking:** `/notify` is the first-fires/always-fires signal for Algorithm phase transitions. ISASync hook is the rich-but-sometimes-skipped signal from ISA frontmatter edits. Both feed `phaseHistory` via `hooks/lib/isa-utils.ts::appendPhase()` — same phase + different source = upgrade to `source: "merged"`. **Both also write top-level `session.phase` and call `setPhaseTab()`** (voice did this starting 2026-04-18; ISASync already did). See `LIFEOS/MEMORY/KNOWLEDGE/Ideas/dual-source-event-tracking-pattern.md` and `feedback_voice_must_update_top_level_phase.md`.
+**Phase tracking:** `/notify` and the ISASync hook (ISA frontmatter edits) both feed session phase tracking; the ascent table in `LIFEOS/TOOLS/ascent.ts` derives every icon, color, and label from the phase key.
 
 ---
 
-## Effort Level in Voice Notifications
+## Voice Notifications During Work
 
-**Voice phase announcements are inline curls in the Algorithm template** (defined in CLAUDE.md), not hooks. Each Algorithm phase has a `curl -s -X POST http://localhost:31337/notify` call that gets spoken. The effort level determines which curls fire:
-
-| Effort | Budget | Voice Curls |
-|--------|--------|-------------|
-| Standard | <2min | OBSERVE + VERIFY curls only |
-| Extended | <8min | All phase curls |
-| Advanced | <16min | All phase curls |
-| Deep | <32min | All phase curls |
-| Comprehensive | <120min | All phase curls |
+**Workflow voice announcements are inline curls** — skills and workflows POST `curl -s -X POST http://localhost:31337/notify` at their own notable moments (skill invocation, long-run milestones). The per-phase announcement table keyed to effort tiers was retired with the modes/tiers system on 2026-07-11; how much a run narrates is discovered from the work, not read off a tier.
 
 **Task completion voice** is handled by `VoiceCompletion.hook.ts` → `handlers/VoiceNotification.ts`, which extracts the `🗣️` line from the response and POSTs to the Pulse `/notify` endpoint at `http://localhost:31337`.
+
+**Scheduled/cadence jobs never voice-notify** (principal directive, 2026-08-14). `/notify` defaults voice ON, so every cadence caller (launchd, cron, Hermes jobs, recurring tools) passes `voice_enabled: false` explicitly. A PULSE cron job with `output = "voice"` is suppressed by `dispatchSingle` in `LIFEOS/PULSE/lib.ts` unless `PULSE_CRON_VOICE=1` is set. Cadence channels are the silent banner, logs, or NotifyPrincipal SMS; interactive-session voice (workflow curls, completion 🗣️) is unaffected.
 
 ---
 
@@ -118,9 +112,10 @@ curl -s -X POST http://localhost:31337/notify \
 | Agent | Voice ID | Notes |
 |-------|----------|-------|
 | **{DA_IDENTITY.NAME}** (default) | `{DA_IDENTITY.VOICEID}` | Use for most workflows |
-| **Priya** (Artist) | `21m00Tcm4TlvDq8ikWAM` | Art skill workflows |
 
-**Full voice registry:** `LIFEOS/DOCUMENTATION/Agents/AgentSystem.md` (see Named Agents) and `~/.claude/settings.json` (daidentity.voices.main.voiceId)
+**The DA is the only speaker.** Subagents never emit voice — the DA narrates every completion, so there is no per-subagent voice routing to configure. The `voiceId:`/`voice:` frontmatter in `agents/*.md` has **no consumer in code** (verified 2026-07-27: nothing under `hooks/`, `LIFEOS/TOOLS/`, or `LIFEOS/PULSE/` parses agent frontmatter for voice); it is persona flavor, not configuration, and two agents currently share one ID without consequence.
+
+**Voice config:** canonical in `LIFEOS/USER/CONFIG/LIFEOS_CONFIG.toml` `[da.voices.main]`; hooks read the runtime mirror at `~/.claude/settings.json` → `daidentity.voices.main.voiceId`. The former "Priya (Artist)" row was removed 2026-07-27 — that agent does not exist.
 
 ---
 
@@ -316,3 +311,48 @@ Events are emitted directly from each hook via `fs.appendFileSync` to `~/.claude
 2. **Fail gracefully** - Missing services don't cause errors
 3. **Conservative defaults** - Avoid notification fatigue
 4. **Duration-aware** - Only push for long-running tasks (>5 min)
+
+---
+
+## Examples
+
+### One task finishing, two very different outcomes
+
+A run wraps up. What the principal experiences depends entirely on what the run *was*:
+
+- **A quick question** — "what's this env var for?" The assistant answers in a sentence. No `curl` fires; the `🗣️` line in the response is the only voice, spoken once. The phone stays quiet. Adding a start-of-task `curl` here would just double the voice for a two-second answer.
+- **A twelve-minute background job** — a research agent the principal kicked off and walked away from. When it lands, the same "done" signal routes differently: it crossed the long-task threshold *and* it was a background agent, so it goes out on voice **and** ntfy — the phone buzzes even though nobody is at the desk.
+
+Same "task done" moment; the routing table decides who hears about it and how.
+
+### When to speak, when to stay silent
+
+The system is tuned against notification fatigue, so most events resolve to nothing:
+
+- **Speak:** a workflow starts significant work, a long task finishes, an error surfaces, a security alert fires.
+- **Stay silent:** greetings, acknowledgments, simple Q&A, a workflow calling a sub-workflow (one notification, not two).
+
+The rule is narrow on purpose — notify when real work begins or ends, not on every turn.
+
+### How an event reaches a channel
+
+```mermaid
+flowchart TD
+    A[Event: task done / error / security alert] --> B{Event type?}
+    B -->|conversational| C[No dispatch — silent]
+    B -->|taskComplete| D[Voice only]
+    B -->|longTask / backgroundAgent| E[Voice + ntfy push]
+    B -->|error| F[Voice + ntfy push]
+    B -->|security| G[Voice + ntfy + Discord]
+    D --> H[Speak the line via ElevenLabs]
+    E --> H
+    F --> H
+    E --> I[Phone buzzes]
+    F --> I
+    G --> I
+    G --> J[Post to Discord webhook]
+```
+
+Every notification is fire-and-forget — a channel being offline never blocks the run. The routing is conservative by default: the further right you travel on the diagram, the rarer and more urgent the event.
+
+---

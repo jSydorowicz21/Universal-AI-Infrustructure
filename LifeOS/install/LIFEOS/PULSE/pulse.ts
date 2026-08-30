@@ -7,7 +7,6 @@
  *   - Voice notifications (ElevenLabs TTS)
  *   - Hook validation (skill-guard, agent-guard)
  *   - Observability (data APIs + dashboard)
- *   - Telegram bot (grammY polling + claude-agent-sdk)
  *   - iMessage bot (SQLite polling + claude-agent-sdk)
  *   - GitHub work polling (LifeOS Worker)
  *
@@ -16,13 +15,12 @@
 
 import { join } from "path"
 import { readFileSync, existsSync } from "fs"
-import { parse } from "smol-toml"
 import { loadLifeosConfig } from "../TOOLS/LifeosConfig"
 import { isLoopbackHostHeader } from "./lib/host-guard.ts"
 
 // ── Load .env before anything else ──
 
-const HOME = process.env.HOME ?? "~"
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir()
 const LIFEOS_DIR = join(HOME, ".claude", "LIFEOS")
 const PULSE_DIR = join(LIFEOS_DIR, "PULSE")
 
@@ -45,7 +43,7 @@ try {
 
 // ── BILLING GUARD (defense-in-depth) ──
 // Strip ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN from the daemon environment
-// AFTER .env load. Every downstream module (telegram, imessage, spawnClaude)
+// AFTER .env load. Every downstream module (imessage, siri, spawnClaude)
 // inherits this. Prevents the Claude Agent SDK and `claude` CLI from billing
 // either key instead of CLAUDE_CODE_OAUTH_TOKEN — both outrank OAuth in
 // Anthropic's auth precedence chain. root cause of an early-2026 invoice
@@ -68,15 +66,17 @@ import {
   isSentinel,
   spawnScript,
   spawnClaude,
+  parseConfigToml,
+  resolveModules,
 } from "./lib"
 
 import { startHooks, handleHooksRequestAsync, hooksHealth } from "./modules/hooks"
+import { homedir } from "node:os";
 
 // Conditional imports — modules may not exist yet during incremental migration
 let voiceModule: any = null
 let observabilityModule: any = null
 let wikiModule: any = null
-let telegramModule: any = null
 let siriModule: any = null
 let imessageModule: any = null
 let assistantModule: any = null
@@ -87,20 +87,32 @@ let localIntelligenceModule: any = null
 let telosModule: any = null
 let tabFreshnessModule: any = null
 let hypothesesModule: any = null
+let upgradesModule: any = null
 let memoryModule: any = null
 let conduitModule: any = null
 let menubarModule: any = null
 let booksModule: any = null
-let amberModule: any = null
+let synapseModule: any = null
+let ledgerModule: any = null
 let projectsModule: any = null
 let assetsModule: any = null
+let atlasModule: any = null
+let threatModelModule: any = null
 let usageModule: any = null
 let bunkerModule: any = null
 let contentModule: any = null
 let doctorModule: any = null
+let algorithmTabModule: any = null
+let evalsModule: any = null
+let hermesModule: any = null
 
+// Module gates read config.modules — one resolved map layering MODULE_DEFAULTS,
+// the legacy [section].enabled flags, then the [modules] table. Infrastructure
+// (observability, hooks, siri, tab-freshness, menubar, doctor) stays ungated:
+// it is how Pulse serves anything at all, not a surface you switch off.
+// ported from public PR #1748, @elhoim
 async function loadModules(config: PulseConfig) {
-  if (config.voice?.enabled !== false) {
+  if (config.modules.voice) {
     try {
       voiceModule = await import("./VoiceServer/voice")
     } catch (err) {
@@ -114,20 +126,15 @@ async function loadModules(config: PulseConfig) {
       log("warn", "Observability module not available", { error: String(err) })
     }
   }
-  // Wiki module — always load (no config gate)
-  try {
-    wikiModule = await import("./modules/wiki")
-  } catch (err) {
-    log("warn", "Wiki module not available", { error: String(err) })
-  }
-  if (config.telegram?.enabled) {
+  // Wiki module — the /docs surface.
+  if (config.modules.docs) {
     try {
-      telegramModule = await import("./modules/telegram")
+      wikiModule = await import("./modules/wiki")
     } catch (err) {
-      log("warn", "Telegram module not available", { error: String(err) })
+      log("warn", "Wiki module not available", { error: String(err) })
     }
   }
-  if (config.imessage?.enabled) {
+  if (config.modules.imessage) {
     try {
       imessageModule = await import("./modules/imessage")
     } catch (err) {
@@ -143,61 +150,73 @@ async function loadModules(config: PulseConfig) {
   // Assistant (DA subsystem) is a private module stripped from the public
   // release payload. Existence-check before importing so a fresh public install
   // boots cleanly and simply omits the /assistant routes. #1419.
-  if (config.da?.enabled && existsSync(join(PULSE_DIR, "Assistant", "module.ts"))) {
+  if (config.modules.da && existsSync(join(PULSE_DIR, "Assistant", "module.ts"))) {
     try {
       assistantModule = await import("./Assistant/module")
     } catch (err) {
       log("warn", "Assistant module not available", { error: String(err) })
     }
   }
-  if (config.performance?.enabled !== false) {
+  if (config.modules.performance) {
     try {
       performanceModule = await import("./Performance/module")
     } catch (err) {
       log("warn", "Performance module not available", { error: String(err) })
     }
   }
-  if (config.syslog?.enabled) {
+  if (config.modules.syslog) {
     try {
       syslogModule = await import("./modules/syslog")
     } catch (err) {
       log("warn", "Syslog module not available", { error: String(err) })
     }
   }
-  if (config.work?.enabled !== false) {
+  if (config.modules.work) {
     try {
       workModule = await import("./modules/work")
     } catch (err) {
       log("warn", "Work module not available", { error: String(err) })
     }
   }
-  if (config.content?.enabled !== false) {
+  if (config.modules.content) {
     try {
       contentModule = await import("./modules/content")
     } catch (err) {
       log("warn", "Content module not available", { error: String(err) })
     }
   }
-  if (config.local_intelligence?.enabled !== false) {
+  if (config.modules.local) {
     try {
       localIntelligenceModule = await import("./modules/local-intelligence")
     } catch (err) {
       log("warn", "LocalIntelligence module not available", { error: String(err) })
     }
   }
-  if (config.telos?.enabled !== false) {
+  if (config.modules.telos) {
     try {
       telosModule = await import("./modules/telos")
+      // Without this, state.running stays false and /api/telos/health reports
+      // "stopped" forever while every other telos endpoint works.
+      // public PR #1622, @elhoim
+      if (telosModule.start) await telosModule.start()
     } catch (err) {
       log("warn", "Telos freshness module not available", { error: String(err) })
     }
   }
-  if (config.hypotheses?.enabled !== false) {
+  if (config.modules.hypotheses) {
     try {
       hypothesesModule = await import("./modules/hypotheses")
       if (hypothesesModule.start) hypothesesModule.start()
     } catch (err) {
       log("warn", "Hypotheses module not available", { error: String(err) })
+    }
+  }
+  if (config.modules.upgrades) {
+    try {
+      upgradesModule = await import("./modules/upgrades")
+      if (upgradesModule.start) upgradesModule.start()
+    } catch (err) {
+      log("warn", "Upgrades module not available", { error: String(err) })
     }
   }
   // Tab freshness — universal per-tab data-source freshness (always loaded).
@@ -206,19 +225,23 @@ async function loadModules(config: PulseConfig) {
   } catch (err) {
     log("warn", "Tab freshness module not available", { error: String(err) })
   }
-  // Memory — autonomic-memory subsystem state surface (always loaded).
-  try {
-    memoryModule = await import("./modules/memory")
-    if (memoryModule.start) memoryModule.start()
-  } catch (err) {
-    log("warn", "Memory module not available", { error: String(err) })
+  // Memory — autonomic-memory subsystem state surface.
+  if (config.modules.memory) {
+    try {
+      memoryModule = await import("./modules/memory")
+      if (memoryModule.start) memoryModule.start()
+    } catch (err) {
+      log("warn", "Memory module not available", { error: String(err) })
+    }
   }
   // Conduit — sensory layer daily-record surface (read-only; capture is launchd).
-  try {
-    conduitModule = await import("./modules/conduit")
-    if (conduitModule.start) conduitModule.start()
-  } catch (err) {
-    log("warn", "Conduit module not available", { error: String(err) })
+  if (config.modules.conduit) {
+    try {
+      conduitModule = await import("./modules/conduit")
+      if (conduitModule.start) conduitModule.start()
+    } catch (err) {
+      log("warn", "Conduit module not available", { error: String(err) })
+    }
   }
   // Menu bar — cross-subsystem aggregator behind the rich native menu bar dropdown.
   try {
@@ -228,42 +251,80 @@ async function loadModules(config: PulseConfig) {
     log("warn", "Menubar module not available", { error: String(err) })
   }
   // Books — favorite-books surface over USER/BOOKS.md.
-  try {
-    booksModule = await import("./modules/books")
-    if (booksModule.start) booksModule.start()
-  } catch (err) {
-    log("warn", "Books module not available", { error: String(err) })
+  if (config.modules.books) {
+    try {
+      booksModule = await import("./modules/books")
+      if (booksModule.start) booksModule.start()
+    } catch (err) {
+      log("warn", "Books module not available", { error: String(err) })
+    }
   }
-  // Amber — idea capture & preservation surface (ledger, knowledge, bookmarks, flows).
-  try {
-    amberModule = await import("./modules/amber")
-    if (amberModule.start) amberModule.start()
-  } catch (err) {
-    log("warn", "Amber module not available", { error: String(err) })
+  // Synapse — input routing & capture surface (ledger, knowledge, bookmarks, flows).
+  if (config.modules.synapse) {
+    try {
+      synapseModule = await import("./modules/synapse")
+      if (synapseModule.start) synapseModule.start()
+    } catch (err) {
+      log("warn", "Synapse module not available", { error: String(err) })
+    }
+  }
+  // Ledger — change-tracking surface (versions, update registry, deploys, integrity, drift).
+  if (config.modules.ledger) {
+    try {
+      ledgerModule = await import("./modules/ledger")
+      if (ledgerModule.start) ledgerModule.start()
+    } catch (err) {
+      log("warn", "Ledger module not available", { error: String(err) })
+    }
   }
   // Projects — project routing-table surface over USER/PROJECTS.md.
-  try {
-    projectsModule = await import("./modules/projects")
-    if (projectsModule.start) await projectsModule.start()
-  } catch (err) {
-    log("warn", "Projects module not available", { error: String(err) })
+  if (config.modules.projects) {
+    try {
+      projectsModule = await import("./modules/projects")
+      if (projectsModule.start) await projectsModule.start()
+    } catch (err) {
+      log("warn", "Projects module not available", { error: String(err) })
+    }
   }
   // Assets — unified read-only inventory over USER/GEAR.md + network topology.
-  try {
-    assetsModule = await import("./modules/assets")
-    if (assetsModule.start) await assetsModule.start()
-  } catch (err) {
-    log("warn", "Assets module not available", { error: String(err) })
+  if (config.modules.gear) {
+    try {
+      assetsModule = await import("./modules/assets")
+      if (assetsModule.start) await assetsModule.start()
+    } catch (err) {
+      log("warn", "Assets module not available", { error: String(err) })
+    }
+  }
+  // Atlas — read-only surface over the asset-graph snapshot (LIFEOS/ATLAS).
+  if (config.modules.atlas) {
+    try {
+      atlasModule = await import("./modules/atlas")
+      if (atlasModule.start) atlasModule.start()
+    } catch (err) {
+      log("warn", "Atlas module not available", { error: String(err) })
+    }
+  }
+  // ThreatModel — read-only surface over the private risk register
+  // (skills/ThreatModel; data in LIFEOS/USER/SECURITY/THREATMODEL).
+  if (config.modules.threatmodel) {
+    try {
+      threatModelModule = await import("./modules/threatmodel")
+      if (threatModelModule.start) threatModelModule.start()
+    } catch (err) {
+      log("warn", "ThreatModel module not available", { error: String(err) })
+    }
   }
   // Usage — Anthropic subscription + durable token/cost/model usage surface.
-  try {
-    usageModule = await import("./modules/usage")
-    if (usageModule.start) await usageModule.start()
-  } catch (err) {
-    log("warn", "Usage module not available", { error: String(err) })
+  if (config.modules.usage) {
+    try {
+      usageModule = await import("./modules/usage")
+      if (usageModule.start) await usageModule.start()
+    } catch (err) {
+      log("warn", "Usage module not available", { error: String(err) })
+    }
   }
-  // Bunker — application-harness registry surface (reads ~/Projects/bunker via its CLI).
-  if (config.bunker?.enabled !== false) {
+  // Bunker — application-harness registry surface (reads ~/.claude/LIFEOS/PULSE/Bunker via its CLI).
+  if (config.modules.bunker) {
     try {
       bunkerModule = await import("./modules/bunker")
     } catch (err) {
@@ -278,15 +339,47 @@ async function loadModules(config: PulseConfig) {
   } catch (err) {
     log("warn", "Doctor module not available", { error: String(err) })
   }
+  // Hermes — the sidecar's core files: SOUL, config, guard policy, and the code
+  // that generates them. Read/edit surface behind the Assistant tab.
+  if (config.modules.hermes) {
+    try {
+      hermesModule = await import("./modules/hermes")
+      if (hermesModule.start) hermesModule.start()
+    } catch (err) {
+      log("warn", "Hermes module not available", { error: String(err) })
+    }
+  }
+  // Algorithm — the thinking chain surface: doctrine (versioned edits), rules
+  // files, AI-generated workflow summary for the /algorithm tab.
+  if (config.modules.algorithm) {
+    try {
+      algorithmTabModule = await import("./modules/algorithm-tab")
+      if (algorithmTabModule.start) algorithmTabModule.start()
+    } catch (err) {
+      log("warn", "AlgorithmTab module not available", { error: String(err) })
+    }
+  }
+  // Evals — standing eval-suite status (pass^k, regressions) for the /algorithm tab.
+  if (config.modules.evals) {
+    try {
+      evalsModule = await import("./modules/evals")
+    } catch (err) {
+      log("warn", "Evals module not available", { error: String(err) })
+    }
+  }
 }
 
 // ── Config Types ──
 
 interface PulseConfig {
   port: number
+  /**
+   * Resolved on/off state for every switchable surface. See MODULE_DEFAULTS.
+   * ported from public PR #1748, @elhoim
+   */
+  modules: Record<string, boolean>
   tls?: { enabled: boolean; cert: string; key: string } // unused — TLS removed
   voice?: { enabled: boolean; [key: string]: unknown }
-  telegram?: { enabled: boolean; [key: string]: unknown }
   imessage?: { enabled: boolean; [key: string]: unknown }
   observability?: { enabled: boolean; dashboard_dir?: string; [key: string]: unknown }
   hooks?: { enabled: boolean; blocked_skills?: string[] }
@@ -299,6 +392,7 @@ interface PulseConfig {
   local_intelligence?: { enabled: boolean; [key: string]: unknown }
   telos?: { enabled: boolean; [key: string]: unknown }
   hypotheses?: { enabled: boolean; [key: string]: unknown }
+  upgrades?: { enabled: boolean; [key: string]: unknown }
   worker?: { name: string; [key: string]: unknown }
   jobs: Array<{
     name: string
@@ -309,6 +403,7 @@ interface PulseConfig {
     model?: string
     output: string | string[]
     enabled: boolean
+    timeout_ms?: number
   }>
 }
 
@@ -316,7 +411,10 @@ interface PulseConfig {
 
 async function loadPulseConfig(): Promise<PulseConfig> {
   const raw = await Bun.file(join(PULSE_DIR, "PULSE.toml")).text()
-  const parsed = parse(raw) as Record<string, unknown>
+  // parseConfigToml expands ${VAR} in every string value (public PR #1544,
+  // @m8ryx), so config sections can carry secrets by reference (e.g. [discord]
+  // bot_token) instead of literal values checked into the file.
+  const parsed = parseConfigToml(raw)
 
   const daemonConfig = await loadConfig(PULSE_DIR)
 
@@ -329,15 +427,24 @@ async function loadPulseConfig(): Promise<PulseConfig> {
     if (daName) da.primary = daName
   } catch { /* LIFEOS_CONFIG.toml absent/invalid — keep PULSE.toml value */ }
 
+  // User-tier overrides (PULSE.user.toml, release-stripped): machine-specific
+  // module choices layer over the shipped template, so the template stays
+  // generic while a live instance keeps e.g. its syslog collector on. The
+  // [syslog] section merges too — its `port` is what the collector binds
+  // (exported to PULSE_SYSLOG_PORT before syslogModule.start() below).
+  const userParsed = daemonConfig.userParsed
+  const systemSyslog = (parsed.syslog as PulseConfig["syslog"]) ?? { enabled: false, port: 5514 }
+  const userSyslog = userParsed?.syslog as PulseConfig["syslog"] | undefined
+
   return {
     port: (parsed.port as number) ?? parseInt(process.env.PULSE_PORT || "31337", 10),
+    modules: resolveModules(parsed, userParsed),
     tls: (parsed.tls as PulseConfig["tls"]) ?? undefined,
     voice: (parsed.voice as PulseConfig["voice"]) ?? { enabled: true },
-    telegram: (parsed.telegram as PulseConfig["telegram"]) ?? { enabled: false },
     imessage: (parsed.imessage as PulseConfig["imessage"]) ?? { enabled: false },
     observability: (parsed.observability as PulseConfig["observability"]) ?? { enabled: true },
     performance: (parsed.performance as PulseConfig["performance"]) ?? { enabled: true },
-    syslog: (parsed.syslog as PulseConfig["syslog"]) ?? { enabled: false, port: 5514 },
+    syslog: userSyslog ? { ...systemSyslog, ...userSyslog } : systemSyslog,
     work: (parsed.work as PulseConfig["work"]) ?? { enabled: true },
     bunker: (parsed.bunker as PulseConfig["bunker"]) ?? { enabled: true },
     content: (parsed.content as PulseConfig["content"]) ?? { enabled: true },
@@ -351,9 +458,24 @@ async function loadPulseConfig(): Promise<PulseConfig> {
 
 // ── Constants ──
 
+// Life surfaces served directly by observability.ts rather than by a module of
+// their own, mapped to the module key that switches them off. Hoisted to module
+// scope so the request path doesn't rebuild it on every hit.
+// ported from public PR #1748, @elhoim
+const LIFE_ROUTE_MODULES: Record<string, string> = {
+  "/api/life/health": "health",
+  "/api/life/finances": "finances",
+  "/api/life/business": "business",
+  "/api/life/growth": "growth",
+}
+
 const STATE_PATH = join(PULSE_DIR, "state", "state.json")
 const PID_PATH = join(PULSE_DIR, "state", "pulse.pid")
 const MAX_FAILURES = 3
+// A latched job (>= MAX_FAILURES) gets one retry attempt after this cooldown
+// instead of being dead until manual state surgery — three transient failures
+// (e.g. during an outage window) previously disabled a job permanently.
+const FAILURE_RETRY_COOLDOWN_MS = 6 * 60 * 60 * 1000
 const MAX_SLEEP_MS = 60_000
 const MIN_SLEEP_MS = 1_000
 
@@ -384,7 +506,13 @@ function msUntilNextDue(jobs: PulseConfig["jobs"], state: DaemonState): number {
     const future = new Date(now.getTime() + offset * 60_000)
     for (const job of jobs) {
       if (!job.enabled) continue
-      if (matchesCron(job.schedule, future)) return offset * 60_000
+      try {
+        if (matchesCron(job.schedule, future)) return offset * 60_000
+      } catch {
+        // An unusable schedule is never due. Already reported by name at load
+        // time; sleeping is not the place to report it again every tick.
+        // public PR #1644, @elhoim
+      }
     }
   }
   return MAX_SLEEP_MS
@@ -427,7 +555,7 @@ function buildHealthResponse(state: DaemonState, config: PulseConfig): Response 
   }
 
   // Voice
-  if (voiceModule && config.voice?.enabled !== false) {
+  if (voiceModule && config.modules.voice) {
     subsystems.voice = voiceModule.voiceHealth()
   }
 
@@ -437,27 +565,22 @@ function buildHealthResponse(state: DaemonState, config: PulseConfig): Response 
   }
 
   // Performance
-  if (performanceModule && config.performance?.enabled !== false) {
+  if (performanceModule && config.modules.performance) {
     subsystems.performance = performanceModule.performanceHealth()
   }
 
-  // Telegram
-  if (telegramModule && config.telegram?.enabled) {
-    subsystems.telegram = telegramModule.telegramHealth()
-  }
-
   // iMessage
-  if (imessageModule && config.imessage?.enabled) {
+  if (imessageModule && config.modules.imessage) {
     subsystems.imessage = imessageModule.imessageHealth()
   }
 
   // Assistant
-  if (assistantModule && config.da?.enabled) {
+  if (assistantModule && config.modules.da) {
     subsystems.assistant = assistantModule.assistantHealth()
   }
 
   // Syslog
-  if (syslogModule && config.syslog?.enabled) {
+  if (syslogModule && config.modules.syslog) {
     subsystems.syslog = syslogModule.health()
   }
 
@@ -471,7 +594,11 @@ function buildHealthResponse(state: DaemonState, config: PulseConfig): Response 
   if (dash.status === "missing") {
     reasons.push(`dashboard build missing: ${dash.indexPath} — run: cd ${PULSE_DIR}/Observability && bun install && bun run build`)
   }
+  // Only enabled jobs count toward degraded — a disabled job's stale failure
+  // counter would otherwise pin healthz at "degraded" forever.
+  const enabledJobNames = new Set(config.jobs.filter((j) => j.enabled).map((j) => j.name))
   for (const [name, s] of Object.entries(state.jobs)) {
+    if (!enabledJobNames.has(name)) continue
     if (s.consecutiveFailures >= MAX_FAILURES) reasons.push(`job ${name}: ${s.consecutiveFailures} consecutive failures`)
   }
   const status = reasons.length === 0 ? "ok" : "degraded"
@@ -497,10 +624,10 @@ function buildHealthResponse(state: DaemonState, config: PulseConfig): Response 
 // ── Main ──
 
 async function main() {
-  // Singleton guard — a second live pulse.ts means two grammY pollers on one
-  // bot token: Telegram 409s them against each other and messages get eaten
-  // by whichever instance wins (2026-07-09 incident: an orphaned hand-launched
-  // pulse fought the launchd one for hours). Refuse to boot instead.
+  // Singleton guard — a second live pulse.ts means duplicate pollers, cron
+  // jobs, and voice servers fighting over the same state (2026-07-09 incident:
+  // an orphaned hand-launched pulse fought the launchd one for hours).
+  // Refuse to boot instead.
   try {
     const oldPid = parseInt((await Bun.file(PID_PATH).text()).trim(), 10)
     if (oldPid && oldPid !== process.pid) {
@@ -524,19 +651,37 @@ async function main() {
   let state = await readState(STATE_PATH)
   state.startedAt = Date.now()
 
+  // Drop state for jobs the config no longer declares. A renamed or deleted
+  // job otherwise leaves its JobState behind forever — it accumulates in
+  // state.json and keeps surfacing in anything that walks state.jobs.
+  // Keyed on config.jobs, NOT the enabled subset: a job switched off in TOML
+  // is still declared, and must keep its run history for when it comes back.
+  // public issue #1768, @xmasyx
+  const declaredJobNames = new Set(config.jobs.map((j) => j.name))
+  for (const name of Object.keys(state.jobs)) {
+    if (!declaredJobNames.has(name)) {
+      log("info", `Pruning state for job no longer in config: ${name}`, {
+        job: name,
+        subsystem: "cron",
+      })
+      delete state.jobs[name]
+    }
+  }
+
   const enabledJobs = config.jobs.filter((j) => j.enabled)
   log("info", "LifeOS Pulse starting (unified daemon)", {
     pid: process.pid,
     port: config.port,
     jobs: enabledJobs.length,
+    // Report the RESOLVED state, so the boot line matches what actually
+    // loaded. hooks/observability are infrastructure and have no module key.
     modules: {
-      voice: config.voice?.enabled !== false,
+      voice: config.modules.voice,
       hooks: config.hooks?.enabled !== false,
       observability: config.observability?.enabled !== false,
-      telegram: config.telegram?.enabled ?? false,
-      imessage: config.imessage?.enabled ?? false,
-      syslog: config.syslog?.enabled ?? false,
-      da: config.da?.enabled ?? false,
+      imessage: config.modules.imessage,
+      syslog: config.modules.syslog,
+      da: config.modules.da,
     },
   })
 
@@ -570,7 +715,12 @@ async function main() {
     startHooks(config.hooks ?? { enabled: true })
   }
 
-  if (voiceModule && config.voice?.enabled !== false) {
+  // These start-time gates read the same resolved config.modules keys as the
+  // load-time gates above. Reading the legacy [section].enabled flag here
+  // instead would let the two disagree — a module enabled via the [modules]
+  // table but disabled by a stale legacy flag would load and then never start.
+  // public PR #1748, @elhoim
+  if (voiceModule && config.modules.voice) {
     voiceModule.startVoice(config.voice)
     log("info", "Voice module loaded")
   }
@@ -580,7 +730,7 @@ async function main() {
     log("info", "Observability module loaded")
   }
 
-  if (performanceModule && config.performance?.enabled !== false) {
+  if (performanceModule && config.modules.performance) {
     performanceModule.startPerformance(config.performance)
     log("info", "Performance module loaded")
   }
@@ -590,7 +740,7 @@ async function main() {
     log("info", "Wiki module loaded")
   }
 
-  if (assistantModule && config.da?.enabled) {
+  if (assistantModule && config.modules.da) {
     // Pass ALL jobs (not just enabled) so the dashboard can render every
     // job from disk — visible, editable, removable. The cron loop still
     // filters by enabled at execution time; visibility is a separate axis.
@@ -598,9 +748,9 @@ async function main() {
     log("info", "Assistant module loaded")
   }
 
-  if (syslogModule && config.syslog?.enabled) {
+  if (syslogModule && config.modules.syslog) {
     try {
-      if (config.syslog.port) process.env.PULSE_SYSLOG_PORT = String(config.syslog.port)
+      if (config.syslog?.port) process.env.PULSE_SYSLOG_PORT = String(config.syslog.port)
       await syslogModule.start()
       log("info", "Syslog module loaded")
     } catch (err) {
@@ -609,7 +759,7 @@ async function main() {
     }
   }
 
-  if (workModule && config.work?.enabled !== false) {
+  if (workModule && config.modules.work) {
     try {
       await workModule.start()
       log("info", "Work module loaded")
@@ -619,7 +769,7 @@ async function main() {
     }
   }
 
-  if (bunkerModule && config.bunker?.enabled !== false) {
+  if (bunkerModule && config.modules.bunker) {
     try {
       await bunkerModule.start()
       log("info", "Bunker module loaded")
@@ -629,7 +779,7 @@ async function main() {
     }
   }
 
-  if (contentModule && config.content?.enabled !== false) {
+  if (contentModule && config.modules.content) {
     try {
       await contentModule.start()
       log("info", "Content module loaded")
@@ -639,7 +789,10 @@ async function main() {
     }
   }
 
-  if (localIntelligenceModule && config.local_intelligence?.enabled !== false) {
+  // config.local_intelligence was never populated by loadPulseConfig, so this
+  // second gate read undefined and always passed. Same resolved key as the
+  // load-time gate. public PR #1748, @elhoim
+  if (localIntelligenceModule && config.modules.local) {
     try {
       await localIntelligenceModule.start()
       log("info", "LocalIntelligence module loaded")
@@ -675,8 +828,18 @@ async function main() {
         return buildHealthResponse(state, config)
       }
 
-      // Voice routes: /notify, /notify/personality, /voice
-      if (voiceModule && (pathname === "/notify" || pathname === "/notify/personality" || pathname === "/voice")) {
+      // Which surfaces are switched on. The dashboard reads this to avoid
+      // rendering a tab whose backend was never loaded — without it, disabling a
+      // module leaves a nav entry that opens an empty page.
+      // ported from public PR #1748, @elhoim
+      if (req.method === "GET" && pathname === "/api/config/modules") {
+        return Response.json({ modules: config.modules })
+      }
+
+      // Voice routes: /notify, /notify/personality, /voice, /voice/health
+      // (/voice/health is implemented and advertised by the module but was never
+      // forwarded, so it 404'd — public PR #1621, @elhoim)
+      if (voiceModule && (pathname === "/notify" || pathname === "/notify/personality" || pathname === "/voice" || pathname === "/voice/health")) {
         const resp = await voiceModule.handleVoiceRequest(req, pathname)
         if (resp) return resp
       }
@@ -705,6 +868,12 @@ async function main() {
         if (resp) return resp
       }
 
+      // Hermes sidecar core-file routes: /api/hermes*
+      if (hermesModule && pathname.startsWith("/api/hermes")) {
+        const resp = await hermesModule.handleRequest(req, pathname)
+        if (resp) return resp
+      }
+
       // Performance routes: /api/performance/*
       if (performanceModule && pathname.startsWith("/api/performance/")) {
         const resp = await performanceModule.handlePerformanceRequest(req)
@@ -721,6 +890,12 @@ async function main() {
       // Work routes: /api/work/*  (data API consumed by the dashboard /work tab)
       if (workModule && pathname.startsWith("/api/work")) {
         const resp = await workModule.handleRequest(req, pathname)
+        if (resp) return resp
+      }
+
+      // Evals route: /api/evals  (standing eval-suite status for the /algorithm tab)
+      if (evalsModule && pathname.startsWith("/api/evals")) {
+        const resp = await evalsModule.handleRequest(req, pathname)
         if (resp) return resp
       }
 
@@ -761,13 +936,20 @@ async function main() {
         if (resp) return resp
       }
 
+      // Upgrades API: /api/upgrades[/...] — the unified system-improvement
+      // queue (Upgrades store + pending hypotheses mapped as source=autonomous).
+      if (upgradesModule && pathname.startsWith("/api/upgrades")) {
+        const resp = await upgradesModule.handleRequest(req, pathname)
+        if (resp) return resp
+      }
+
       // Memory API: /api/memory[/state|/health|/runs]
       if (memoryModule && pathname.startsWith("/api/memory")) {
         const resp = await memoryModule.handleRequest(req, pathname)
         if (resp) return resp
       }
 
-      // Conduit API: /api/conduit[/today|/recent|/status]
+      // Conduit API: /api/conduit[/today|/recent|/sources|/insight|/insight/build|/status]
       if (conduitModule && pathname.startsWith("/api/conduit")) {
         const resp = await conduitModule.handleRequest(req, pathname)
         if (resp) return resp
@@ -785,9 +967,15 @@ async function main() {
         if (resp) return resp
       }
 
-      // Amber API: /api/amber
-      if (amberModule && pathname.startsWith("/api/amber")) {
-        const resp = await amberModule.handleRequest(req, pathname)
+      // Synapse API: /api/synapse
+      if (synapseModule && pathname.startsWith("/api/synapse")) {
+        const resp = await synapseModule.handleRequest(req, pathname)
+        if (resp) return resp
+      }
+
+      // Ledger API: /api/ledger
+      if (ledgerModule && pathname.startsWith("/api/ledger")) {
+        const resp = await ledgerModule.handleRequest(req, pathname)
         if (resp) return resp
       }
 
@@ -803,6 +991,18 @@ async function main() {
         if (resp) return resp
       }
 
+      // Atlas API: /api/atlas (asset-graph snapshot)
+      if (atlasModule && pathname.startsWith("/api/atlas")) {
+        const resp = await atlasModule.handleRequest(req, pathname)
+        if (resp) return resp
+      }
+
+      // ThreatModel API: /api/threatmodel (risk-register posture, redacted)
+      if (threatModelModule && pathname.startsWith("/api/threatmodel")) {
+        const resp = await threatModelModule.handleRequest(req, pathname)
+        if (resp) return resp
+      }
+
       // Usage API: /api/usage/*
       if (usageModule && pathname.startsWith("/api/usage")) {
         const resp = await usageModule.handleRequest(req, pathname)
@@ -813,6 +1013,21 @@ async function main() {
       if (doctorModule && pathname.startsWith("/api/doctor")) {
         const resp = await doctorModule.handleRequest(req, pathname)
         if (resp) return resp
+      }
+
+      // Algorithm tab API: /api/algorithm-tab/* (thinking chain: doctrine, rules, summary)
+      if (algorithmTabModule && pathname.startsWith("/api/algorithm-tab")) {
+        const resp = await algorithmTabModule.handleRequest(req, pathname)
+        if (resp) return resp
+      }
+
+      // The HEALTH / FINANCES / BUSINESS / GROWTH surfaces have no module of
+      // their own — observability.ts serves them directly — so switching them
+      // off has to happen here, at the route, rather than at module load.
+      // ported from public PR #1748, @elhoim
+      const lifeModule = LIFE_ROUTE_MODULES[pathname]
+      if (lifeModule && !config.modules[lifeModule]) {
+        return Response.json({ error: "module disabled", module: lifeModule }, { status: 404 })
       }
 
       // Observability routes: /api/*, /dashboard/*
@@ -857,12 +1072,7 @@ async function main() {
 
   // ── Start Long-Running Subsystems (supervised) ──
 
-  if (telegramModule && config.telegram?.enabled) {
-    supervise("telegram", () => telegramModule.startTelegram(config.telegram), isShuttingDown)
-    log("info", "Telegram module started (supervised)")
-  }
-
-  if (imessageModule && config.imessage?.enabled) {
+  if (imessageModule && config.modules.imessage) {
     supervise("imessage", () => imessageModule.startIMessage(config.imessage), isShuttingDown)
     log("info", "iMessage module started (supervised)")
   }
@@ -878,7 +1088,14 @@ async function main() {
   for (const job of config.jobs) {
     if (!job.enabled || job.type === "claude" || !job.command) continue
     const scriptRefs = job.command.match(/[^\s'"]+\.(?:ts|js|sh)\b/g) ?? []
-    const missing = scriptRefs.filter((p) => !existsSync(p.startsWith("/") ? p : join(PULSE_DIR, p)))
+    // Resolve like the executor does: spawnScript runs via bash -c, so "~/"
+    // expands to HOME at runtime — the existence check must match or every
+    // "~/" job gets falsely disabled as "not present on this install".
+    const resolveRef = (p: string): string => {
+      if (p.startsWith("~/")) return join(homedir(), p.slice(2))
+      return p.startsWith("/") ? p : join(PULSE_DIR, p)
+    }
+    const missing = scriptRefs.filter((p) => !existsSync(resolveRef(p)))
     if (missing.length > 0) {
       missingScriptJobs.add(job.name)
       log("warn", `Disabling cron job ${job.name}: script not present on this install`, {
@@ -888,6 +1105,13 @@ async function main() {
     }
   }
 
+  // Backstop for the same class of failure in the schedule itself. loadConfig()
+  // already disables jobs whose cron expression doesn't validate; if one still
+  // reaches the loop, it is skipped with one message instead of throwing out of
+  // the loop into main().catch → exit(1) → supervised restart every 30s.
+  // public PR #1644, @elhoim
+  const badScheduleJobs = new Set<string>()
+
   while (!shuttingDown) {
     const tickStart = Date.now()
     const now = new Date()
@@ -895,17 +1119,37 @@ async function main() {
     for (const job of config.jobs) {
       if (!job.enabled) continue
       if (missingScriptJobs.has(job.name)) continue
+      if (badScheduleJobs.has(job.name)) continue
       if (shuttingDown) break
 
       const jobState = state.jobs[job.name]
 
-      if (!isDue(job.schedule, now, jobState?.lastRun)) continue
-
-      if ((jobState?.consecutiveFailures ?? 0) >= MAX_FAILURES) {
-        log("warn", `Skipping ${job.name}: ${jobState!.consecutiveFailures} consecutive failures`, {
-          lastResult: jobState!.lastResult,
+      let due: boolean
+      try {
+        due = isDue(job.schedule, now, jobState?.lastRun)
+      } catch (err) {
+        badScheduleJobs.add(job.name)
+        log("error", `Disabling cron job ${job.name}: unusable schedule`, {
+          schedule: job.schedule,
+          error: String(err),
+          subsystem: "cron",
         })
         continue
+      }
+      if (!due) continue
+
+      if ((jobState?.consecutiveFailures ?? 0) >= MAX_FAILURES) {
+        const sinceLastRun = Date.now() - (jobState?.lastRun ?? 0)
+        if (sinceLastRun < FAILURE_RETRY_COOLDOWN_MS) {
+          log("warn", `Skipping ${job.name}: ${jobState!.consecutiveFailures} consecutive failures`, {
+            lastResult: jobState!.lastResult,
+          })
+          continue
+        }
+        log("info", `Retrying ${job.name} after failure cooldown`, {
+          consecutiveFailures: jobState!.consecutiveFailures,
+          subsystem: "cron",
+        })
       }
 
       log("info", `Running: ${job.name}`, { type: job.type, subsystem: "cron" })
@@ -917,7 +1161,7 @@ async function main() {
         if (job.type === "claude") {
           output = await spawnClaude(job.prompt!, { model: job.model ?? "sonnet" })
         } else {
-          output = await spawnScript(job.command!)
+          output = await spawnScript(job.command!, job.timeout_ms)
         }
 
         const durationMs = Date.now() - startMs
@@ -962,7 +1206,6 @@ async function main() {
 
   // ── Cleanup ──
   server.stop()
-  if (telegramModule) telegramModule.stopTelegram?.()
   if (imessageModule) imessageModule.stopIMessage?.()
   if (assistantModule) assistantModule.stopAssistant?.()
   if (syslogModule) await syslogModule.stop?.()

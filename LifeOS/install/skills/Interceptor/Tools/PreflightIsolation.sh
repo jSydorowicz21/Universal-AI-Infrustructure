@@ -16,10 +16,12 @@
 #      Default/working pattern. This is the new guarantee — "connected" was the
 #      old check; "target is provably not a working profile" is the contract now.
 #
-#   4. Extension freshness (graceful): compare the pinned Extension copy's
-#      PINNED_FROM.txt against the upstream dist IF present. Mismatch → fail with
-#      re-pin remediation. Upstream absent → WARN and continue (do not hard-fail
-#      on a missing reference).
+#   4. Extension present, then fresh. Absent Extension/ → hard fail (browser
+#      control cannot work without it, and the freshness check below cannot see
+#      this case: it is guarded on PINNED_FROM.txt, which is gone too). Then,
+#      graceful: compare the pinned copy's PINNED_FROM.txt against the upstream
+#      dist IF present. Mismatch → fail with re-pin remediation. Upstream absent
+#      → WARN and continue (do not hard-fail on a missing reference).
 #
 # There is NO fallback path. A missing/stale pinned context is a hard stop with
 # remediation, never an auto-route to Default. The old "fall back to the first
@@ -32,8 +34,9 @@
 #   fi
 #
 # Exit codes: 0 cleared; 2 binary missing; 3 version-parse fail; 4 version too low;
-# 5 no contexts connected; 6 pinned context not connected (UUID rot); 7 target is a
-# Default/working profile (deny); 8 test-context unset in preferences.
+# 5 no contexts connected; 6 pinned context not connected (UUID rot) OR pinned
+# Extension stale; 7 target is a Default/working profile (deny); 8 test-context
+# unset in preferences; 9 no pinned Extension at all.
 
 set -euo pipefail
 
@@ -196,14 +199,24 @@ if printf '%s\n' "$REQUIRED_CONTEXT" | grep -qiE '(^|[^a-z])default([^a-z]|$)'; 
     deny_hit="name matches Default"
 fi
 if [ -z "$deny_hit" ] && [ -n "$WORKING_PROFILE_IDS" ]; then
-    IFS=',' read -ra _deny_ids <<< "$WORKING_PROFILE_IDS"
-    for _id in "${_deny_ids[@]}"; do
-        _id="$(printf '%s' "$_id" | sed 's/^[ \t]*//;s/[ \t]*$//')"
-        [ -z "$_id" ] && continue
-        if [ "$_id" = "$REQUIRED_CONTEXT" ]; then
-            deny_hit="matches working-profile deny-list entry ($_id)"
-            break
-        fi
+    # Comma is the documented separator, but a whitespace-separated value must not
+    # fail open here (it arrives as one token), and a single entry that itself
+    # contains spaces must still match whole. Test the whole value and both splits:
+    # a superset of the comma-only parse, so this can only add a refusal.
+    # public issue #1802, @catchingknives
+    _deny_raw="$(printf '%s' "$WORKING_PROFILE_IDS" | sed 's/^[ \t]*//;s/[ \t]*$//')"
+    [ "$_deny_raw" = "$REQUIRED_CONTEXT" ] && deny_hit="matches working-profile deny-list entry ($_deny_raw)"
+    for _sep in ',' $', \t'; do
+        [ -n "$deny_hit" ] && break
+        IFS="$_sep" read -ra _deny_ids <<< "$_deny_raw"
+        for _id in "${_deny_ids[@]:-}"; do
+            _id="$(printf '%s' "$_id" | sed 's/^[ \t]*//;s/[ \t]*$//')"
+            [ -z "$_id" ] && continue
+            if [ "$_id" = "$REQUIRED_CONTEXT" ]; then
+                deny_hit="matches working-profile deny-list entry ($_id)"
+                break
+            fi
+        done
     done
 fi
 
@@ -226,15 +239,92 @@ fi
 
 # --- 4. Extension freshness (graceful — warn if upstream reference is absent) ---
 
-EXT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/Extension"
+# The extension is not always the from-source pin beside the skill. The signed
+# installer — the recommended install route — puts it under /Library/Application
+# Support and never creates a source checkout, so knowing only the pin path made
+# this gate exit 9 on such a machine and print remediation it cannot perform
+# (Pin.sh needs $INTERCEPTOR_SRC/extension/dist to copy from). Resolve from an
+# ordered candidate list instead, and hard-fail below only when none exists.
+# public issue #1802, @catchingknives
+EXT_PIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/Extension"
+EXT_DIR=""
+for _cand in "${INTERCEPTOR_EXT_DIR:-}" "$EXT_PIN_DIR" "/Library/Application Support/Interceptor/extension"; do
+    [ -n "$_cand" ] || continue
+    if [ -f "$_cand/manifest.json" ]; then
+        EXT_DIR="$_cand"
+        break
+    fi
+done
+# No candidate found: fall back to the pin so the hard-fail below names the path
+# Pin.sh writes and Load Unpacked wants.
+[ -n "$EXT_DIR" ] || EXT_DIR="$EXT_PIN_DIR"
 PINNED_FROM="$EXT_DIR/PINNED_FROM.txt"
 UPSTREAM_DIST="${INTERCEPTOR_SRC:-$HOME/Projects/interceptor}/extension/dist"
 UPSTREAM_MANIFEST="$UPSTREAM_DIST/manifest.json"
 
+# Relativize a $HOME-rooted path to ~ for display. Same helper (and same reason)
+# as Tools/Pin.sh: do NOT use ${x/#$HOME/~} — bash 5.2+ tilde-expands the
+# replacement back to an absolute path, so the substitution prints the very
+# thing it is meant to hide. bash 3.2 -> "~/...", bash 5.3 -> absolute.
+# public PR #1602, @asdf8675309
+rel_home() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}";; *) printf '%s' "$1";; esac; }
+EXT_DIR_DISP="$(rel_home "$EXT_DIR")"
+UPSTREAM_DIST_DISP="$(rel_home "$UPSTREAM_DIST")"
+PIN_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/Pin.sh"
+
+# 4a. Extension present at all? The freshness comparison below is guarded on
+# PINNED_FROM.txt existing, so a WHOLLY MISSING Extension/ takes the
+# warn-and-continue branch and preflight exits 0 — it detects a STALE pin but
+# never an ABSENT one. Chrome keeps an already-loaded unpacked extension alive
+# from memory after its directory disappears, so the gap stays invisible until
+# the next Chrome restart, then presents as unrelated runner/injection errors.
+# public PR #1602, @asdf8675309
+if [ ! -f "$EXT_DIR/manifest.json" ]; then
+    cat >&2 <<EOF
+[PreflightIsolation] FAIL: no Extension found. Checked \$INTERCEPTOR_EXT_DIR, the pin
+at $EXT_DIR_DISP, and the signed-install path
+/Library/Application Support/Interceptor/extension
+
+WHY THIS MATTERS:
+  Browser control needs the unpacked extension loaded from this directory. It is
+  a local pin of the built extension and is deliberately NOT shipped with the
+  skill, so anything that replaces the skill directory removes it with no
+  replacement. Chrome may still be running a copy from memory right now; that
+  copy does not survive a restart.
+
+REMEDIATION:
+  1. Re-pin:  bash "$(rel_home "$PIN_SH")"
+     (needs the built extension at $UPSTREAM_DIST_DISP; override with INTERCEPTOR_SRC)
+  2. In the test profile: chrome://extensions/ -> Load Unpacked
+       from $EXT_DIR_DISP
+  3. Re-run this preflight.
+EOF
+    exit 9
+fi
+
+# Prefer the origin the pin was actually taken from (recorded in
+# PINNED_FROM.txt) when INTERCEPTOR_SRC is unset — the default checkout path
+# can hold a stale, unrelated tree (e.g. a leftover clone on a .pkg install),
+# and comparing the pin against it judges freshness against the wrong
+# reference. (public issue #1824, @xmasyx)
+if [ -z "${INTERCEPTOR_SRC:-}" ] && [ -f "$PINNED_FROM" ]; then
+    pinned_origin="$(grep -i '^Pinned from:' "$PINNED_FROM" | sed -E 's/^[^:]*: *//')"
+    case "$pinned_origin" in "~"*) pinned_origin="$HOME${pinned_origin#\~}";; esac
+    if [ -n "$pinned_origin" ] && [ -f "$pinned_origin/manifest.json" ]; then
+        UPSTREAM_DIST="$pinned_origin"
+        UPSTREAM_MANIFEST="$UPSTREAM_DIST/manifest.json"
+        UPSTREAM_DIST_DISP="$(rel_home "$UPSTREAM_DIST")"
+    fi
+fi
+
 if [ -f "$PINNED_FROM" ] && [ -f "$UPSTREAM_MANIFEST" ]; then
     pinned_version="$(grep -i '^Manifest version:' "$PINNED_FROM" | sed -E 's/.*: *//' | tr -d ' ')"
     upstream_version="$(grep '"version"' "$UPSTREAM_MANIFEST" | head -1 | sed -E 's/.*"version" *: *"([^"]+)".*/\1/')"
-    if [ -n "$pinned_version" ] && [ -n "$upstream_version" ] && [ "$pinned_version" != "$upstream_version" ]; then
+    # "Stale" means upstream is NEWER than the pin. Plain inequality also fired
+    # when the reference tree was OLDER (the stale-checkout case above), telling
+    # the user to re-pin DOWN to an older build. (public issue #1824, @xmasyx)
+    newest="$(printf '%s\n%s\n' "$pinned_version" "$upstream_version" | sort -V | tail -1)"
+    if [ -n "$pinned_version" ] && [ -n "$upstream_version" ] && [ "$pinned_version" != "$upstream_version" ] && [ "$newest" = "$upstream_version" ]; then
         cat >&2 <<EOF
 [PreflightIsolation] FAIL: pinned Extension (manifest $pinned_version) is stale vs upstream ($upstream_version).
 
@@ -256,7 +346,7 @@ else
     # Warn, do not hard-fail on a missing reference.
     printf '[PreflightIsolation] WARN: cannot verify extension freshness ' >&2
     printf '(upstream dist %s absent or PINNED_FROM.txt missing). Proceeding.\n' \
-        "${UPSTREAM_DIST/#$HOME/~}" >&2
+        "$UPSTREAM_DIST_DISP" >&2
 fi
 
 # --- All checks passed ---

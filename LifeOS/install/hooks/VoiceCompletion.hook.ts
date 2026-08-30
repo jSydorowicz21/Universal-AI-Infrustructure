@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 1.4.5
+ * @version 1.4.7
  * VoiceCompletion.hook.ts — Send completion voice line to TTS server
  *
  * PURPOSE:
@@ -78,8 +78,8 @@ async function main() {
   }
 
   // Channel gate: desktop /notify must not fire when the session is running
-  // on behalf of a remote channel (Telegram, iMessage). Those channels
-  // deliver voice via their own APIs. See hooks/lib/notification-channel.ts.
+  // on behalf of a remote channel (iMessage, Siri). Those channels deliver
+  // replies via their own APIs. See hooks/lib/notification-channel.ts.
   if (!isDesktopChannel()) {
     const channel = getNotificationChannel();
     console.error(`[VoiceCompletion] Voice OFF (remote channel: ${channel})`);
@@ -95,7 +95,10 @@ async function main() {
     if (fromLastMsg) {
       parsed.voiceCompletion = fromLastMsg;
     } else {
-      // Final fallback: extract first meaningful sentence from last_assistant_message
+      // Final fallback: extract first meaningful sentence from last_assistant_message.
+      // Log it — a silent fallback spoke CHANGE bullets for six days on one
+      // install before anyone noticed. (public issue #1829, @MatiasBarboza)
+      console.error('[VoiceCompletion] no 🗣️ line extracted — falling back to summary extraction');
       const fallback = extractFallbackSummary(input.last_assistant_message);
       if (fallback) {
         parsed.voiceCompletion = fallback;

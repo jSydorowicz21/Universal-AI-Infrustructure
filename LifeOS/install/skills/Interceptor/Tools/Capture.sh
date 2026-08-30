@@ -141,12 +141,21 @@ target_denied() {
         return 0
     fi
     if [ -n "$WORKING_PROFILE_IDS" ]; then
-        local _d
-        IFS=',' read -ra _arr <<< "$WORKING_PROFILE_IDS"
-        for _d in "${_arr[@]}"; do
-            _d="$(printf '%s' "$_d" | sed 's/^[ \t]*//;s/[ \t]*$//')"
-            [ -z "$_d" ] && continue
-            [ "$_d" = "$id" ] && return 0
+        # Comma is the documented separator, but a whitespace-separated value must
+        # not fail open here (it arrives as one token), and a single entry that
+        # itself contains spaces must still match whole. Test the whole value and
+        # both splits: a superset of the comma-only parse, so this can only add a
+        # refusal. public issue #1802, @catchingknives
+        local _d _sep _raw
+        _raw="$(printf '%s' "$WORKING_PROFILE_IDS" | sed 's/^[ \t]*//;s/[ \t]*$//')"
+        [ "$_raw" = "$id" ] && return 0
+        for _sep in ',' $', \t'; do
+            IFS="$_sep" read -ra _arr <<< "$_raw"
+            for _d in "${_arr[@]:-}"; do
+                _d="$(printf '%s' "$_d" | sed 's/^[ \t]*//;s/[ \t]*$//')"
+                [ -z "$_d" ] && continue
+                [ "$_d" = "$id" ] && return 0
+            done
         done
     fi
     return 1
@@ -167,11 +176,12 @@ if ! printf '%s\n' "$contexts_now" \
     exit 3
 fi
 
-# --- 4. resolve output path (review artifacts go to ~/Downloads per OPERATIONAL_RULES) ---
+# --- 4. resolve output path (review artifacts go to the downloads dir per OPERATIONAL_RULES;
+#         LIFEOS_DOWNLOADS_DIR overrides ~/Downloads when set — public PR #1535, @anikinsasha) ---
 if [ -z "$OUT" ]; then
     ts="$(date +%Y%m%d-%H%M%S)"
     rand="$$"
-    OUT="${HOME}/Downloads/interceptor-capture-${ts}-${rand}.png"
+    OUT="${LIFEOS_DOWNLOADS_DIR:-${HOME}/Downloads}/interceptor-capture-${ts}-${rand}.png"
 fi
 mkdir -p "$(dirname "$OUT")"
 
@@ -245,7 +255,9 @@ resolve_saved() {
     [ -s "$OUT" ] && return 0
     fp="$(printf '%s\n' "$out_text" | grep -oE '"filePath"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/')"
     if [ -n "$fp" ] && [ -s "$fp" ]; then
-        cp -f "$fp" "$OUT" 2>/dev/null && return 0
+        # mv, not cp: cp left the daemon-chosen temp file behind as a full-size
+        # stray duplicate on every --pixel capture (public PR #1535, @anikinsasha)
+        mv -f "$fp" "$OUT" 2>/dev/null && return 0
     fi
     return 1
 }

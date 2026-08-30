@@ -13,7 +13,20 @@
 import { existsSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { execSync, execFileSync } from 'child_process';
-import { TAB_COLORS, PHASE_TAB_CONFIG, ACTIVE_TAB_BG, ACTIVE_TAB_FG, INACTIVE_TAB_FG, type TabState, type AlgorithmTabPhase } from './tab-constants';
+import { TAB_COLORS, ACTIVE_TAB_BG, ACTIVE_TAB_FG, type TabState } from './tab-constants';
+import {
+  ASCENT,
+  ASCENT_GERUNDS,
+  PHASE_TO_ASCENT,
+  TAB_ACTIVITY,
+  ascentProgress,
+  defaultTabActivity,
+  deriveAscent,
+  stripAscentPrefix,
+  type AscentInput,
+  type AscentState,
+  type TabActivity,
+} from '../../LIFEOS/TOOLS/ascent';
 
 /** Detect if we're running inside cmux */
 function isCmux(): boolean {
@@ -26,6 +39,7 @@ function stateToCmuxLogLevel(state: TabState): string {
     case 'thinking':  return 'progress';
     case 'working':   return 'info';
     case 'question':  return 'warning';
+    case 'blocked':   return 'warning';
     case 'completed': return 'success';
     case 'error':     return 'error';
     case 'idle':      return 'info';
@@ -33,33 +47,17 @@ function stateToCmuxLogLevel(state: TabState): string {
   }
 }
 
-/** Map Algorithm phase to cmux log level */
-function phaseToCmuxLogLevel(phase: string): string {
-  switch (phase) {
-    case 'OBSERVE':  return 'info';
-    case 'THINK':    return 'progress';
-    case 'PLAN':     return 'progress';
-    case 'BUILD':    return 'info';
-    case 'EXECUTE':  return 'warning';
-    case 'VERIFY':   return 'success';
-    case 'LEARN':    return 'success';
-    case 'COMPLETE': return 'success';
-    case 'IDLE':     return 'info';
-    default:         return 'info';
-  }
-}
-
 /**
  * Set cmux sidebar metadata for the current workspace.
- * Uses status pills for phase/session, log for activity, progress for ISC completion.
+ * Uses status pills for the ascent state, log for activity, progress for the climb.
  */
-function setCmuxState(title: string, state: TabState, phase?: string): void {
+function setCmuxState(title: string, state: TabState, ascent?: AscentState): void {
   try {
-    const logLevel = phase ? phaseToCmuxLogLevel(phase) : stateToCmuxLogLevel(state);
-    const config = phase ? PHASE_TAB_CONFIG[phase] : null;
-    const phaseLabel = config ? `${config.symbol} ${phase}` : state.toUpperCase();
+    const meta = ascent ? ASCENT[ascent] : null;
+    const logLevel = meta ? meta.cmux : stateToCmuxLogLevel(state);
+    const phaseLabel = meta ? `${meta.icon} ${meta.label}` : state.toUpperCase();
 
-    // Status pill: shows current phase/state at a glance
+    // Status pill: shows the current ascent state at a glance
     execFileSync('cmux', ['set-status', 'phase', phaseLabel], { stdio: 'ignore', timeout: 2000 });
 
     // Log entry: shows what's happening with color-coded level
@@ -78,10 +76,16 @@ function setCmuxState(title: string, state: TabState, phase?: string): void {
   }
 }
 
-// Generic phase gerunds that must never carry over between phases.
-// Includes both current short gerunds AND legacy long-form ones that may persist in stale state files.
+// Generic state gerunds that must never carry over as if they were task
+// descriptions. Current gerunds come from the ascent table; the rest are
+// retired station strings that may still sit in a stale tab-state file.
 const GENERIC_PHASE_GERUNDS = new Set([
-  ...Object.values(PHASE_TAB_CONFIG).map(c => c.gerund).filter(g => g.length > 0),
+  ...ASCENT_GERUNDS,
+  // Retired ascent gerunds (renamed 2026-08-13 — a tab read "Climbing" while
+  // the official state is Ascending): strip forever from stale tab-state files.
+  'Climbing.', 'Testing the hold.',
+  'Observing.', 'Thinking.', 'Planning.', 'Building.', 'Executing.',
+  'Verifying.', 'Learning.', 'Complete.', 'Starting.', 'Scoping.',
   'Observing the user request.', 'Analyzing the problem space.',
   'Planning the execution approach.', 'Building the solution artifacts.',
   'Executing the planned work.', 'Verifying ideal state criteria.',
@@ -196,9 +200,13 @@ interface SetTabOptions {
   title: string;
   state: TabState;
   previousTitle?: string;
+  /** Ascent state to carry across a transient stamp (e.g. question), so the
+   * restore path can return to the run's real state instead of a generic one. */
+  previousAscent?: AscentState;
+  /** Marks a permission-blocked stamp so the wildcard PostToolUse restore path
+   * can tell "blocked on approval" apart from every other transient state. */
+  blocked?: boolean;
   sessionId?: string;
-  /** Mode/tier token to lead the title: "N" (native). Algorithm tiers come via setPhaseTab. */
-  modeToken?: string;
 }
 
 /**
@@ -242,12 +250,8 @@ function cleanupStaleStateFiles(): void {
 }
 
 export function setTabState(opts: SetTabOptions): void {
-  const { state, previousTitle, sessionId, modeToken } = opts;
-  // Lead the title with the mode/tier token when supplied (e.g. "N ⚙️ Fixing tabs.").
-  // Idempotent: never double-stamp if the caller already prefixed a token.
-  const title = modeToken && !MODE_TOKEN_RE.test(opts.title)
-    ? `${modeToken} ${opts.title}`
-    : opts.title;
+  const { state, previousTitle, previousAscent, sessionId } = opts;
+  const title = opts.title;
   const colors = TAB_COLORS[state];
 
   // cmux path: use sidebar metadata instead of Kitty remote control
@@ -332,6 +336,8 @@ export function setTabState(opts: SetTabOptions): void {
         timestamp: new Date().toISOString(),
       };
       if (previousTitle) stateData.previousTitle = previousTitle;
+      if (previousAscent) stateData.previousAscent = previousAscent;
+      if (opts.blocked) stateData.blocked = true;
       writeFileSync(join(TAB_TITLES_DIR, `${windowId}.json`), JSON.stringify(stateData), 'utf-8');
     }
   } catch { /* silent */ }
@@ -340,62 +346,11 @@ export function setTabState(opts: SetTabOptions): void {
   cleanupStaleStateFiles();
 }
 
-/**
- * Set ONLY the leading mode/tier token ("N" | "E1".."E5") on the current tab,
- * preserving the working description, and clearing any stale completion state.
- *
- * This is the authoritative mode-token writer, called by TheRouter the moment
- * it classifies the turn — so the tab projects the real {mode,tier} decision
- * instead of PromptProcessing's shadow-classifier guess. It is deliberately a
- * distinct primitive from setTabState (which takes a full title) and setPhaseTab
- * (which needs an Algorithm phase): here we mutate ONLY the token, keep the
- * description, and drop a prior turn's `✅ done` so it can't linger into live work.
- *
- * - `token`: "N" for NATIVE turns, "E1".."E5" for ALGORITHM. (MINIMAL passes no call.)
- * - `fallbackDesc`: used only when the current title is absent or a stale completion
- *   (whose description we intentionally drop). Normally PromptProcessing's ~50ms
- *   deterministic stamp has already set a live working description we preserve.
- *
- * Silent no-op when no kitty socket/session resolves (setTabState handles that).
- * Never writes stdout — safe to call from a hook that emits JSON on stdout.
- */
-const LIVE_ALGO_PHASES = new Set(['OBSERVE', 'THINK', 'PLAN', 'BUILD', 'EXECUTE', 'VERIFY', 'LEARN']);
-
-export function setModeToken(sessionId: string | undefined, token: string, fallbackDesc?: string): void {
-  if (!token) return;
-  try {
-    const cur = readTabState(sessionId);
-    const wasCompleted = !!cur && (cur.state === 'completed' || cur.state === 'idle' || /✅/.test(cur.title || ''));
-
-    // Mid-run follow-up on an ALGORITHM turn: the tab is already showing a live
-    // phase (e.g. "E4 👁️ desc"). Preserve the phase icon + phase field, swapping
-    // ONLY the tier token — delegate to setPhaseTab. Without this, re-stamping the
-    // token every turn would revert 👁️→⚙️ and drop the phase (the documented
-    // "orange gear wiped the phase tab" regression). Only for E-tier tokens: a
-    // NATIVE ('N') follow-up after an algorithm turn SHOULD clear the phase → falls
-    // through to the neutral stamp below.
-    if (cur && !wasCompleted && cur.phase && LIVE_ALGO_PHASES.has(cur.phase) && /^E[1-5]$/.test(token)) {
-      const carriedDesc = stripPrefix(cur.title);
-      setPhaseTab(cur.phase as AlgorithmTabPhase, sessionId!, carriedDesc || undefined, token);
-      return;
-    }
-
-    // Preserve a LIVE working description; drop a stale completion's text.
-    let desc = cur && !wasCompleted ? stripPrefix(cur.title) : '';
-    if (!desc) desc = (fallbackDesc && fallbackDesc.trim()) || getSessionOneWord(sessionId || '') || 'working…';
-    const state: TabState = token === 'N' ? 'native' : 'working';
-    // Neutral working gear at turn start (pre-phase); phase icons (👁️📋…) arrive from
-    // setPhaseTab. Title already carries the token, so don't also pass modeToken.
-    setTabState({ title: `${token} ⚙️ ${desc}`, state, sessionId });
-  } catch (err) {
-    console.error('[tab-setter] setModeToken failed:', err);
-  }
-}
 
 /**
  * Read per-window state file. Returns null if not found or invalid.
  */
-export function readTabState(sessionId?: string): { title: string; state: TabState; previousTitle?: string; phase?: string } | null {
+export function readTabState(sessionId?: string): { title: string; state: TabState; previousTitle?: string; previousAscent?: AscentState; ascent?: AscentState; blocked?: boolean } | null {
   const kittyEnv = getKittyEnv(sessionId);
   const windowId = kittyEnv.windowId;
   if (!windowId) return null;
@@ -407,33 +362,22 @@ export function readTabState(sessionId?: string): { title: string; state: TabSta
       title: raw.title || '',
       state: raw.state || 'idle',
       previousTitle: raw.previousTitle,
-      phase: raw.phase,
+      previousAscent: raw.previousAscent as AscentState | undefined,
+      blocked: raw.blocked === true,
+      // `phase` is the pre-2026-07-27 key; map it forward so a tab written by
+      // the old code still re-stamps correctly on the next prompt.
+      ascent: (raw.ascent || PHASE_TO_ASCENT[String(raw.phase || '').toLowerCase()]) as AscentState | undefined,
     };
   } catch { return null; }
 }
 
 /**
- * Mode/tier token that leads every tab title: "N" for NATIVE turns, "E1".."E5"
- * for the Algorithm tier. Always followed by whitespace then the state/phase icon.
- */
-export const MODE_TOKEN_RE = /^(N|E[1-5])\s+/;
-
-/** Extract the leading mode/tier token ("N" | "E1".."E5") from a title, or null. */
-export function extractModeToken(title: string): string | null {
-  const m = title.match(MODE_TOKEN_RE);
-  return m ? m[1] : null;
-}
-
-/**
- * Strip the mode/tier token AND emoji prefix from a tab title to get raw text.
- * Handles working-state prefixes (🧠⚙️✓❓), Algorithm phase symbols (👁️📋🔨⚡✅📚),
- * and the leading mode/tier token (N / E1-E5). Order-tolerant.
+ * Strip the emoji prefix from a tab title to get raw text.
+ * Covers every current ascent glyph plus the retired station emoji — the glyph
+ * list lives in the ascent table, so a new icon is strippable the moment it ships.
  */
 export function stripPrefix(title: string): string {
-  return title
-    .replace(MODE_TOKEN_RE, '')
-    .replace(/^(?:🧠|⚙️|⚙|✓|❓|👁️|📋|🔨|⚡|✅|📚|⚠)\s*/, '')
-    .trim();
+  return stripAscentPrefix(title);
 }
 
 // Noise words to skip when extracting the session label
@@ -451,9 +395,19 @@ const SESSION_NOISE = new Set([
 export function getSessionOneWord(sessionId: string): string | null {
   try {
     const namesPath = paiPath('MEMORY', 'STATE', 'session-names.json');
-    if (!existsSync(namesPath)) return null;
-    const names = JSON.parse(readFileSync(namesPath, 'utf-8'));
-    const fullName = names[sessionId];
+    let names: Record<string, string> | null = null;
+    try {
+      if (existsSync(namesPath)) names = JSON.parse(readFileSync(namesPath, 'utf-8'));
+    } catch { names = null; }
+    if (!names) {
+      // Mid-rename/corrupt read: the writer keeps a .bak (see PromptProcessing
+      // writeSessionNames) — a transient miss here is how a completed tab got
+      // stamped with a bare state word (window 1, 2026-08-12).
+      const bakPath = namesPath + '.bak';
+      if (!existsSync(bakPath)) return null;
+      names = JSON.parse(readFileSync(bakPath, 'utf-8'));
+    }
+    const fullName = names?.[sessionId];
     if (!fullName) return null;
 
     const words = fullName.split(/\s+/).filter((w: string) => w.length > 0);
@@ -477,68 +431,118 @@ export function getSessionOneWord(sessionId: string): string | null {
 }
 
 /**
- * Set tab title and color for an Algorithm phase.
- * Active format:    {SYMBOL} {ONE_WORD} | {PHASE}
- * Complete format:  {ONE_WORD} | {summary}
- *
- * Called on algorithm phase transitions.
+ * Bare state words and transient stamps are never task descriptions. A title
+ * carrying one of these tells the user nothing ("🪨 WORKING" on a completed
+ * tab, found live 2026-08-12) — filter it and fall back to something honest.
  */
-export function setPhaseTab(phase: AlgorithmTabPhase, sessionId: string, summary?: string, eLevel?: string): void {
-  const config = PHASE_TAB_CONFIG[phase];
+export function isDegenerateDesc(desc: string): boolean {
+  const d = (desc || '').trim();
+  if (!d) return true;
+  if (/^APPROVE:/i.test(d)) return true;
+  return /^(working|done|thinking|blocked|completed|idle|task complete)[.…]?$/i.test(d);
+}
+
+/**
+ * Pure title composition for setAscentTab — extracted so tests can replay the
+ * exact shipping logic against regression cases (the 🪨 WORKING tab).
+ *
+ * Title shape since 2026-08-12: `{stateIcon}{activityGlyph} {desc}` — the
+ * state icon says where in the climb, the activity glyph says whether work is
+ * moving (⚡), waiting on {{PRINCIPAL_NAME}} (⏳), done (✅), or quiet (💤). Defaults come
+ * from `defaultTabActivity`; only the question/approval stamps override.
+ */
+export function composeAscentTitle(
+  state: AscentState,
+  opts: {
+    summary?: string;
+    oneWord?: string | null;
+    currentTitle?: string | null;
+    activity?: TabActivity | null;
+    /** Use the summary verbatim as the description (approval stamps carry
+     * `APPROVE: …`, which the degenerate filter rightly bans everywhere else). */
+    literal?: boolean;
+  },
+): string {
+  const config = ASCENT[state];
+  const summary = opts.summary?.trim() || '';
+  const activity = opts.activity !== undefined ? opts.activity : defaultTabActivity(state);
+  const prefix = `${config.icon}${activity ? TAB_ACTIVITY[activity].glyph : ''}`;
+  if (state === 'cairn') {
+    // No summary extracted — the session name at least identifies the work;
+    // never a bare state word.
+    return `${prefix} ${summary || opts.oneWord || 'Done'}`;
+  }
+  if (state === 'idle') {
+    return opts.oneWord || 'Idle';
+  }
+  if (opts.literal && summary) {
+    return `${prefix} ${summary}`;
+  }
+  // Preserve the working description carried in from PromptProcessing or a
+  // prior phase — only the leading token+icon changes to show the new phase.
+  // stripPrefix removes token+icon; tolerate the legacy "ONE_WORD | desc"
+  // shape that may linger in pre-format-change state files.
+  let existingDesc = '';
+  if (opts.currentTitle) {
+    const pipeIdx = opts.currentTitle.indexOf(' | ');
+    existingDesc = pipeIdx !== -1
+      ? opts.currentTitle.slice(pipeIdx + 3).trim()
+      : stripPrefix(opts.currentTitle);
+  }
+  // Never carry over generic phase gerunds, state words, or approval stamps —
+  // they're not real task descriptions.
+  if (GENERIC_PHASE_GERUNDS.has(existingDesc) || isDegenerateDesc(existingDesc)) existingDesc = '';
+  // An explicit summary (e.g. a fresh iteration's gerund from PromptProcessing)
+  // overrides the carried-over desc; otherwise keep what the tab already shows.
+  const override = summary && !GENERIC_PHASE_GERUNDS.has(summary) && !isDegenerateDesc(summary) ? summary : '';
+  const desc = override || existingDesc || config.gerund;
+  return `${prefix} ${desc}`;
+}
+
+export interface AscentTabOptions {
+  /** Override the state-implied activity glyph (question/approval → 'waiting'). */
+  activity?: TabActivity | null;
+  /** Use the summary verbatim as the description (approval stamps). */
+  literal?: boolean;
+  /** Carry the pre-stamp title so a transient stamp (question/approval) can restore it. */
+  previousTitle?: string;
+  /** Carry the pre-stamp ascent state for the same restore path. */
+  previousAscent?: AscentState;
+  /** Marks a permission-blocked stamp for the wildcard PostToolUse restore. */
+  blocked?: boolean;
+}
+
+/**
+ * Set tab title and color for an Algorithm run state.
+ * Active format:   {ICON}{ACTIVITY} {task description}
+ * Cairn format:    🪨✅ {summary}
+ *
+ * Called whenever the run's derived ascent state changes. Every glyph, color and
+ * fallback gerund comes from `LIFEOS/TOOLS/ascent.ts` — the same table Pulse and
+ * the status line read, so a tab can never disagree with the board. Since
+ * 2026-08-12 the tab background IS the board color (ASCENT.tabBg === color),
+ * and the question/approval stamps route through here too, so every painted
+ * tab is one of the six run-state colors.
+ */
+export function setAscentTab(state: AscentState, sessionId: string, summary?: string, opts: AscentTabOptions = {}): void {
+  const config = ASCENT[state];
   if (!config) return;
 
-  const oneWord = getSessionOneWord(sessionId) || 'WORKING';
   const kittyEnv = getKittyEnv(sessionId);
-
-  // Resolve the mode/tier token that leads the title:
-  //   1. explicit eLevel (Algorithm tier from ISA frontmatter — "E1".."E5"), else
-  //   2. the token already on this window's tab — preserves "N" for a native
-  //      session completing, or a tier stamped by an earlier phase, else
-  //   3. none.
   const currentState = readTabState(sessionId);
-  const recoveredToken = currentState?.title ? extractModeToken(currentState.title) : null;
-  const token = eLevel || recoveredToken || '';
-  const lead = (icon: string) => [token, icon].filter(Boolean).join(' ');
+  const title = composeAscentTitle(state, {
+    summary,
+    oneWord: getSessionOneWord(sessionId),
+    currentTitle: currentState?.title ?? null,
+    activity: opts.activity,
+    literal: opts.literal,
+  });
 
-  // Build title based on phase. Format: {TOKEN} {ICON} {summary}
-  let title: string;
-  if (phase === 'COMPLETE' && summary) {
-    title = `${lead('✅')} ${summary}`;
-  } else if (phase === 'COMPLETE') {
-    // No summary extracted — use session name instead of generic "Done."
-    title = `${lead('✅')} ${oneWord}`;
-  } else if (phase === 'IDLE') {
-    title = oneWord;
-  } else {
-    // Preserve the working description carried in from PromptProcessing or a
-    // prior phase — only the leading token+icon changes to show the new phase.
-    // stripPrefix removes token+icon; tolerate the legacy "ONE_WORD | desc"
-    // shape that may linger in pre-format-change state files.
-    let existingDesc = '';
-    if (currentState?.title) {
-      const pipeIdx = currentState.title.indexOf(' | ');
-      existingDesc = pipeIdx !== -1
-        ? currentState.title.slice(pipeIdx + 3).trim()
-        : stripPrefix(currentState.title);
-    }
-    // Never carry over generic phase gerunds — they're not real task descriptions
-    if (GENERIC_PHASE_GERUNDS.has(existingDesc)) existingDesc = '';
-    // An explicit summary (e.g. a fresh iteration's gerund from PromptProcessing)
-    // overrides the carried-over desc; otherwise keep what the tab already shows.
-    const override = summary && summary.trim() && !GENERIC_PHASE_GERUNDS.has(summary.trim()) ? summary.trim() : '';
-    const desc = override || existingDesc || config.gerund;
-    title = `${lead(config.symbol)} ${desc}`;
-  }
-
-  // cmux path: use sidebar metadata for phase display
+  // cmux path: use sidebar metadata instead of Kitty remote control
   if (isCmux()) {
-    setCmuxState(title, phase === 'COMPLETE' ? 'completed' : phase === 'IDLE' ? 'idle' : 'working', phase);
-    // Also set progress based on phase number (1-7 scale)
-    const phaseProgress: Record<string, number> = {
-      OBSERVE: 0.14, THINK: 0.28, PLAN: 0.42, BUILD: 0.57, EXECUTE: 0.71, VERIFY: 0.85, LEARN: 1.0, COMPLETE: 1.0, IDLE: 0,
-    };
+    setCmuxState(title, state === 'cairn' ? 'completed' : state === 'idle' ? 'idle' : 'working', state);
     try {
-      const progress = phaseProgress[phase] ?? 0;
+      const progress = ascentProgress(state);
       if (progress > 0) {
         execFileSync('cmux', ['set-progress', String(progress)], { stdio: 'ignore', timeout: 2000 });
       } else {
@@ -577,13 +581,13 @@ export function setPhaseTab(phase: AlgorithmTabPhase, sessionId: string, summary
     execFileSync(kitten, titleArgs, { stdio: 'ignore', timeout: 2000 });
     execFileSync(kitten, winTitleArgs, { stdio: 'ignore', timeout: 2000 });
 
-    const colorArgs = phase === 'IDLE'
+    const colorArgs = state === 'idle'
       ? ['@', toArg, 'set-tab-color', colorTargetArg, 'active_bg=none', 'active_fg=none', 'inactive_bg=none', 'inactive_fg=none']
-      : ['@', toArg, 'set-tab-color', colorTargetArg, `active_bg=${ACTIVE_TAB_BG}`, `active_fg=${ACTIVE_TAB_FG}`, `inactive_bg=${config.inactiveBg}`, `inactive_fg=${INACTIVE_TAB_FG}`];
+      : ['@', toArg, 'set-tab-color', colorTargetArg, `active_bg=${ACTIVE_TAB_BG}`, `active_fg=${ACTIVE_TAB_FG}`, `inactive_bg=${config.tabBg}`, `inactive_fg=${config.tabFg}`];
     execFileSync(kitten, colorArgs, { stdio: 'ignore', timeout: 2000 });
-    console.error(`[tab-setter] Phase tab: "${title}" (${phase}, bg=${config.inactiveBg})`);
+    console.error(`[tab-setter] Ascent tab: "${title}" (${state}, bg=${config.tabBg})`);
   } catch (err) {
-    console.error(`[tab-setter] Error setting phase tab:`, err);
+    console.error(`[tab-setter] Error setting ascent tab:`, err);
   }
 
   // Persist per-window state
@@ -592,12 +596,27 @@ export function setPhaseTab(phase: AlgorithmTabPhase, sessionId: string, summary
 
   try {
     if (!existsSync(TAB_TITLES_DIR)) mkdirSync(TAB_TITLES_DIR, { recursive: true });
-    writeFileSync(join(TAB_TITLES_DIR, `${windowId}.json`), JSON.stringify({
+    const stateData: Record<string, unknown> = {
       title,
-      inactiveBg: config.inactiveBg,
-      state: phase === 'COMPLETE' ? 'completed' : 'working',
-      phase,
+      inactiveBg: config.tabBg,
+      state: state === 'cairn' ? 'completed' : 'working',
+      ascent: state,
       timestamp: new Date().toISOString(),
-    }), 'utf-8');
+    };
+    if (opts.activity !== undefined) stateData.activity = opts.activity;
+    if (opts.previousTitle) stateData.previousTitle = opts.previousTitle;
+    if (opts.previousAscent) stateData.previousAscent = opts.previousAscent;
+    if (opts.blocked) stateData.blocked = true;
+    writeFileSync(join(TAB_TITLES_DIR, `${windowId}.json`), JSON.stringify(stateData), 'utf-8');
   } catch { /* silent */ }
+}
+
+/**
+ * Convenience wrapper for callers that hold ISA/registry data rather than a
+ * resolved state — derives through the same `deriveAscent` Pulse uses.
+ */
+export function setAscentTabFrom(input: AscentInput, sessionId: string, summary?: string): AscentState {
+  const state = deriveAscent(input);
+  setAscentTab(state, sessionId, summary);
+  return state;
 }

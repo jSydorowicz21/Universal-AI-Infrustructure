@@ -30,7 +30,7 @@ A reusable Next.js dashboard template with Tokyo Night Day theme, shadcn/ui comp
 ### 1. Copy the Template
 
 ```bash
-cp -r ~/.claude/skills/telos/dashboard-template /path/to/your/project
+cp -r ~/.claude/skills/Telos/DashboardTemplate /path/to/your/project
 cd /path/to/your/project
 ```
 
@@ -163,7 +163,7 @@ The Ask page uses Claude Haiku 4.5 via Anthropic API:
 
 **Environment Variable Required**:
 ```
-ANTHROPIC_API_KEY=sk-ant-api03-...
+ANTHROPIC_API_KEY=<your-anthropic-key>
 ```
 
 ## Dynamic File System

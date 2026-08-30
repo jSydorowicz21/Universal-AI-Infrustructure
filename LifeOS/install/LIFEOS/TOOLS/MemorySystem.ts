@@ -10,7 +10,7 @@
  *   knowledge, or proposal. A background reviewer reads recent conversation
  *   and emits typed items. The system routes each item to the right place
  *   based on type. Memory items load into every prompt. Ideas and knowledge
- *   load when relevant. Proposals get surfaced in Telegram for yes/no/edit.
+ *   load when relevant. Proposals queue for principal review (Pulse surfaces).
  *   Four safety tiers gate writes by destination.
  *
  * Two public functions:
@@ -23,7 +23,7 @@
  *   type=memory     → MemoryWriter.setEntries (set-overwrite, capped, Tier A)
  *   type=idea       → atomic-rename append (Tier B, audit row written)
  *   type=knowledge  → atomic-rename append (Tier B, audit row written)
- *   type=proposal   → JSONL queue (Telegram surfacer consumes)
+ *   type=proposal   → JSONL queue (proposal surfacer consumes)
  *
  * Defense-in-depth: every write goes through MutationTier.getTier(path)
  * before persisting. If the resolved path's tier doesn't match the type's
@@ -37,44 +37,50 @@
  *   bun MemorySystem.ts test                (smoke test)
  */
 
-import { randomUUID } from "node:crypto";
 import {
   appendFileSync,
   closeSync,
   existsSync,
   fsyncSync,
-  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve as pathResolve, join as pathJoin } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
+
+import { invariant, InvariantViolation } from "./Invariant";
 
 import {
   TYPE_REGISTRY,
   isKnownType,
   resolveStoragePath,
-  PROPOSAL_KIND_TO_FILES,
-  USER_ROOT,
-  isKnownProposalKind,
+  inferProposalKind,
+  pinProposalTargetFile,
+  ALWAYS_LOADED_KINDS,
   ALL_TYPES,
+  ALL_RELATED_TYPES,
+  ALL_PROPOSAL_KINDS,
   TIER_B_AUDIT_PATH,
   PRINCIPAL_MEMORY_PATH,
   type TypedItem,
   type MemoryTypeName,
   type Tier,
   type RelatedLink,
-  type ProposalTargetKind,
 } from "./MemoryTypes";
 
 import { setEntries as memoryWriterSetEntries, read as memoryWriterRead } from "./MemoryWriter";
+import { classifyScope } from "./ProposalScope";
+import { addUpgrade } from "./Upgrades";
 import { getTier } from "./MutationTier";
 import { getRelevantContext, type RelevantResultItem } from "./MemoryRetriever";
 import { mintId, slugFromPath, SCHEMA_VERSION } from "./KnowledgeSchema";
+import { stripPrivateContent } from "./CaptureEnvelope";
+import { assertInsideUserData } from "./lib/ForeignDataCheck";
 
 // ── Constants ──
 
@@ -131,77 +137,180 @@ function logTierBWrite(filePath: string, bytes: number, type: MemoryTypeName): v
   }
 }
 
+// ── Per-note write lock, crash-safe ──
+// Memory writes run inside hook-spawned subprocesses. If the harness times one
+// out — or the machine loses power — after the lockfile is created but before
+// the `finally` releases it, the `.lock` survives on disk and every later write
+// to that note fails with "Lock held", permanently and silently. That is memory
+// loss nobody is told about. (public PR #1646, @elhoim — ported slim: recovery
+// lives here rather than in a separate lock module.)
+//
+// Recovery is decided on EVIDENCE first, age second:
+//   1. The holder stamps pid + host + ts into the lockfile at acquire time.
+//   2. A contender reads that stamp. Holder on this host and `kill(pid, 0)`
+//      says gone → the holder died; break immediately, no waiting out a TTL.
+//   3. Liveness unverifiable (empty/corrupt stamp, older build, other host) →
+//      fall back to age; stale only past LOCK_STALE_MS.
+//   4. A provably-live holder is respected.
+// Every unknown resolves toward "assume alive", so the failure mode is a
+// refused write rather than two writers corrupting one note.
+//
+// LOCK_STALE_MS matches DerivedSync.ts's constant rather than inventing a third.
+const LOCK_STALE_MS = 5 * 60 * 1000;
+const LOCK_LOG_PATH = pathJoin(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/memory-locks.jsonl");
+
+type LockReason =
+  | "holder-process-gone"
+  | "holder-alive"
+  | "unverifiable-holder-within-ttl"
+  | "expired-unverifiable-holder";
+
+/**
+ * Every event here is abnormal — a recovered crash or a refused write — so it
+ * earns both a JSONL row and an operator-visible stderr line. Best-effort:
+ * observability must never be why a write fails.
+ */
+function logLockEvent(event: "stale_lock_recovered" | "lock_contended", lockPath: string, reason: LockReason, detail: string): void {
+  try {
+    mkdirSync(dirname(LOCK_LOG_PATH), { recursive: true });
+    appendFileSync(
+      LOCK_LOG_PATH,
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        pid: process.pid,
+        event,
+        reason,
+        lock: lockPath.replace(CLAUDE_ROOT + "/", ""),
+        detail,
+      }) + "\n",
+      "utf8",
+    );
+  } catch {
+    /* observability is best-effort */
+  }
+  console.error(`[MemorySystem] ${event} (${reason}): ${detail}`);
+}
+
+/**
+ * Signal 0 does no work — it runs only the kernel's existence + permission
+ * checks. ESRCH is the ONLY answer that proves absence: EPERM means the process
+ * exists under another uid, and any other error means we don't know. Both
+ * resolve to "alive", so an ambiguous probe can never break a live lock.
+ */
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code !== "ESRCH";
+  }
+}
+
+/**
+ * Decide whether a held lock may be broken. Returns null when it must be respected.
+ * Exported for `test/tools/MemorySystem.lock.test.ts` — the dangerous direction is
+ * breaking a LIVE lock, so the decision matrix is probed directly.
+ */
+export function staleLockReason(lockPath: string): LockReason | null {
+  let stamp: { pid?: number; host?: string } = {};
+  let ageMs = 0;
+  try {
+    ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    stamp = JSON.parse(readFileSync(lockPath, "utf8"));
+  } catch {
+    /* unreadable or pre-stamp lockfile — falls through to the age rule */
+  }
+
+  const sameHost = typeof stamp.host === "string" && stamp.host === hostname();
+  if (sameHost && typeof stamp.pid === "number") {
+    if (!isProcessAlive(stamp.pid)) return "holder-process-gone";
+    return null; // provably alive — respect it
+  }
+  return ageMs > LOCK_STALE_MS ? "expired-unverifiable-holder" : "unverifiable-holder-within-ttl";
+}
+
+/**
+ * Break a stale lock race-safely: rename it aside, then re-create with O_EXCL so
+ * at most one of several concurrent recoverers wins. Returns the new fd, or null
+ * if we lost the race (another writer got there first — respect it).
+ */
+function breakStaleLock(lockPath: string): number | null {
+  const asidePath = `${lockPath}.stale.${process.pid}`;
+  try {
+    renameSync(lockPath, asidePath);
+  } catch {
+    return null; // someone else already moved it
+  }
+  try {
+    const fd = openSync(lockPath, "wx");
+    try { unlinkSync(asidePath); } catch { /* best-effort */ }
+    return fd;
+  } catch {
+    try { unlinkSync(asidePath); } catch { /* best-effort */ }
+    return null;
+  }
+}
+
 // ── Append-write primitive for Tier B types ──
 
-function appendToTierBFile(filePath: string, content: string): { ok: true; bytes: number } | AddError {
+/** Exported for `test/tools/MemorySystem.lock.test.ts` (acquire / recover / release). */
+export function appendToTierBFile(filePath: string, content: string): { ok: true; bytes: number } | AddError {
   const lockPath = `${filePath}.lock`;
   let fd: number | null = null;
   try {
     mkdirSync(dirname(filePath), { recursive: true });
     fd = openSync(lockPath, "wx");
   } catch (e: any) {
-    if (e?.code === "EEXIST") {
+    if (e?.code !== "EEXIST") {
+      return { ok: false, code: "EWRITE_FAILED", message: `Failed to acquire lock: ${e?.message}` };
+    }
+    const reason = staleLockReason(lockPath);
+    if (reason === null || reason === "unverifiable-holder-within-ttl") {
+      // `null` means the holder is provably alive — a distinct operator signal
+      // from "we could not verify it", so it must not be collapsed into one code.
+      logLockEvent("lock_contended", lockPath, reason ?? "holder-alive", `Lock held: ${lockPath}`);
       return { ok: false, code: "EWRITE_FAILED", message: `Lock held: ${lockPath}` };
     }
-    return { ok: false, code: "EWRITE_FAILED", message: `Failed to acquire lock: ${e?.message}` };
+    fd = breakStaleLock(lockPath);
+    if (fd === null) {
+      logLockEvent("lock_contended", lockPath, "holder-alive", `Lost the recovery race for ${lockPath}`);
+      return { ok: false, code: "EWRITE_FAILED", message: `Lock held: ${lockPath}` };
+    }
+    logLockEvent("stale_lock_recovered", lockPath, reason, `Recovered stale lock at ${lockPath}`);
   }
 
-  let tmpPath: string | undefined;
+  // Stamp the holder so the next contender can prove liveness instead of
+  // waiting out the TTL. Best-effort: a failed stamp only costs evidence.
   try {
-    tmpPath = pathJoin(dirname(filePath), `.${randomUUID()}.uai-tmp`);
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, host: hostname(), ts: new Date().toISOString() }), "utf8");
+  } catch { /* the lock still holds; the next contender falls back to age */ }
+
+  try {
+    const tmpPath = `${filePath}.tmp`;
     const existing = existsSync(filePath) ? readFileSync(filePath, "utf8") : "";
     const newContent = existing.length > 0 && !existing.endsWith("\n")
       ? existing + "\n" + content
       : existing + content;
-    const tmpDescriptor = openSync(tmpPath, "wx", 0o600);
-    try {
-      writeFileSync(tmpDescriptor, newContent, "utf8");
-      fsyncSync(tmpDescriptor);
-    } finally {
-      closeSync(tmpDescriptor);
-    }
+
+    // A tier-B append may add content but never lose or reorder what was
+    // already on disk — this rewrite-then-rename path would corrupt silently.
+    invariant(newContent.startsWith(existing), "tier-B append must preserve existing content as a prefix");
+    invariant(newContent.endsWith(content), "tier-B append must end with the appended content");
+
+    writeFileSync(tmpPath, newContent, "utf8");
+    const fdSync = openSync(tmpPath, "r+");
+    try { fsyncSync(fdSync); } finally { closeSync(fdSync); }
     renameSync(tmpPath, filePath);
 
     return { ok: true, bytes: Buffer.byteLength(content, "utf8") };
-  } catch (error: unknown) {
-    if (tmpPath) try { unlinkSync(tmpPath); } catch { /* only our temporary */ }
-    return { ok: false, code: "EWRITE_FAILED", message: `Append failed: ${error instanceof Error ? error.message : String(error)}`, underlying: error };
+  } catch (e: any) {
+    if (e instanceof InvariantViolation) throw e; // impossible states die loud, never as typed errors
+    return { ok: false, code: "EWRITE_FAILED", message: `Append failed: ${e?.message}`, underlying: e };
   } finally {
     try { if (fd !== null) closeSync(fd); } catch { /* ignore */ }
     try { unlinkSync(lockPath); } catch { /* ignore */ }
   }
-}
-
-export type ProposalTargetValidation = { ok: true; kind: ProposalTargetKind } | AddError;
-
-export function validateProposalTargetBinding(targetFile: string, targetKind: string | undefined): ProposalTargetValidation {
-  if (!targetKind || !isKnownProposalKind(targetKind)) {
-    return { ok: false, code: "EINVAL_ITEM", message: "Proposal target_kind is required and must be recognized" };
-  }
-  const target = pathResolve(targetFile);
-  const allowed = PROPOSAL_KIND_TO_FILES[targetKind].some((file) => pathResolve(file) === target);
-  if (!allowed) {
-    return { ok: false, code: "EINVAL_ITEM", message: `Proposal target is not allowed for kind '${targetKind}'` };
-  }
-  const root = pathResolve(USER_ROOT);
-  let cursor = target;
-  while (cursor !== root) {
-    if (dirname(cursor) === cursor) {
-      return { ok: false, code: "EINVAL_ITEM", message: "Proposal target escapes the selected USER root" };
-    }
-    if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) {
-      return { ok: false, code: "EINVAL_ITEM", message: `Proposal target crosses a symbolic link: ${cursor}` };
-    }
-    cursor = dirname(cursor);
-  }
-  if (existsSync(root) && lstatSync(root).isSymbolicLink()) {
-    return { ok: false, code: "EINVAL_ITEM", message: `Selected USER root is a symbolic link: ${root}` };
-  }
-  return { ok: true, kind: targetKind };
-}
-
-function validateProposalTarget(item: TypedItem & { type: "proposal" }): ProposalTargetValidation {
-  return validateProposalTargetBinding(item.target_file, item.target_kind);
 }
 
 // ── Proposal queue ──
@@ -209,11 +318,46 @@ function validateProposalTarget(item: TypedItem & { type: "proposal" }): Proposa
 function enqueueProposal(item: TypedItem & { type: "proposal" }): { ok: true; id: string } | AddError {
   const id = generateProposalId();
   const path = resolveStoragePath(item);
-  // Persist the validated subtype discriminator so every later apply can
-  // revalidate the same closed target binding.
-  const validation = validateProposalTarget(item);
-  if (!validation.ok) return validation;
-  const targetKind = validation.kind;
+  // P1 2026-05-25: persist the subtype discriminator onto the queue row so
+  // the proposal surfacer can render the [kind] badge. Falls back to the
+  // path-based inference when the reviewer omits target_kind (legacy compat).
+  const targetKind = item.target_kind ?? inferProposalKind(item.target_file);
+  // Pin target_file to the kind's canonical file (public PR #1563, @anikinsasha):
+  // most kinds map to exactly one file, so trusting the reviewer's free-text
+  // path lets a hallucinated path get persisted and then silently mis-file or
+  // fail to apply. null = a multi-file (identity) path outside the allowed set.
+  const targetFile = pinProposalTargetFile(targetKind, item.target_file);
+  if (targetFile === null) {
+    return { ok: false, code: "EINVAL_ITEM", message: `target_file '${item.target_file}' is not an allowed '${targetKind}' target` };
+  }
+
+  // ── Scope gate (2026-07-31) ────────────────────────────────────────────────
+  // `target_kind` decides WHICH curated file a proposal belongs to; it says
+  // nothing about WHO needs the rule loaded. Without a scope axis every
+  // rule-shaped signal landed in an @-imported file. Audit of OPERATIONAL_RULES'
+  // tail: 7 of 10 entries were skill- or project-scoped, carried into every turn
+  // for the benefit of one skill.
+  //
+  // Only the kinds whose target is @-imported are gated. `projects` is exempt by
+  // construction — a PROJECTS.md row NAMES a project, so scoping it away from
+  // PROJECTS.md would divert exactly the proposals that belong there.
+  if (ALWAYS_LOADED_KINDS.has(targetKind)) {
+    const verdict = classifyScope(item.edit);
+    if (verdict.scope !== "global") {
+      const r = addUpgrade({
+        claim: item.edit.slice(0, 1000),
+        source: "correction",
+        current_state: `Proposed as a '${targetKind}' edit to ${targetFile}, which is loaded on every turn.`,
+        recommendation: `Encode in ${verdict.dest} instead — ${verdict.reason}.`,
+        target_surface: verdict.scope,
+        confidence: item.confidence,
+        session_id: item.source_session ?? undefined,
+        evidence: [`memory-proposal:${id}`],
+      });
+      return { ok: true, id: r.id || id };
+    }
+  }
+
   try {
     mkdirSync(dirname(path), { recursive: true });
     appendFileSync(
@@ -222,7 +366,7 @@ function enqueueProposal(item: TypedItem & { type: "proposal" }): { ok: true; id
         id,
         ts: new Date().toISOString(),
         status: "pending",
-        target_file: item.target_file,
+        target_file: targetFile,
         target_kind: targetKind,
         edit: item.edit,
         confidence: item.confidence,
@@ -324,7 +468,7 @@ function addMemoryItem(item: TypedItem & { type: "memory" }, path: string): AddR
  * Render the `related:` YAML block for note frontmatter. LifeOS's KNOWLEDGE
  * graph uses this exact shape — preserving the convention means new notes
  * participate in the existing graph traversal infrastructure (KnowledgeGraph.ts,
- * Knowledge skill, 2-hop search) without any extra wiring.
+ * Cortex skill, 2-hop search) without any extra wiring.
  *
  * Empty array renders as `related: []` so the field is present and ready for
  * future enrichment by the reviewer.
@@ -520,6 +664,141 @@ function addNoteTypeItem(item: TypedItem & { type: "idea" | "knowledge" }, path:
   };
 }
 
+// ── Capture privacy boundary ──
+
+type SanitizedItemResult = { ok: true; item: TypedItem } | Extract<AddError, { code: "EINVAL_ITEM" }>;
+
+/**
+ * Clean every free-text field that can enter Cortex-controlled persistence.
+ * The native harness transcript is deliberately untouched; this copy is the
+ * only value allowed to proceed into routing, notes, queues, and indexes.
+ */
+export function sanitizeTypedItemForPersistence(item: TypedItem): SanitizedItemResult {
+  const invalid = (message: string): SanitizedItemResult => ({ ok: false, code: "EINVAL_ITEM", message });
+  if (!item || typeof item !== "object" || Array.isArray(item)) return invalid("item must be an object");
+
+  const raw = item as any;
+  const schemas: Record<string, readonly string[]> = {
+    memory: ["type", "actor", "op", "content", "entries", "provenance", "confidence"],
+    idea: ["type", "title", "content", "source_session", "confidence", "related"],
+    knowledge: ["type", "entity_type", "name", "content", "source_session", "confidence", "related"],
+    proposal: ["type", "target_file", "target_kind", "edit", "confidence", "rationale", "observed_across_sessions", "source_session"],
+  };
+  if (typeof raw.type !== "string" || !isKnownType(raw.type)) return invalid("invalid item type");
+  const allowed = new Set(schemas[raw.type]);
+  const unknown = Object.keys(raw).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) return invalid(`unknown field(s) for ${raw.type}: ${unknown.sort().join(", ")}`);
+
+  const MAX_WRITE_CHARS = 65_536;
+  const MAX_METADATA_CHARS = 1_024;
+  const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+  const FRONTMATTER_RE = /(?:^|\r?\n)[ \t]*---[ \t]*(?:\r?\n|$)/;
+  const COMMENT_RE = /<!--|-->/;
+  const checkString = (value: unknown, field: string, options: { required?: boolean; singleLine?: boolean; max?: number } = {}): string | SanitizedItemResult => {
+    if (typeof value !== "string") return invalid(`${field} must be a string`);
+    if (value.length > (options.max ?? MAX_WRITE_CHARS)) return invalid(`${field} exceeds size limit`);
+    if (options.required && value.trim().length === 0) return invalid(`${field} must not be empty`);
+    if (CONTROL_RE.test(value)) return invalid(`${field} contains control characters`);
+    if (options.singleLine && /[\r\n]/.test(value)) return invalid(`${field} must be single-line`);
+    if (FRONTMATTER_RE.test(value)) return invalid(`${field} contains frontmatter injection`);
+    if (COMMENT_RE.test(value)) return invalid(`${field} contains comment injection`);
+    return value;
+  };
+  const cleanText = (value: unknown, field: string, options: { required?: boolean; singleLine?: boolean; max?: number } = {}): string | SanitizedItemResult => {
+    if (typeof value !== "string") return invalid(`${field} must be a string`);
+    return checkString(stripPrivateContent(value), field, options);
+  };
+  const isError = (value: string | SanitizedItemResult): value is SanitizedItemResult => typeof value !== "string";
+
+  const cleaned: any = { ...raw };
+  for (const field of ["content", "edit", "title", "name", "rationale"] as const) {
+    if (raw[field] === undefined) continue;
+    const value = cleanText(raw[field], field, {
+      required: true,
+      singleLine: field === "title" || field === "name",
+      max: field === "title" || field === "name" ? MAX_METADATA_CHARS : MAX_WRITE_CHARS,
+    });
+    if (isError(value)) return value;
+    cleaned[field] = value;
+  }
+  if (raw.source_session !== undefined) {
+    const value = cleanText(raw.source_session, "source_session", { singleLine: true, max: MAX_METADATA_CHARS });
+    if (isError(value)) return value;
+    if (/[:#][ \t]|^[\-?:,\[\]{}#&*!|>"%@\x27\x60]/.test(value)) return invalid("source_session contains YAML-ambiguous syntax");
+    if (value.trim().length === 0) delete cleaned.source_session;
+    else cleaned.source_session = value;
+  }
+
+  if (raw.entries !== undefined) {
+    if (!Array.isArray(raw.entries)) return invalid("memory entries must be an array");
+    if (raw.entries.length > 48) return invalid("memory entries exceed the 48-entry cap — trim before re-submitting");
+    const entries: string[] = [];
+    for (const [index, entry] of raw.entries.entries()) {
+      const value = cleanText(entry, `entries[${index}]`, { required: true, singleLine: true, max: 256 });
+      if (isError(value)) return value;
+      entries.push(value);
+    }
+    cleaned.entries = entries;
+  }
+
+  if (raw.confidence !== undefined && (typeof raw.confidence !== "number" || !Number.isFinite(raw.confidence) || raw.confidence < 0 || raw.confidence > 1)) {
+    return invalid("confidence must be a finite number between 0 and 1");
+  }
+
+  if (raw.related !== undefined) {
+    if (!Array.isArray(raw.related)) return invalid("related must be an array");
+    if (raw.related.length > 64) return invalid("related exceeds size limit");
+    const links: RelatedLink[] = [];
+    for (const [index, link] of raw.related.entries()) {
+      if (!link || typeof link !== "object" || Array.isArray(link)) return invalid(`related[${index}] must be an object`);
+      const linkKeys = Object.keys(link);
+      if (linkKeys.some((key) => key !== "slug" && key !== "type")) return invalid(`related[${index}] has unknown fields`);
+      const slug = cleanText((link as any).slug, `related[${index}].slug`, { required: true, singleLine: true, max: 256 });
+      if (isError(slug)) return slug;
+      if (!/^[a-z0-9][a-z0-9._-]*$/i.test(slug)) return invalid(`related[${index}].slug is invalid`);
+      if (typeof (link as any).type !== "string" || !(ALL_RELATED_TYPES as readonly string[]).includes((link as any).type)) {
+        return invalid(`related[${index}].type is invalid`);
+      }
+      links.push({ slug, type: (link as any).type });
+    }
+    cleaned.related = links;
+  }
+
+  switch (raw.type) {
+    case "memory": {
+      if (raw.actor !== "principal" && raw.actor !== "assistant") return invalid("memory actor is invalid");
+      if (raw.op !== undefined && raw.op !== "add" && raw.op !== "set") return invalid("memory op is invalid");
+      if (raw.provenance !== undefined && !["explicit", "deduced", "inferred"].includes(raw.provenance)) return invalid("memory provenance is invalid");
+      if (raw.op === "set") {
+        if (!Array.isArray(cleaned.entries) || cleaned.entries.length === 0) return invalid("memory entries must be a non-empty array");
+      } else if (cleaned.content === undefined) {
+        return invalid("memory content must be a non-empty string");
+      }
+      break;
+    }
+    case "idea":
+      if (cleaned.title === undefined || cleaned.content === undefined) return invalid("idea requires title and content");
+      break;
+    case "knowledge":
+      if (!["person", "company", "research"].includes(raw.entity_type)) return invalid("knowledge entity_type is invalid");
+      if (cleaned.name === undefined || cleaned.content === undefined) return invalid("knowledge requires name and content");
+      break;
+    case "proposal":
+      if (typeof raw.target_file !== "string") return invalid("proposal target_file must be a string");
+      {
+        const target = checkString(raw.target_file, "target_file", { required: true, singleLine: true, max: 4_096 });
+        if (isError(target)) return target;
+        if (stripPrivateContent(target) !== target) return invalid("target_file contains private boundary markup");
+      }
+      if (raw.target_kind !== undefined && (typeof raw.target_kind !== "string" || !(ALL_PROPOSAL_KINDS as readonly string[]).includes(raw.target_kind))) return invalid("proposal target_kind is invalid");
+      if (cleaned.edit === undefined || cleaned.rationale === undefined) return invalid("proposal requires edit and rationale");
+      if (typeof raw.confidence !== "number") return invalid("proposal confidence is required");
+      if (raw.observed_across_sessions !== undefined && (!Number.isSafeInteger(raw.observed_across_sessions) || raw.observed_across_sessions < 1)) return invalid("observed_across_sessions must be a positive integer");
+      break;
+  }
+  return { ok: true, item: cleaned as TypedItem };
+}
+
 // ── Public API ──
 
 /**
@@ -541,12 +820,27 @@ export function add(item: TypedItem): AddResult {
     };
   }
 
+  const sanitized = sanitizeTypedItemForPersistence(item);
+  if (!sanitized.ok) return sanitized;
+  item = sanitized.item;
+
   const entry = TYPE_REGISTRY[item.type];
   let path: string;
   try {
     path = resolveStoragePath(item);
   } catch (e: any) {
     return { ok: false, code: "EINVAL_ITEM", message: `Storage path resolution failed: ${e?.message}` };
+  }
+
+  // Boundary (2026-08-11 lifelog incident class): every Cortex write target
+  // must physically resolve into the private USER_DATA repo. The resolvers all
+  // point through the LIFEOS/USER and LIFEOS/MEMORY symlinks; if a symlink is
+  // broken or replaced by a real directory, the same lexical path would land
+  // personal data inside the system tree — refuse instead. Realpath-based, so
+  // a symlinked component cannot defeat it.
+  const boundary = assertInsideUserData(path);
+  if (!boundary.ok) {
+    return { ok: false, code: "EWRITE_FAILED", message: `memory write refused at the system/user boundary: ${boundary.reason}` };
   }
 
   // Defense-in-depth: for direct writes (set-overwrite, append), the registry's

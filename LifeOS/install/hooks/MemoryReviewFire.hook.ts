@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * @version 2.0.1
+ * @version 2.1.0
  * MemoryReviewFire — Stop hook that owns the WHOLE memory-review cadence.
  *
  * Consolidation (2026-07-11, thinking-system BPE strip): the old design split
@@ -10,47 +10,56 @@
  * debounce machinery approximated, so the handshake was scaffolding. Now:
  *
  *   On every primary-session Stop:
- *     1. turn_count += 1, last_message_at = now
- *     2. If turn_count >= turn_threshold AND minutes since last_review >=
- *        min_minutes_between → spawn MemoryReviewer.ts detached, reset.
+ *     1. THIS SESSION's turn_count += 1, last_message_at = now
+ *     2. If this session's turn_count >= turn_threshold AND minutes since the
+ *        GLOBAL last_review >= min_minutes_between → spawn MemoryReviewer.ts
+ *        detached, reset this session's counter, stamp the global clock.
  *
- * State schema is unchanged (review-state.json) — the statusline 🧠 MEM line
- * reads it directly every second; pending_review stays false forever.
+ * Per-session cadence (public issue #1711, @jacobo-ortiz): the turn counter used
+ * to live in the single global review-state.json, so two concurrent sessions
+ * incremented and reset each other's count — a busy session could starve a quiet
+ * one, and read-modify-write interleaving lost ticks outright. The counter now
+ * lives per session at MEMORY/STATE/memory-review/<session_id>.json, mirroring
+ * the per-session pattern already used by hooks/MemoryTurnStart.hook.ts.
+ *
+ * The two halves of the trigger are deliberately scoped differently:
+ *   - turn_threshold is PER SESSION. It asks "has this conversation moved enough
+ *     to be worth reviewing?", which is only meaningful within one transcript.
+ *   - min_minutes_between stays GLOBAL. It is the inference-volume guard, and a
+ *     per-session rate cap would let N sessions run N reviews per window.
+ *
+ * OBSERVABILITY/review-state.json is still written on every Stop as a mirror, so
+ * the statusline 🧠 MEM line, MemoryStatus.ts, MemoryHealthCheck.ts and the Pulse
+ * memory module keep reading the schema they already know. Its `last_review_at`
+ * remains load-bearing (it IS the global rate cap); its turn count is now
+ * display-only and last-writer-wins across concurrent sessions.
  * Cadence parameters: LIFEOS/USER/CONFIG/memory-review.json.
  *
  * Failure mode: any error logs to stderr and exits 0 (never block Stop).
  */
 
-import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { dirname, resolve as pathResolve } from "node:path";
-import { randomUUID } from "node:crypto";
-import { resolveDataRoot, resolveLifeosRoot } from "../LIFEOS/UNIVERSAL/platform";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { dirname, join, resolve as pathResolve } from "node:path";
+import { homedir } from "node:os";
+import { isSubagentContext as isSubagent } from './lib/subagent';
 
-const LIFEOS_DIR = resolveLifeosRoot(process.env, "claude");
-const USER_ROOT = pathResolve(resolveDataRoot(process.env), "USER");
-const STATE_PATH = pathResolve(LIFEOS_DIR, "MEMORY/OBSERVABILITY/review-state.json");
-const CONFIG_PATH = pathResolve(USER_ROOT, "CONFIG/memory-review.json");
-const FIRE_LOG_PATH = pathResolve(LIFEOS_DIR, "MEMORY/OBSERVABILITY/reviewer-fires.jsonl");
-const REVIEWER_PATH = pathResolve(LIFEOS_DIR, "TOOLS/MemoryReviewer.ts");
-const STATE_LOCK_PATH = `${STATE_PATH}.lock`;
+const CLAUDE_ROOT = pathResolve(homedir(), ".claude");
+const STATE_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/review-state.json");
+const SESSION_STATE_DIR = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/STATE/memory-review");
+const CONFIG_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/USER/CONFIG/memory-review.json");
+const FIRE_LOG_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/MEMORY/OBSERVABILITY/reviewer-fires.jsonl");
+const REVIEWER_PATH = pathResolve(CLAUDE_ROOT, "LIFEOS/TOOLS/MemoryReviewer.ts");
 
-interface ReviewAttempt {
-  id: string;
-  pid: number;
-  started_at: string;
-  turns_reviewed: number;
-  transcript_path?: string;
-}
+/** Per-session state files older than this are pruned opportunistically. */
+const SESSION_STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface ReviewState {
   turn_count_since_last_review: number;
   last_review_at: string | null;
   last_message_at: string | null;
-  pending_review: boolean;
+  pending_review: boolean; // kept for statusline schema compat; always false now
   schema_version: 1;
-  review_attempt?: ReviewAttempt;
-  sessions?: Record<string, Omit<ReviewState, "sessions">>;
 }
 
 const INITIAL_STATE: ReviewState = {
@@ -60,24 +69,6 @@ const INITIAL_STATE: ReviewState = {
   pending_review: false,
   schema_version: 1,
 };
-
-interface HookInput {
-  session_id?: string;
-  uai_session_id?: string;
-  native_session_id?: string;
-  transcript_path?: string;
-}
-
-function readHookInput(): HookInput {
-  try {
-    const raw = readFileSync(0, "utf8").trim();
-    if (raw.length === 0) return {};
-    const parsed: unknown = JSON.parse(raw);
-    return parsed !== null && typeof parsed === "object" ? parsed as HookInput : {};
-  } catch {
-    return {};
-  }
-}
 
 function loadConfig(): { turn_threshold: number; min_minutes_between: number } {
   const fallback = { turn_threshold: 8, min_minutes_between: 30 };
@@ -101,9 +92,8 @@ function loadState(): ReviewState {
       turn_count_since_last_review: typeof raw.turn_count_since_last_review === "number" ? raw.turn_count_since_last_review : 0,
       last_review_at: typeof raw.last_review_at === "string" ? raw.last_review_at : null,
       last_message_at: typeof raw.last_message_at === "string" ? raw.last_message_at : null,
-      pending_review: raw.pending_review === true,
+      pending_review: false,
       schema_version: 1,
-      sessions: raw.sessions && typeof raw.sessions === "object" ? raw.sessions : {},
     };
   } catch {
     return { ...INITIAL_STATE };
@@ -112,20 +102,82 @@ function loadState(): ReviewState {
 
 function saveState(state: ReviewState): void {
   mkdirSync(dirname(STATE_PATH), { recursive: true });
-  const temporary = pathResolve(dirname(STATE_PATH), `.${randomUUID()}.uai-tmp`);
-  let descriptor: number | undefined;
+  const tmp = `${STATE_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf8");
+  renameSync(tmp, STATE_PATH);
+}
+
+// ── Per-session cadence state (public issue #1711, @jacobo-ortiz) ────────────
+
+interface SessionReviewState {
+  turn_count_since_last_review: number;
+  last_review_at: string | null;
+  last_message_at: string | null;
+  schema_version: 1;
+}
+
+/**
+ * Same sanitiser as hooks/MemoryTurnStart.hook.ts so both per-session stores
+ * key off an identical filename for a given session.
+ *
+ * A null session_id (no stdin, or unparseable) degrades to one shared "unknown"
+ * bucket — i.e. exactly the pre-fix global behaviour, which is the right
+ * fallback: it never fires more often than the old code did.
+ */
+function sessionStatePath(sessionId: string | null): string {
+  const safe = (sessionId ?? "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
+  return join(SESSION_STATE_DIR, `${safe}.json`);
+}
+
+function loadSessionState(sessionId: string | null): SessionReviewState {
+  const empty: SessionReviewState = {
+    turn_count_since_last_review: 0,
+    last_review_at: null,
+    last_message_at: null,
+    schema_version: 1,
+  };
   try {
-    descriptor = openSync(temporary, "wx", 0o600);
-    writeFileSync(descriptor, JSON.stringify(state, null, 2) + "\n", "utf8");
-    fsyncSync(descriptor);
-    closeSync(descriptor);
-    descriptor = undefined;
-    renameSync(temporary, STATE_PATH);
-  } catch (error) {
-    if (descriptor !== undefined) try { closeSync(descriptor); } catch { /* best effort */ }
-    try { unlinkSync(temporary); } catch { /* only our temporary */ }
-    throw error;
+    const p = sessionStatePath(sessionId);
+    if (!existsSync(p)) return empty;
+    const raw = JSON.parse(readFileSync(p, "utf8"));
+    return {
+      turn_count_since_last_review:
+        typeof raw.turn_count_since_last_review === "number" ? raw.turn_count_since_last_review : 0,
+      last_review_at: typeof raw.last_review_at === "string" ? raw.last_review_at : null,
+      last_message_at: typeof raw.last_message_at === "string" ? raw.last_message_at : null,
+      schema_version: 1,
+    };
+  } catch {
+    return empty;
   }
+}
+
+function saveSessionState(sessionId: string | null, state: SessionReviewState): void {
+  const p = sessionStatePath(sessionId);
+  mkdirSync(dirname(p), { recursive: true });
+  const tmp = `${p}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf8");
+  renameSync(tmp, p);
+}
+
+/**
+ * Drop per-session files untouched for SESSION_STATE_TTL_MS. Called only when a
+ * review actually fires — rare enough to keep Stop cheap, frequent enough that
+ * the directory cannot grow without bound. Never removes the current session's
+ * file, and never throws.
+ */
+function pruneSessionStates(currentPath: string, nowMs: number): void {
+  try {
+    if (!existsSync(SESSION_STATE_DIR)) return;
+    for (const name of readdirSync(SESSION_STATE_DIR)) {
+      if (!name.endsWith(".json")) continue;
+      const p = join(SESSION_STATE_DIR, name);
+      if (p === currentPath) continue;
+      try {
+        if (nowMs - statSync(p).mtimeMs > SESSION_STATE_TTL_MS) unlinkSync(p);
+      } catch { /* skip this file */ }
+    }
+  } catch { /* best-effort */ }
 }
 
 function minutesSince(iso: string | null, nowMs: number): number {
@@ -135,14 +187,6 @@ function minutesSince(iso: string | null, nowMs: number): number {
   return Math.max(0, (nowMs - t) / 60_000);
 }
 
-function isSubagent(): boolean {
-  return Boolean(
-    process.env.CLAUDE_CODE_SUBAGENT_NAME ||
-    process.env.CLAUDE_CODE_SUBAGENT_TYPE ||
-    process.env.CLAUDE_AGENT_SDK === "1",
-  );
-}
-
 function logFire(payload: Record<string, unknown>): void {
   try {
     mkdirSync(dirname(FIRE_LOG_PATH), { recursive: true });
@@ -150,37 +194,34 @@ function logFire(payload: Record<string, unknown>): void {
   } catch { /* best-effort */ }
 }
 
-export function reviewerArgs(turnsReviewed: number, transcriptPath?: string): string[] {
-  const args = [REVIEWER_PATH, "review", "--turns", String(turnsReviewed)];
-  if (transcriptPath && transcriptPath.trim().length > 0) args.push("--input", transcriptPath);
-  return args;
-}
-
-function runReviewer(turnsReviewed: number, transcriptPath?: string): { completed: boolean; reason: string } {
-  if (!existsSync(REVIEWER_PATH)) {
-    return { completed: false, reason: "reviewer-not-found" };
-  }
-  const env = { ...process.env };
-  delete env.ANTHROPIC_API_KEY;
-  delete env.ANTHROPIC_AUTH_TOKEN;
-  delete env.CLAUDECODE;
-  const timeout = Number(process.env.LIFEOS_REVIEW_TIMEOUT_MS ?? 130_000);
+/**
+ * Claude Code hands every Stop hook a JSON payload on stdin carrying
+ * session_id and transcript_path — the identity of the session that just
+ * fired. Read it so the reviewer analyzes THIS session's transcript instead
+ * of guessing via globally-newest-mtime, which grabs a concurrent session's
+ * transcript whenever two sessions overlap (public issue #1495, @christauff).
+ */
+function readHookInput(): { sessionId: string | null; transcriptPath: string | null } {
   try {
-    const result = spawnSync(process.execPath, reviewerArgs(turnsReviewed, transcriptPath), {
-      env,
-      stdio: "ignore",
-      windowsHide: true,
-      timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : 130_000,
-    });
-    if (result.error) return { completed: false, reason: `spawn-failed: ${result.error.message}` };
-    if (result.status !== 0) return { completed: false, reason: `reviewer-exit-${result.status ?? "signal"}${result.signal ? `-${result.signal}` : ""}` };
-    return { completed: true, reason: "completed" };
-  } catch (error) {
-    return { completed: false, reason: `spawn-failed: ${(error as Error)?.message || String(error)}` };
+    const raw = readFileSync(0, "utf8");
+    if (!raw.trim()) return { sessionId: null, transcriptPath: null };
+    const j = JSON.parse(raw);
+    return {
+      sessionId: typeof j.session_id === "string" ? j.session_id : null,
+      transcriptPath: typeof j.transcript_path === "string" ? j.transcript_path : null,
+    };
+  } catch {
+    return { sessionId: null, transcriptPath: null };
   }
 }
 
 const REVIEW_LEASE_MS = 5 * 60_000;
+
+export function reviewerArgs(turnsReviewed: number, transcriptPath?: string): string[] {
+  const args = [REVIEWER_PATH, "review", "--turns", String(turnsReviewed)];
+  if (transcriptPath?.trim()) args.push("--input", transcriptPath);
+  return args;
+}
 
 export function reviewLockIsStale(
   lock: { pid?: number; createdAt?: string },
@@ -192,158 +233,71 @@ export function reviewLockIsStale(
   return Number.isFinite(leaseStartedAt) && nowMs - leaseStartedAt > REVIEW_LEASE_MS;
 }
 
-function acquireStateLock(timeoutMs = 5000): () => void {
-  mkdirSync(dirname(STATE_LOCK_PATH), { recursive: true });
-  const startedAt = Date.now();
-  const owner = `${process.pid}:${randomUUID()}`;
-  while (true) {
-    try {
-      const fd = openSync(STATE_LOCK_PATH, "wx");
-      writeFileSync(fd, JSON.stringify({ owner, pid: process.pid, createdAt: new Date().toISOString() }) + "\n", "utf8");
-      return () => {
-        closeSync(fd);
-        if (!existsSync(STATE_LOCK_PATH)) throw new Error("memory review state lock disappeared before release");
-        const current = JSON.parse(readFileSync(STATE_LOCK_PATH, "utf8")) as { owner?: string };
-        if (current.owner !== owner) throw new Error("memory review state lock ownership changed");
-        unlinkSync(STATE_LOCK_PATH);
-      };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      const possibleWindowsContention = process.platform === "win32" && (code === "EPERM" || code === "EACCES");
-      if (code !== "EEXIST" && !possibleWindowsContention) throw error;
-      let rawLock: string;
-      let lockMtimeMs: number;
-      try {
-        rawLock = readFileSync(STATE_LOCK_PATH, "utf8");
-        lockMtimeMs = statSync(STATE_LOCK_PATH).mtimeMs;
-      } catch (observationError) {
-        if ((observationError as NodeJS.ErrnoException).code === "ENOENT") continue;
-        throw observationError;
-      }
-      let lock: { pid?: number; createdAt?: string } = {};
-      try {
-        lock = JSON.parse(rawLock) as { pid?: number; createdAt?: string };
-      } catch {
-        // Malformed metadata is recoverable only after the file's lease demonstrably expires.
-      }
-      if (reviewLockIsStale(lock, Date.now(), lockMtimeMs)) {
-        try {
-          unlinkSync(STATE_LOCK_PATH);
-        } catch (unlinkError) {
-          if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") throw unlinkError;
-        }
-        continue;
-      }
-      if (Date.now() - startedAt >= timeoutMs) throw new Error("memory review state lock timed out");
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-    }
+function spawnReviewer(turnsReviewed: number, transcriptPath: string | null): { spawned: boolean; reason: string } {
+  if (!existsSync(REVIEWER_PATH)) {
+    return { spawned: false, reason: "reviewer-not-found" };
+  }
+  try {
+    const env = { ...process.env };
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.CLAUDECODE;
+    const args = reviewerArgs(turnsReviewed, transcriptPath ?? undefined);
+    const proc = spawn("bun", args, {
+      env,
+      stdio: "ignore",
+      detached: true,
+    });
+    proc.unref();
+    return { spawned: true, reason: `pid=${proc.pid}` };
+  } catch (e) {
+    return { spawned: false, reason: `spawn-failed: ${(e as Error)?.message || String(e)}` };
   }
 }
 
-function reviewAttemptIsActive(attempt: ReviewAttempt | undefined): boolean {
-  if (!attempt) return false;
-  const startedAt = Date.parse(attempt.started_at);
-  return Number.isFinite(startedAt) && Date.now() - startedAt <= REVIEW_LEASE_MS;
-}
-
-function mirrorSessionState(state: ReviewState, scoped: Omit<ReviewState, "sessions">): void {
-  state.turn_count_since_last_review = scoped.turn_count_since_last_review;
-  state.last_message_at = scoped.last_message_at;
-  state.last_review_at = scoped.last_review_at;
-  state.pending_review = scoped.pending_review;
-}
-
-function main(): number {
-  let releaseStateLock: (() => void) | undefined;
+function main(): void {
   try {
-    if (isSubagent()) return 0;
-    const input = readHookInput();
-    const sessionId = input.uai_session_id || input.session_id || "unknown-session";
-    releaseStateLock = acquireStateLock();
+    if (isSubagent()) process.exit(0);
 
+    const { sessionId, transcriptPath } = readHookInput();
     const nowMs = Date.now();
     const now = new Date(nowMs).toISOString();
     const config = loadConfig();
-    const state = loadState();
-    const scoped = state.sessions?.[sessionId] ?? { ...INITIAL_STATE };
-    scoped.turn_count_since_last_review += 1;
-    scoped.last_message_at = now;
+    const global = loadState();
+    const session = loadSessionState(sessionId);
 
-    if (scoped.review_attempt && !reviewAttemptIsActive(scoped.review_attempt)) {
-      scoped.review_attempt = undefined;
-      scoped.pending_review = true;
-    }
+    // Tick THIS session only. A concurrent session's Stop no longer touches it.
+    session.turn_count_since_last_review += 1;
+    session.last_message_at = now;
+
+    // Turn threshold: per session (has this conversation moved enough?).
+    // Minute floor: global (the inference-volume guard across all sessions).
     const due =
-      !scoped.review_attempt &&
-      (
-        scoped.pending_review ||
-        (
-          scoped.turn_count_since_last_review >= config.turn_threshold &&
-          minutesSince(scoped.last_review_at, nowMs) >= config.min_minutes_between
-        )
-      );
-    const attempt: ReviewAttempt | undefined = due
-      ? {
-          id: randomUUID(),
-          pid: process.pid,
-          started_at: now,
-          turns_reviewed: scoped.turn_count_since_last_review,
-          ...(input.transcript_path ? { transcript_path: input.transcript_path } : {}),
-        }
-      : undefined;
-    if (attempt) {
-      scoped.pending_review = true;
-      scoped.review_attempt = attempt;
+      session.turn_count_since_last_review >= config.turn_threshold &&
+      minutesSince(global.last_review_at, nowMs) >= config.min_minutes_between;
+
+    if (due) {
+      const turnsReviewed = session.turn_count_since_last_review;
+      const { spawned, reason } = spawnReviewer(turnsReviewed, transcriptPath);
+      logFire({ ts: now, turns_since_last_review: turnsReviewed, spawned, reason, session_id: sessionId, transcript_path: transcriptPath });
+      session.turn_count_since_last_review = 0;
+      session.last_review_at = now;
+      global.last_review_at = now;
+      pruneSessionStates(sessionStatePath(sessionId), nowMs);
     }
 
-    state.sessions ??= {};
-    state.sessions[sessionId] = scoped;
-    mirrorSessionState(state, scoped);
-    saveState(state);
-    releaseStateLock();
-    releaseStateLock = undefined;
-    if (!attempt) return 0;
+    saveSessionState(sessionId, session);
 
-    const { completed, reason } = runReviewer(attempt.turns_reviewed, attempt.transcript_path);
-    const completedAt = new Date().toISOString();
-    logFire({
-      ts: completedAt,
-      session_id: sessionId,
-      native_session_id: input.native_session_id,
-      transcript_path: attempt.transcript_path,
-      turns_since_last_review: attempt.turns_reviewed,
-      completed,
-      reason,
-      attempt_id: attempt.id,
-    });
-
-    releaseStateLock = acquireStateLock();
-    const latest = loadState();
-    const latestScoped = latest.sessions?.[sessionId] ?? { ...INITIAL_STATE };
-    if (latestScoped.review_attempt?.id === attempt.id) {
-      latestScoped.review_attempt = undefined;
-      if (completed) {
-        latestScoped.turn_count_since_last_review = Math.max(
-          0,
-          latestScoped.turn_count_since_last_review - attempt.turns_reviewed,
-        );
-        latestScoped.last_review_at = completedAt;
-        latestScoped.pending_review = latestScoped.turn_count_since_last_review >= config.turn_threshold;
-      } else {
-        latestScoped.pending_review = true;
-      }
-      latest.sessions ??= {};
-      latest.sessions[sessionId] = latestScoped;
-      mirrorSessionState(latest, latestScoped);
-      saveState(latest);
-    }
-    return completed ? 0 : 1;
-  } catch (error) {
-    process.stderr.write(`MemoryReviewFire error: ${(error as Error)?.message || String(error)}\n`);
-    return 1;
-  } finally {
-    releaseStateLock?.();
+    // Mirror for the statusline / MemoryStatus / MemoryHealthCheck / Pulse.
+    // Schema is unchanged; the turn count reflects whichever session wrote last
+    // and is display-only, while last_review_at above is the real rate cap.
+    global.turn_count_since_last_review = session.turn_count_since_last_review;
+    global.last_message_at = now;
+    saveState(global);
+  } catch (e) {
+    process.stderr.write(`MemoryReviewFire error: ${(e as Error)?.message || String(e)}\n`);
   }
+  process.exit(0);
 }
 
-if (import.meta.main) process.exit(main());
+main();

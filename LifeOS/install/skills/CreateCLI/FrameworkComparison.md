@@ -82,7 +82,7 @@ main().catch(error => {
 - ✅ Type-safe with TypeScript interfaces
 - ✅ 300-400 lines total (easy to understand)
 - ✅ Fast development (no framework learning curve)
-- ✅ Proven pattern (llcli is production-ready)
+- ✅ Proven pattern (validated in production by the retired llcli, 2026-07-15)
 - ✅ Perfect for Bun runtime
 - ✅ Deterministic behavior
 
@@ -102,7 +102,7 @@ main().catch(error => {
 - ✅ Fast development priority
 
 ### Reference Implementation
-**Location:** `~/.claude/LIFEOS/TOOLS/llcli/llcli.ts` (327 lines)
+**Location:** retired 2026-07-15 (llcli was the Limitless CLI, deleted with that service; the pattern lives on in this doc)
 **Commands:** today, date, search
 **Pattern:** Exactly what this tier generates
 
@@ -422,7 +422,7 @@ JSON output + pipes > built-in table rendering.
 Run `--help` before declaring framework choice successful.
 
 ### 7. **Read Real Code**
-Study llcli, not just framework docs.
+Study a real shipped CLI in this codebase (any Tier 3 tool under `LIFEOS/TOOLS/`), not just framework docs.
 
 ### 8. **Benchmark Size**
 Check dist/ folder size. Tier 1 CLIs are <100 KB.
@@ -470,7 +470,7 @@ Check dist/ folder size. Tier 1 CLIs are <100 KB.
 ---
 
 **Sources:**
-- llcli production implementation (~/.claude/LIFEOS/TOOLS/llcli/)
+- llcli production implementation (retired 2026-07-15; pattern preserved in this doc)
 - Commander.js 12.x documentation
 - oclif core documentation
 - Perplexity research (32 sub-queries on CLI frameworks)

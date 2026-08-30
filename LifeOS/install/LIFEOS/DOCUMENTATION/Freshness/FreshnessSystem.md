@@ -1,5 +1,5 @@
 ---
-version: 1.2.3
+version: 1.3.2
 ---
 
 # Freshness System
@@ -117,6 +117,10 @@ export function aggregateGrade(grades: FreshnessGrade[]): FreshnessGrade;
 // Registry
 export const CONTEXT_FRESHNESS_REGISTRY: ContextFile[];
 export const STALENESS_THRESHOLDS: Record<string, number>;
+
+// State-file surface (2026-08-11) — CURRENT_STATE/ + IDEAL_STATE/ dimension files
+export function stateFreshnessRegistry(): ContextFile[];   // dynamic glob; per-file `review_cadence:` fm overrides dir defaults (current 30d, ideal 90d); README/INDEX excluded
+export function readStateFreshness(): ContextFreshness;    // same shape as readContextFreshness, over the state registry
 ```
 
 The registry typed shape:
@@ -144,7 +148,7 @@ Thresholds reflect **review cadence, not change cadence**. The right question is
 | `projects` | 30d | Projects added/removed weekly |
 | `goals`, `strategies` (TELOS) | 30d | Active work needs monthly check-in |
 | `principal_identity` | 90d | Location, role can shift |
-| `pai_system_prompt` | 90d | Constitutional — quarterly review |
+| `lifeos_system_prompt` | 90d | Constitutional — quarterly review |
 | `mission`, `beliefs`, `models`, `frames`, `wisdom`, `ideal_state` (TELOS) | 90d | Slow-moving foundational |
 | `da_identity` | 180d | Voice, personality — changes rarely |
 | Preferences (books, bands, restaurants…) | 180d | Long-tail static |
@@ -212,9 +216,9 @@ Pulse remains the canonical reader for the dashboard; the cache file is the cano
 
 ## Interview integration
 
-`/interview` runs the **ContextCheckin** workflow at `~/.claude/skills/Interview/Workflows/ContextCheckin.md`. The workflow:
+`/interview` runs the **ContextCheckin** workflow at `~/.claude/skills/Interview/Workflows/ContextCheckin.md`. Since 2026-08-11 the interview is evidence-grounded: `StateEvidence.ts` caches observed data per domain (`USER/CACHE/state-evidence.json`), `InterviewDue.ts` computes a deterministic due-verdict (`USER/CACHE/interview-due.json`, refreshed daily by launchd `com.lifeos.interviewdue`, rendered as the 🎤 statusline chip), and the conversation opens with claim-vs-evidence contradictions. `InterviewDue.ts --mark-done` at wrap records completion (`MEMORY/STATE/interview.json`) and silences the chip. The workflow:
 
-1. Reads `readContextFreshness()` plus `readTelosFreshness()` for the per-section detail.
+1. Reads `readContextFreshness()` plus `readTelosFreshness()` for the per-section detail, plus `readStateFreshness()` for the dimension files, plus the evidence cache.
 2. Identifies stale files and stale TELOS sections, sorted most-stale-first.
 3. Opens with the most-stale item as the lead — referencing the actual content, not asking generic fill prompts.
 4. For derived files (PRINCIPAL_TELOS, ARCHITECTURE_SUMMARY), routes review questions to the source.
@@ -245,13 +249,51 @@ Pulse remains the canonical reader for the dashboard; the cache file is the cano
 
 ## Adjacent freshness system: memory hot-layer mtime cache
 
-The autonomic memory loop (2026-05-22, see `LIFEOS/DOCUMENTATION/Memory/MemorySystem.md`) uses a parallel but separate freshness mechanism for the per-turn context block. `LIFEOS/PULSE/modules/telegram.ts` `buildLifeosContextBlock()` mtime-caches the four constitutional files (DA_IDENTITY, PRINCIPAL_IDENTITY, PRINCIPAL_TELOS, PROJECTS) plus the two hot-layer memory files (`PRINCIPAL_MEMORY.md`, `DA_MEMORY.md`) for 60 seconds, re-reading whenever any per-file mtime changes. The 60s window is short enough to pick up an autonomic memory reviewer write within the same conversational burst, long enough to avoid re-reading on every prompt.
+The autonomic memory loop (2026-05-22, see `LIFEOS/DOCUMENTATION/Memory/MemorySystem.md`) uses a parallel but separate freshness mechanism for the per-turn context block. `LIFEOS/PULSE/lib/lifeos-context.ts` `buildLifeosContextBlock()` mtime-caches the four constitutional files (DA_IDENTITY, PRINCIPAL_IDENTITY, PRINCIPAL_TELOS, PROJECTS) plus the two hot-layer memory files (`PRINCIPAL_MEMORY.md`, `DA_MEMORY.md`) for 60 seconds, re-reading whenever any per-file mtime changes. The 60s window is short enough to pick up an autonomic memory reviewer write within the same conversational burst, long enough to avoid re-reading on every prompt.
 
 This is structurally distinct from the freshness cache documented above:
 - **This file's cache** (`LIFEOS/USER/CACHE/freshness.json`) backs the statusline FRESH line and `/api/freshness/summary`. Driven by `bump*` events + Pulse `invalidate()` + SessionStart hook. Schema = full A-F grade output.
 - **Memory hot-layer mtime cache** (in-process, per-Pulse-process) backs the per-turn context injection. Driven by file-system mtime checks. Schema = file content strings.
 
 They share neither code nor data store; they're parallel solutions to the "context drift" problem at different scopes (session-spanning user review cadence vs. intra-session memory write propagation).
+
+## Examples
+
+### One file aging past its window
+
+The whole convention in miniature: **the projects file was last reviewed 40 days ago, and its review threshold is 30 days.**
+
+Nothing about the file changed. It just aged. But because the A-F grade is computed from *review age*, not write age, the file now reads **F** on the statusline FRESH line. That F is the only reason anyone notices it drifted — a 6-month-old registry and one reviewed yesterday look byte-for-byte the same until the grade separates them.
+
+Running `/interview` leads with that file, referencing its actual contents. The principal confirms the entries are still current (or edits them), and the workflow calls `bumpReviewedTimestamp` — which writes a fresh `last_reviewed`. The grade snaps back to **A**, and the clock starts again.
+
+### The trap the two-timestamp split exists to prevent
+
+Now suppose a migration rewrites that same file's bytes — reformats the frontmatter, say — and bumps `last_updated`. The grade **stays F**, correctly.
+
+"Bytes changed" is not "a human looked." Only a real review resets the freshness clock, so only `bumpReviewedTimestamp` moves the grade. If the migration had bumped `last_reviewed` instead, the file would show a confident **A** while no one had actually read it in months — the signal would quietly become a lie. This is why the system splits the two timestamps: migrations and auto-generators touch `last_updated`; only principal review touches `last_reviewed`.
+
+The rule of thumb: **`last_updated` answers "when did the bytes last change?"; `last_reviewed` answers "when did a human last vouch for the content?" — and only the second one drives the grade.**
+
+```mermaid
+stateDiagram-v2
+    [*] --> A: principal reviews (last_reviewed set)
+    A --> B: aged past 25% of window
+    B --> C: aged past 50%
+    C --> D: aged past 75%
+    D --> F: aged past the threshold (overdue)
+    D --> A: reviewed early
+    F --> A: /interview review, bumpReviewedTimestamp
+    note right of F
+        A byte-only write (migration, generator)
+        bumps last_updated, NOT last_reviewed —
+        the grade does not move.
+    end note
+```
+
+The diagram is the file's whole life: the grade decays as the file ages toward its threshold, and the *only* edge that resets it is a real review. Every other kind of write leaves the grade exactly where it was — which is what keeps the signal honest.
+
+---
 
 ## Cross-references
 
@@ -266,4 +308,3 @@ They share neither code nor data store; they're parallel solutions to the "conte
 - Interview workflow: `skills/Interview/Workflows/ContextCheckin.md`
 - Generator (TELOS summary): `LIFEOS/TOOLS/GenerateTelosSummary.ts`
 - Generator (architecture summary): `LIFEOS/TOOLS/ArchitectureSummaryGenerator.ts`
-- ISA: `LIFEOS/MEMORY/WORK/20260504-statusline-freshness-cache/ISA.md`

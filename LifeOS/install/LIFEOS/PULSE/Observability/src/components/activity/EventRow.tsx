@@ -77,8 +77,6 @@ const AGENT_HEX: Record<string, string> = {
   "perplexity-researcher": "#EAB308",
   "claude-researcher": "#EAB308",
   "gemini-researcher": "#EAB308",
-  "grok-researcher": "#EAB308",
-  qatester: "#EAB308",
   main: "#3B82F6",
   da: "#3B82F6",
   pai: "#3B82F6",
@@ -138,12 +136,31 @@ const EVENT_TYPE_LABELS: Record<string, string> = {
 
 function formatTime(timestamp?: number): string {
   if (!timestamp) return "";
-  return new Date(timestamp).toLocaleTimeString("en-GB", {
+  const d = new Date(timestamp);
+  const time = d.toLocaleTimeString("en-GB", {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
   });
+  // Prepend the date when the event is not from today, so cross-day events
+  // stay unambiguous in the Time column. public PR #1628, @elhoim
+  const now = new Date();
+  const isToday =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (isToday) return time;
+  // Non-today: zero-padded day + 3-letter month (e.g. "03 Jul"). Across a year
+  // boundary, also show the year (e.g. "31 Dec 2025 07:31:22").
+  const sameYear = d.getFullYear() === now.getFullYear();
+  const date = d.toLocaleDateString(
+    "en-GB",
+    sameYear
+      ? { day: "2-digit", month: "short" }
+      : { day: "2-digit", month: "short", year: "numeric" },
+  );
+  return `${date} ${time}`;
 }
 
 function getToolInfo(event: HookEvent): { tool: string; detail?: string } | null {
@@ -270,6 +287,7 @@ export default function EventRow({ event }: EventRowProps) {
                 )}
                 {toolInfo.detail && (
                   <span
+                    data-sensitive
                     className="text-base truncate flex-1 min-w-0"
                     style={{
                       fontFamily:
@@ -293,7 +311,7 @@ export default function EventRow({ event }: EventRowProps) {
 
             {/* Summary */}
             {event.summary && (
-              <span className="inline-flex items-center gap-1.5 text-xs text-white font-medium px-2.5 py-1 bg-blue-500/10 rounded-lg min-w-0 max-w-sm">
+              <span className="inline-flex items-center gap-1.5 text-xs text-white font-medium px-2.5 py-1 bg-blue-500/10 rounded-lg min-w-0 max-w-sm" data-sensitive>
                 <FileText size={11} strokeWidth={2} className="text-blue-400 shrink-0" />
                 <span className="truncate">{event.summary}</span>
               </span>
@@ -326,7 +344,7 @@ export default function EventRow({ event }: EventRowProps) {
                   {copyText}
                 </button>
               </div>
-              <pre className="text-sm text-white bg-black/20 p-3 rounded-xl overflow-x-auto max-h-64 overflow-y-auto font-mono">
+              <pre className="text-sm text-white bg-black/20 p-3 rounded-xl overflow-x-auto max-h-64 overflow-y-auto font-mono" data-sensitive>
                 {JSON.stringify(event.payload, null, 2)}
               </pre>
             </div>

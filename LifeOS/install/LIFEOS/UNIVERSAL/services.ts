@@ -25,6 +25,41 @@ export function planService(input: { os: RuntimeOs; headless: boolean; managers:
   return { backend: "unsupported", supported: false, dryRun: true, losses: ["no supported service or foreground platform"] };
 }
 
+export interface WindowsScheduledTaskPlan {
+  executable: "schtasks.exe";
+  taskName: string;
+  commandLine: string;
+  createArgs: string[];
+  deleteArgs: string[];
+  queryArgs: string[];
+}
+
+function quoteWindowsCommandArgument(value: string): string {
+  if (!/[\s"]/u.test(value)) return value;
+  return '"' + value.replaceAll('"', '\\"') + '"';
+}
+
+export function planWindowsScheduledTask(input: {
+  taskName: string;
+  executable: string;
+  args?: readonly string[];
+  intervalSeconds: number;
+}): WindowsScheduledTaskPlan {
+  if (!input.taskName.trim()) throw new Error("Windows scheduled task name is required");
+  if (!input.executable.trim()) throw new Error("Windows scheduled task executable is required");
+  if (!Number.isFinite(input.intervalSeconds) || input.intervalSeconds <= 0) throw new Error("Windows scheduled task interval must be positive");
+  const everyMinutes = Math.max(1, Math.ceil(input.intervalSeconds / 60));
+  const commandLine = [input.executable, ...(input.args ?? [])].map(quoteWindowsCommandArgument).join(" ");
+  return {
+    executable: "schtasks.exe",
+    taskName: input.taskName,
+    commandLine,
+    createArgs: ["/Create", "/TN", input.taskName, "/SC", "MINUTE", "/MO", String(everyMinutes), "/TR", commandLine, "/F"],
+    deleteArgs: ["/Delete", "/TN", input.taskName, "/F"],
+    queryArgs: ["/Query", "/TN", input.taskName, "/FO", "LIST"],
+  };
+}
+
 export function pulseCapability(plan: ServicePlan, input: { healthUri?: string; audioObserved?: boolean; notificationsObserved?: boolean }): PulseCapability {
   return {
     mode: plan.backend === "unsupported" ? "unsupported" : plan.backend === "foreground" ? "foreground" : "service",

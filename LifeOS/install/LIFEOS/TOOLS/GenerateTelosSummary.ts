@@ -18,6 +18,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { paiUserDir } from './LifeosConfig';
+import { homedir } from "node:os";
 
 const TELOS_DIR = join(paiUserDir(), 'TELOS');
 const OUTPUT_PATH = join(TELOS_DIR, 'PRINCIPAL_TELOS.md');
@@ -45,6 +46,7 @@ const LEGACY_FILE_TO_SECTION: Record<string, string> = {
   'GOALS.md':      'goals',
   'PROBLEMS.md':   'problems',
   'STRATEGIES.md': 'strategies',
+  'PROJECTS.md':   'projects',
   'CHALLENGES.md': 'challenges',
   'NARRATIVES.md': 'narratives',
   'TRAUMAS.md':    'traumas',
@@ -88,17 +90,94 @@ function loadTelosSections(): Record<string, string> {
   return sections;
 }
 
-function readTelosFile(filename: string): string {
-  // Legacy per-file path first (back-compat), then unified-TELOS section.
-  const path = join(TELOS_DIR, filename);
-  if (existsSync(path)) return readFileSync(path, 'utf-8');
-  const sectionKey = LEGACY_FILE_TO_SECTION[filename];
-  if (sectionKey) {
-    const sections = loadTelosSections();
-    return sections[sectionKey] ?? '';
-  }
-  return '';
+/**
+ * Does this source text carry the principal's own content, or only shipped
+ * template scaffolding? A block is a placeholder when every one of its lines
+ * carries the `(sample` marker parseItems()/paragraphItems() already filter on;
+ * a line is scaffolding when it is a horizontal rule, a heading that carries no
+ * item ID (an ID'd heading like "### M0: …" IS content), or a wholly
+ * emphasis-wrapped line — the *…* footnote every shipped template closes with.
+ * That footnote matters: it sits after the file's last H2, so loadTelosSections()
+ * attaches it to that section's body, and without this it would let a sample-only
+ * final section outrank a populated legacy file.
+ * public PR #1809, @0bsolescence
+ */
+function hasRealContent(text: string): boolean {
+  const isSample = (l: string) => /\(sample\b/i.test(l);
+  const isStructural = (l: string) =>
+    /^-{3,}$/.test(l) ||
+    (/^#{1,6}\s/.test(l) && !/^#{1,6}\s+[A-Z]+\d+\w?:/.test(l)) ||
+    /^[*_].*[*_]$/.test(l);
+  return text
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .split(/\n\s*\n/)
+    .some(block => {
+      const lines = block.split('\n').map(l => l.trim()).filter(Boolean);
+      if (lines.length === 0 || lines.every(isSample)) return false;
+      return lines.some(l => !isSample(l) && !isStructural(l));
+    });
 }
+
+function readTelosFile(filename: string): string {
+  // Unified-TELOS section first, legacy per-file path as the fallback.
+  // TELOS.md is the single source of truth as of 2026-05-01, so a section
+  // carrying real content has to WIN over the legacy file rather than lose to
+  // it: ScaffoldUser copies the legacy sample stubs into every fresh install,
+  // so reading the file first meant those stubs permanently shadowed a
+  // populated TELOS.md and the summary rendered template data. Back-compat is
+  // intact — an absent, empty, or still-sample-only unified section falls
+  // through to the legacy file exactly as before.
+  // public PR #1809, @0bsolescence
+  //
+  // Plural fallback (public issue #1517, @christauff): TELOS.md is
+  // hand-authored, and "## MISSIONS" (plural) keyed as 'missions' silently
+  // missed the singular 'mission' lookup — the section rendered empty and
+  // the fail-loud guard below couldn't see it (same lookup, same miss).
+  const sectionKey = LEGACY_FILE_TO_SECTION[filename];
+  const sections = sectionKey ? loadTelosSections() : {};
+  const unified = sectionKey ? (sections[sectionKey] ?? sections[sectionKey + 's'] ?? '') : '';
+  if (hasRealContent(unified)) return unified;
+  // Legacy per-file path. Strip leading YAML frontmatter (public issue #1496):
+  // in files with no ID-form items, paragraphItems() otherwise swallows the
+  // frontmatter block as a garbage first entry (e.g. "M0: --- provenance: ...").
+  const path = join(TELOS_DIR, filename);
+  if (existsSync(path)) {
+    return readFileSync(path, 'utf-8').replace(/^---\n[\s\S]*?\n---\n?/, '');
+  }
+  return unified;
+}
+
+// Placeholder filtering is suppressed for exactly one caller: the per-section
+// fail-loud guard in generate() re-runs each section's parse sample-blind, which
+// is how it tells a fresh still-templated install (items exist, all of them
+// placeholders) apart from real format drift (nothing parses at all).
+// public issue #1815, @tzioup
+let INCLUDE_SAMPLES = false;
+function withSamples<T>(fn: () => T): T {
+  INCLUDE_SAMPLES = true;
+  try { return fn(); } finally { INCLUDE_SAMPLES = false; }
+}
+
+// The single placeholder test every parse path must route through. Shipped
+// template text must never reach PRINCIPAL_TELOS.md, which is @-imported every
+// session — and each path that rolled its own bullet scan instead of calling
+// parseItems()/paragraphItems() silently skipped the filter.
+// public issue #1815, @tzioup (adjacent: sample text leaked through the
+// plain-bullet and wisdom paths)
+const isPlaceholder = (text: string) => !INCLUDE_SAMPLES && /\(sample\b/i.test(text);
+
+// Markdown scaffolding no parse path may turn into an item: horizontal rules,
+// headings, blockquote callouts (every shipped template writes its guidance
+// banner as `>`), and the emphasis-wrapped footnote each template closes with.
+// Filtering `(sample` alone was not enough — with the placeholders gone, the
+// surrounding template guidance became the parsed content instead.
+// public issue #1815, @tzioup (adjacent: sample text leaked through the
+// plain-bullet and wisdom paths)
+const isScaffolding = (line: string): boolean => {
+  const l = line.trim();
+  return l === '' || /^-{3,}$/.test(l) || l.startsWith('>') ||
+    /^#{1,6}\s/.test(l) || /^[*_].*[*_]$/.test(l);
+};
 
 /**
  * Parse items in format "- **ID**: text", "- ID: text", or H3 heading "### ID: text".
@@ -126,12 +205,33 @@ function parseItems(content: string, fallbackPrefix?: string): ParsedItem[] {
       items.push({ id: heading[1], text: heading[2].trim() });
     }
   }
+  // H2 heading form with body: "## M0: title" followed by prose until the next
+  // heading (public issue #1538, @waveman2020-sudo). Line-based matching alone
+  // dropped the ID'd heading and let its multi-paragraph body fall through to
+  // the positional-prose fallback, silently fragmenting one entry into fake
+  // sequential items. Runs only when no bullet/H3 items matched, so existing
+  // formats keep byte-identical output; explicit IDs still win over prose.
+  if (items.length === 0) {
+    const h2Re = /^#{2}\s+([A-Z]+\d+\w?):\s*(.+)$/;
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(h2Re);
+      if (!m) continue;
+      const body: string[] = [];
+      for (let j = i + 1; j < lines.length && !/^#{2,3}\s/.test(lines[j]); j++) body.push(lines[j]);
+      const bodyText = body.join(' ').replace(/<!--[\s\S]*?-->/g, '').replace(/\s+/g, ' ').trim();
+      items.push({ id: m[1], text: bodyText ? `${m[2].trim()} — ${bodyText}` : m[2].trim() });
+    }
+  }
   // Fallback: ID-less prose (2026-06-08 TELOS rewrite). Explicit IDs always win;
   // this path only runs when zero ID-form items matched.
   if (items.length === 0 && fallbackPrefix) {
     return paragraphItems(content, fallbackPrefix);
   }
-  return items;
+  // Shipped-template placeholder text must never render as the principal's real
+  // content — PRINCIPAL_TELOS.md is @-imported every session (public issue #1528, @vichong).
+  // \b not literal ")": templates also write "(sample — …)" variants, which the
+  // literal match let through into fresh installs (public issue #1671, @catchingknives).
+  return items.filter(item => !isPlaceholder(item.text));
 }
 
 /**
@@ -140,11 +240,41 @@ function parseItems(content: string, fallbackPrefix?: string): ParsedItem[] {
  * acceptable; the source format carries no stable IDs to preserve.
  */
 function paragraphItems(content: string, prefix: string): ParsedItem[] {
+  // Strip HTML comments before paragraphing (issue #1472). The unified TELOS
+  // format requires an `<!-- updated: … -->` freshness marker after every H2;
+  // without this strip the marker survives as its own paragraph and, because
+  // downstream truncates to the first N items, EVICTS a real entry.
   return content
+    .replace(/<!--[\s\S]*?-->/g, '')
     .split(/\n\s*\n/)
     .map(p => p.trim())
     .filter(p => p.length > 0 && !/^-{3,}$/.test(p) && !p.startsWith('#'))
+    // A paragraph made entirely of scaffolding is layout, not an entry. Added
+    // alongside the two tests above rather than replacing them, so this can only
+    // ever drop more, never admit something they used to reject.
+    // public issue #1815, @tzioup (adjacent: sample text leaked through the
+    // plain-bullet and wisdom paths)
+    .filter(p => !p.split('\n').every(isScaffolding))
+    // Skip shipped-template placeholder paragraphs (public issue #1528, @vichong;
+    // \b for "(sample — …)" variants, public issue #1671, @catchingknives)
+    .filter(p => !isPlaceholder(p))
     .map((p, i) => ({ id: `${prefix}${i}`, text: p.replace(/\s*\n\s*/g, ' ').replace(/^-\s+/, '').trim() }));
+}
+
+/**
+ * The principal's own Context Filter, read from the unified TELOS.md
+ * "## Context Filter" section. The hardcoded line at the call site is a
+ * fallback for a TELOS.md that defines no such section — without this, one
+ * person's value statement shipped as every install's steering filter.
+ * public PR #1808, @0bsolescence
+ */
+function readContextFilter(): string {
+  return (loadTelosSections()['context filter'] ?? '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .split('\n')
+    .filter(l => !/\(sample\b/i.test(l))
+    .join('\n')
+    .trim();
 }
 
 /**
@@ -177,7 +307,12 @@ function parseGoals(): { active: string[]; deferred: string[]; completed: string
     if (h.includes('active')) return 'active';
     if (h.includes('deferred') || h.includes('ongoing')) return 'deferred';
     if (h.includes('completed') || h.includes('done')) return 'completed';
-    return null; // unrecognized heading (e.g. "## Notes") — not goal content
+    // Explicit skip: a "## Notes"/"## Note" block is genuinely not goal content.
+    if (h.includes('note')) return null;
+    // Any other unrecognized heading (e.g. "## Detail") is treated as active
+    // goal content — never silently discarded (issue #1473). Dropping real
+    // goals under a natural heading is worse than over-including a stray line.
+    return 'active';
   };
 
   const sectionLines: Record<Bucket, string[]> = { active: [], deferred: [], completed: [] };
@@ -198,11 +333,23 @@ function parseGoals(): { active: string[]; deferred: string[]; completed: string
     const text = lines.join('\n');
     const withIds = parseItems(text);
     if (withIds.length > 0) return withIds;
+    // isPlaceholder here, not just in parseItems: when every ID'd goal is a
+    // template sample, parseItems() correctly returns zero and this plain-bullet
+    // path re-collected the very same lines unfiltered, so the shipped samples
+    // landed in the summary wearing fresh positional IDs.
+    //
+    // The prose fallback is keyed on the PRE-filter bullet count, matching the
+    // order parseItems() already uses. Deciding it on the filtered count means a
+    // wholly-sample bullet list falls through to the template's own guidance
+    // prose, which is a worse leak than the samples were.
+    // public issue #1815, @tzioup (adjacent: sample text leaked through the
+    // plain-bullet and wisdom paths)
     const bullets = lines
       .map(l => l.match(/^-\s+(.+)$/))
-      .filter((m): m is RegExpMatchArray => m !== null)
-      .map(m => ({ id: '', text: m[1].trim() }));
-    if (bullets.length > 0) return bullets;
+      .filter((m): m is RegExpMatchArray => m !== null);
+    if (bullets.length > 0) {
+      return bullets.filter(m => !isPlaceholder(m[1])).map(m => ({ id: '', text: m[1].trim() }));
+    }
     return paragraphItems(text, '').map(i => ({ id: '', text: i.text }));
   };
 
@@ -212,7 +359,17 @@ function parseGoals(): { active: string[]; deferred: string[]; completed: string
     completed: parseBucket(sectionLines.completed),
   };
 
+  // Seed the positional counter ABOVE the highest explicit G<n> anywhere in the
+  // parsed buckets — a counter starting at 0 could re-issue an ID an explicit entry
+  // already owns in another bucket, corrupting the session-imported summary
+  // (public issue #1529, @vichong). ID-less files are unaffected (seed stays 0).
   let idx = 0;
+  for (const bucket of Object.values(parsed)) {
+    for (const item of bucket) {
+      const explicit = item.id.match(/^G(\d+)$/);
+      if (explicit) idx = Math.max(idx, Number(explicit[1]) + 1);
+    }
+  }
   const format = (items: ParsedItem[], max: number): string[] =>
     items.map(item => {
       const id = item.id || `G${idx}`;
@@ -237,7 +394,12 @@ function parseProblems(): string[] {
   const lines: string[] = [];
 
   // Format: ## P0: Title (optional parenthetical)
-  const headers = [...content.matchAll(/^##\s+(P\d+):\s*(.+?)(?:\s*\(.*\))?\s*$/gm)];
+  // isPlaceholder on the whole matched line: the trailing-parenthetical strip
+  // above would otherwise quietly launder "## P0: A problem (sample)" into a
+  // clean-looking entry. public issue #1815, @tzioup (adjacent: sample text
+  // leaked through the plain-bullet and wisdom paths)
+  const headers = [...content.matchAll(/^##\s+(P\d+):\s*(.+?)(?:\s*\(.*\))?\s*$/gm)]
+    .filter(m => !isPlaceholder(m[0]));
   for (const match of headers) {
     const title = match[2].trim();
     const short = title.length > 60 ? title.substring(0, 57) + '...' : title;
@@ -264,7 +426,10 @@ function parseStrategies(): string[] {
   const lines: string[] = [];
 
   // Extract strategy headers: ## S0: name or ### S1: name
-  const headers = [...content.matchAll(/^#{2,3}\s+(S\d+):\s*(.+?)(?:\s*\(.*\))?\s*$/gm)];
+  // Same parenthetical-laundering gap as parseProblems — public issue #1815,
+  // @tzioup (adjacent: sample text leaked through the plain-bullet and wisdom paths)
+  const headers = [...content.matchAll(/^#{2,3}\s+(S\d+):\s*(.+?)(?:\s*\(.*\))?\s*$/gm)]
+    .filter(m => !isPlaceholder(m[0]));
   for (const match of headers) {
     const short = match[2].length > 60 ? match[2].substring(0, 57) + '...' : match[2];
     lines.push(`- **${match[1]}**: ${short}`);
@@ -278,6 +443,66 @@ function parseStrategies(): string[] {
   }
 
   return lines;
+}
+
+/**
+ * Parse projects from PROJECTS.md — the concrete work pursuing the strategies.
+ *
+ * Mirrors parseStrategies(): ID'd headers first, ID-less prose as the fallback.
+ * The section was authored in TELOS.md but had no parser and no entry in
+ * LEGACY_FILE_TO_SECTION, so it never reached the summary at all.
+ * public issue #1710, @PaulWaldo
+ *
+ * IDs use a PJ prefix: the summary already renders Problems as P0…Pn, and a
+ * second P-series in the same @-imported file would be ambiguous on sight.
+ */
+function parseProjects(): string[] {
+  const content = readTelosFile('PROJECTS.md');
+  const lines: string[] = [];
+
+  // Same parenthetical-laundering gap as parseProblems — public issue #1815,
+  // @tzioup (adjacent: sample text leaked through the plain-bullet and wisdom paths)
+  const headers = [...content.matchAll(/^#{2,3}\s+(PJ?\d+):\s*(.+?)(?:\s*\(.*\))?\s*$/gm)]
+    .filter(m => !isPlaceholder(m[0]));
+  for (const match of headers) {
+    lines.push(`- **${match[1]}**: ${truncate(match[2].trim(), 60)}`);
+  }
+
+  // Fallback: ID-less prose
+  if (lines.length === 0) {
+    for (const item of parseItems(content, 'PJ')) {
+      lines.push(`- **${item.id}**: ${truncate(item.text, 90)}`);
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * Parse WISDOM.md — lessons and aphorisms, rendered ID-less like WRONG.md.
+ * Quotes are referenced by their text, not by a number.
+ * public issue #1710, @PaulWaldo
+ */
+function parseWisdom(): string[] {
+  const content = readTelosFile('WISDOM.md');
+  // Own bullet scan, so it needs its own isPlaceholder call, and its own
+  // pre-filter fallback count — a wholly-sample bullet list must yield nothing
+  // rather than fall through to the template's guidance prose.
+  // public issue #1815, @tzioup (adjacent: sample text leaked through the
+  // plain-bullet and wisdom paths)
+  const bullets = content.split('\n')
+    .map(l => l.match(/^-\s+(.+)$/))
+    .filter((m): m is RegExpMatchArray => m !== null);
+  const out = bullets
+    .filter(m => !isPlaceholder(m[1]))
+    .map(m => `- ${truncate(m[1].trim(), 110)}`);
+  // Fallback: ID-less prose
+  if (bullets.length === 0) {
+    for (const item of paragraphItems(content, 'WI')) {
+      out.push(`- ${truncate(item.text, 110)}`);
+    }
+  }
+  return out;
 }
 
 /**
@@ -317,14 +542,16 @@ function parseChallenges(): string[] {
  */
 function parseWrong(): string[] {
   const content = readTelosFile('WRONG.md');
-  const lines = content.split('\n');
-  const out: string[] = [];
-  for (const line of lines) {
-    const m = line.match(/^-\s+(.+)$/);
-    if (m) out.push(`- ${truncate(m[1].trim(), 110)}`);
-  }
+  // Same own-bullet-scan gap as parseWisdom — public issue #1815, @tzioup
+  // (adjacent: sample text leaked through the plain-bullet and wisdom paths).
+  const bullets = content.split('\n')
+    .map(l => l.match(/^-\s+(.+)$/))
+    .filter((m): m is RegExpMatchArray => m !== null);
+  const out = bullets
+    .filter(m => !isPlaceholder(m[1]))
+    .map(m => `- ${truncate(m[1].trim(), 110)}`);
   // Fallback: ID-less prose
-  if (out.length === 0) {
+  if (bullets.length === 0) {
     for (const item of paragraphItems(content, 'W')) {
       out.push(`- ${truncate(item.text, 110)}`);
     }
@@ -370,7 +597,7 @@ function principalDisplayName(): string {
   }
   if (coreName) return coreName;
   try {
-    const settings = JSON.parse(readFileSync(join(process.env.HOME!, '.claude', 'settings.json'), 'utf-8'));
+    const settings = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf-8'));
     const name = settings?.principal?.name;
     if (typeof name === 'string' && name.trim() && !looksLikeToken(name)) return name.trim();
   } catch { /* no settings.json — fall through */ }
@@ -396,6 +623,8 @@ function generate(): string {
   const goals = parseGoals();
   const problems = parseProblems();
   const strategies = parseStrategies();
+  const projects = parseProjects();
+  const wisdom = parseWisdom();
   const narratives = parseNarratives();
   const challenges = parseChallenges();
   const wrong = parseWrong();
@@ -405,18 +634,49 @@ function generate(): string {
   // Per-section fail-loud guard: a core section whose SOURCE text is non-empty
   // but parses to zero items means the format drifted past the parser for that
   // section alone — the total-items guard in main() can't see a partial drop.
+  //
+  // The guard has to judge presence exactly the way the parser reads it, or it
+  // fires on installs that have nothing real to lose (public issue #1815,
+  // @tzioup). It used to read TELOS.md directly while the parse read whatever
+  // readTelosFile() resolved, and it never applied the parser's `(sample`
+  // filter — so a fresh, wholly-templated tree exited 1 before the user had any
+  // content at all. Same resolution now, and a sample-blind re-parse separates
+  // "only placeholders here" from "real content the parser can no longer see".
   const sections = loadTelosSections();
-  const coreChecks: Array<[string, string, number]> = [
-    ['mission', 'Missions', missions.length],
-    ['goals', 'Goals', goals.active.length + goals.deferred.length + goals.completed.length],
-    ['problems', 'Problems', problems.length],
-    ['strategies', 'Strategies', strategies.length],
-    ['challenges', 'Challenges', challenges.length],
+  const coreChecks: Array<[string, string, number, () => number]> = [
+    ['MISSION.md', 'Missions', missions.length, () => parseMissions().length],
+    ['GOALS.md', 'Goals', goals.active.length + goals.deferred.length + goals.completed.length,
+      () => { const g = parseGoals(); return g.active.length + g.deferred.length + g.completed.length; }],
+    ['PROBLEMS.md', 'Problems', problems.length, () => parseProblems().length],
+    ['STRATEGIES.md', 'Strategies', strategies.length, () => parseStrategies().length],
+    ['CHALLENGES.md', 'Challenges', challenges.length, () => parseChallenges().length],
   ];
-  for (const [key, label, count] of coreChecks) {
-    if ((sections[key] ?? '').trim().length > 0 && count === 0) {
-      console.error(`❌ TELOS section "${label}" has source content but parsed to zero items — refusing to write a summary that silently drops it.`);
-      process.exit(1);
+  for (const [filename, label, count, reparse] of coreChecks) {
+    if (count > 0) continue;
+    if (!readTelosFile(filename).trim()) continue;   // no source for this section at all
+    if (withSamples(reparse) > 0) continue;          // source is placeholders only
+    console.error(`❌ TELOS section "${label}" has source content but parsed to zero items — refusing to write a summary that silently drops it.`);
+    process.exit(1);
+  }
+
+  // Orphan-heading warning (public issue #1517, @christauff): the guard above
+  // resolves keys through the same lookup it guards, so a heading that drifts
+  // past LEGACY_FILE_TO_SECTION (e.g. "## NARRATIVES / PROBLEMS / MODELS"
+  // combined under one heading) is invisible to it — both miss, section drops
+  // silently. Detect drift from the content side: a non-empty heading no known
+  // key claims, but which CONTAINS a known section token, is almost certainly
+  // meant to be consumed. Warn, don't fail — headings that share no token with
+  // any known section (Ideas, Projects, Current State…) are legitimately
+  // consumed by other tools and stay silent.
+  const knownKeys = new Set(Object.values(LEGACY_FILE_TO_SECTION));
+  for (const [heading, body] of Object.entries(sections)) {
+    if (!body.trim()) continue;
+    const singular = heading.endsWith('s') ? heading.slice(0, -1) : heading;
+    if (knownKeys.has(heading) || knownKeys.has(singular)) continue;
+    const tokens = heading.split(/[^a-z]+/).filter(Boolean);
+    const hit = tokens.find(t => knownKeys.has(t) || knownKeys.has(t.replace(/s$/, '')));
+    if (hit) {
+      console.error(`⚠️  TELOS heading "${heading}" has content but matches no known section — its "${hit}" content will be missing from the summary. Known sections: ${[...knownKeys].join(', ')}.`);
     }
   }
 
@@ -432,7 +692,7 @@ function generate(): string {
     principalName ? `# Principal TELOS — ${principalName}` : '# Principal TELOS',
     '',
     '> Auto-generated from TELOS source files. Do not edit manually.',
-    `> Generated: ${now} | Sources: MISSION, GOALS, PROBLEMS, STRATEGIES, NARRATIVES, CHALLENGES, WRONG, TRAUMAS, MODELS`,
+    `> Generated: ${now} | Sources: MISSION, GOALS, PROBLEMS, STRATEGIES, PROJECTS, NARRATIVES, CHALLENGES, WRONG, TRAUMAS, MODELS, WISDOM`,
     '',
     '## Missions',
     '',
@@ -469,6 +729,15 @@ function generate(): string {
     '## Strategies',
     '',
     ...strategies,
+  );
+
+  // Conditional like Core Models: an unconditional empty section is the shape
+  // ContextAudit's empty-section check exists to catch (public issue #1559).
+  if (projects.length > 0) {
+    lines.push('', '## Active Projects', '', ...projects);
+  }
+
+  lines.push(
     '',
     '## Active Narratives',
     '',
@@ -494,15 +763,25 @@ function generate(): string {
     lines.push('', '## Things I\'ve Been Wrong About (Mistakes)', '', ...wrong);
   }
 
+  // Emit Core Models only when populated (public issue #1559, @tzioup): an
+  // unconditional empty section is exactly the shape ContextAudit's empty-
+  // section check exists to catch, and emitting it guaranteed a false-clean.
+  if (models.length > 0) {
+    lines.push('', '## Core Models', '', ...models);
+  }
+
+  if (wisdom.length > 0) {
+    lines.push('', '## Wisdom', '', ...wisdom);
+  }
+
   lines.push(
-    '',
-    '## Core Models',
-    '',
-    ...models,
     '',
     '## Context Filter',
     '',
-    'When steering work, bias toward: human flourishing, Human 3.0 transition, AI augmentation strategies, becoming one\'s full self, correct framing.',
+    // public PR #1808, @0bsolescence — the principal's own filter wins; the
+    // literal below only stands in when TELOS.md defines no such section.
+    readContextFilter() ||
+      'When steering work, bias toward: human flourishing, Human 3.0 transition, AI augmentation strategies, becoming one\'s full self, correct framing.',
   );
 
   return lines.join('\n') + '\n';
@@ -511,10 +790,29 @@ function generate(): string {
 // Main — fail-loud guard: never blank a populated summary. Zero parsed items
 // means the source format drifted beyond the parser; keep the existing file.
 const summary = generate();
-const itemLines = summary.split('\n').filter(l => l.startsWith('- ')).length;
+const countItems = (text: string) => text.split('\n').filter(l => l.startsWith('- ')).length;
+const itemLines = countItems(summary);
 if (itemLines === 0) {
-  console.error('❌ TELOS parse produced zero items — refusing to overwrite PRINCIPAL_TELOS.md. Fix the parser or the source format.');
-  process.exit(1);
+  // A fresh install legitimately parses to zero: every entry in the tree is
+  // still a shipped placeholder, and now that those are filtered out there is
+  // nothing left to render. Same test the per-section guard uses — if the
+  // sample-blind parse WOULD have produced items, no real content is being
+  // dropped and an empty summary is the correct output.
+  // public issue #1815, @tzioup (adjacent: sample text leaked through the
+  // plain-bullet and wisdom paths)
+  const realError = console.error;
+  console.error = () => {};   // the re-parse would duplicate every warning
+  let sampleBlind = 0;
+  try {
+    sampleBlind = countItems(withSamples(generate));
+  } finally {
+    console.error = realError;
+  }
+  if (sampleBlind === 0) {
+    console.error('❌ TELOS parse produced zero items — refusing to overwrite PRINCIPAL_TELOS.md. Fix the parser or the source format.');
+    process.exit(1);
+  }
+  console.error('ℹ️  TELOS sources are still shipped templates — writing an empty summary until they are filled in.');
 }
 writeFileSync(OUTPUT_PATH, summary);
 const lineCount = summary.split('\n').length;

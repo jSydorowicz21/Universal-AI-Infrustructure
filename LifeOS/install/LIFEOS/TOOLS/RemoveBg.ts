@@ -4,7 +4,9 @@
  * remove-bg - Background Removal CLI
  *
  * Remove backgrounds from images using local rembg.
- * Part of the Images skill for LifeOS system.
+ * Part of the Art skill for LifeOS system.
+ * (Images was retired and folded into Art — ported from public PR #1707
+ * (commit 1), @anikinsasha.)
  *
  * Usage:
  *   remove-bg input.png                    # Overwrites original
@@ -16,11 +18,13 @@ import { resolve, extname } from "node:path";
 import { existsSync } from "node:fs";
 import { unlink, stat, rename } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { homeDir } from "./lib/paths";
+import { homedir } from "node:os";
 
 function resolveRembgBin(): string {
   if (process.env.REMBG_BIN) return process.env.REMBG_BIN;
-  return resolve(homeDir(), ".local/bin/rembg");
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
+  if (!home) throw new Error("HOME not set; cannot resolve rembg binary");
+  return resolve(home, ".local/bin/rembg");
 }
 
 function showHelp(): void {
@@ -54,7 +58,7 @@ NOTES:
 
 function runRembg(bin: string, input: string, output: string): Promise<void> {
   return new Promise((resolveFn, rejectFn) => {
-    const proc = spawn(bin, ["i", input, output], { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    const proc = spawn(bin, ["i", input, output], { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
     proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     proc.on("error", (err) => rejectFn(new Error(`Failed to launch rembg: ${err.message}`)));

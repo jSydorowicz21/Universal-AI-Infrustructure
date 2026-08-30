@@ -5,7 +5,7 @@
 // zone must stay clean per LIFEOS/DOCUMENTATION/Tools/Containment.md.
 //
 // Consumed by two enforcement points:
-//   1. Release pipeline gates in skills/_LIFEOS/Tools/ShadowRelease.ts (build-time).
+//   1. Release pipeline gates in the release tooling (build-time).
 //   2. hooks/SystemFileGuard.hook.ts (runtime PreToolUse Write/Edit/MultiEdit
 //      gate, restored 2026-05-21 in Phase E of the system/user separation
 //      rebuild). The hook reads CONTAINMENT_ZONES via isContained() to decide
@@ -61,10 +61,28 @@ export const CONTAINMENT_ZONES: readonly ContainmentZone[] = [
       "Plugins/**",
       "Plugins/installed_plugins.json",
       "Plugins/known_marketplaces.json",
+      // public issue #1719, @catchingknives — pattern matching here is
+      // case-SENSITIVE (componentMatch uses ===/startsWith/endsWith). macOS
+      // hides this because the filesystem is case-insensitive, but Linux
+      // harnesses write a lowercase plugins/ and it fell outside every zone.
+      // Both spellings are carried: this install's real dir is capital-P, and
+      // an extra zone only ever excludes MORE from the public payload.
+      "plugins/**",
+      "plugins/installed_plugins.json",
+      "plugins/known_marketplaces.json",
       "debug/**",
       "debug",
+      // Classed sensitive at release time too (ShadowRelease RSYNC excludes +
+      // ROOT_RUNTIME_STATE_DENY) — keep both surfaces in agreement. Parity is
+      // enforced by test/regression/runtime-state-zone-parity.test.ts: every
+      // file-shaped ROOT_RUNTIME_STATE_DENY entry must be zone-covered.
+      "remote-settings.json",
+      "stats-cache.json",
+      "stats.json",
+      "ids.txt",
+      "checkpoint-repos.txt",
     ],
-    description: "Claude Code runtime install state written by the harness — plugin registry, history, and debug/ session transcripts (the debug/latest symlink and per-session .txt dumps; runtime output, never ships)",
+    description: "Claude Code runtime install state written by the harness — plugin registry (both Plugins/ and Linux's lowercase plugins/), history, remote-settings.json, and debug/ session transcripts (the debug/latest symlink and per-session .txt dumps; runtime output, never ships)",
   },
   {
     name: "private-infra",
@@ -74,11 +92,16 @@ export const CONTAINMENT_ZONES: readonly ContainmentZone[] = [
       "LIFEOS/PULSE/Plans/**",
       "LIFEOS/PULSE/logs/**",
       "LIFEOS/PULSE/state/**",
+      // The LIVE out/ (this machine's rendered dashboard state) never ships.
+      // The release DOES ship a dashboard bundle at the same path: ShadowRelease
+      // Phase E (buildStagedDashboard) rebuilds it fresh inside staging and G11
+      // scans the rendered HTML for identity. Zone = live tree; rebuild = payload.
       "LIFEOS/PULSE/Observability/out/**",
       "LIFEOS/PULSE/.playwright-cli/**",
+      "LIFEOS/PULSE/Bunker/**",
       "LIFEOS/ScheduledTasks/**",
     ],
-    description: "Top-level private infrastructure dirs: cloud worker code, Assistant runtime state (diary jsonl), planning docs, runtime logs/state, rendered HTML",
+    description: "Top-level private infrastructure dirs: cloud worker code, Assistant runtime state (diary jsonl), planning docs, runtime logs/state, rendered HTML, Bunker app-harness code (personal probe targets + alert email; concept ships via DOCUMENTATION, impl stays private)",
   },
   {
     name: "pre-sanitization-backups",
@@ -92,7 +115,15 @@ export const CONTAINMENT_ZONES: readonly ContainmentZone[] = [
     patterns: [
       "skills/*/profile-data/**",
       "skills/*/state/**",
+      // Capital-case variants: real skill dirs are TitleCase (State/, Cache/, Logs/)
+      // and the matcher is case-sensitive, so the lowercase patterns alone MISSED
+      // them. RSYNC_EXCLUDES already covers these; keeping the zone in sync so
+      // DenyListCheck classifies them as private-zone, not a real-leak false alarm
+      // (2026-08-11 skill/data-separation audit).
+      "skills/*/State/**",
       "skills/*/cache/**",
+      "skills/*/Cache/**",
+      "skills/*/Logs/**",
       "skills/*/.playwright-cli/**",
       "skills/*/.cache/**",
       "skills/*/node_modules/**",
@@ -127,6 +158,21 @@ export const PATTERN_ALLOWLIST_FILES: readonly string[] = [
   // SystemFileGuard test file legitimately embeds deny-list pattern literals
   // as test fixtures — the whole point is verifying the gate catches them.
   "hooks/SystemFileGuard.test.ts",
+  // 2026-07-20 — the public install flow embeds the public install URL
+  // (curl -fsSL https://ourlifeos.ai/install.sh) BY DESIGN: ourlifeos.ai is
+  // the public marketing/install domain, and these files are the shipped
+  // install path + brand-asset doc. Reviewed hit-by-hit before allowlisting;
+  // only the ourlifeos.ai pattern fires in them.
+  "skills/LifeOS/SKILL.md",
+  "skills/LifeOS/INSTALL.md",
+  "skills/LifeOS/install/install.sh",
+  // The public repo README (template overlay lands at staging root README.md).
+  // Author attribution — blog/social links, contributor credits — is BY DESIGN
+  // here and already public on github.com/danielmiessler/LifeOS; the star-history
+  // README refresh (2026-07-17) made G2 fire on it. Allowlisting also skips the
+  // token sanitizer so the links ship intact. (Principal approved 2026-07-21.)
+  "README.md",
+  "LIFEOS/DOCUMENTATION/BrandAssets.md",
   // Fabric quiz/answer patterns that legitimately use "unsupervised learning"
   // as ML terminology (not as a brand name). Allowed past G2.
   "skills/Fabric/Patterns/create_quiz/README.md",

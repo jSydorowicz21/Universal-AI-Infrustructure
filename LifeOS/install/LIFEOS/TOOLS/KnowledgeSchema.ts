@@ -3,7 +3,7 @@
  * KnowledgeSchema — the single source of truth for the LifeOS Knowledge Archive
  * note schema (the "kb-v3" contract).
  *
- * WHY THIS EXISTS (design: MEMORY/WORK/20260704-knowledge-schema-upgrade-design/DESIGN.md):
+ * WHY THIS EXISTS:
  * the archive had THREE competing frontmatter dialects with nothing enforcing any
  * of them (v2.0 28% / pai-memory-v1 2.7% / undocumented blog-import 69%), so it
  * couldn't be queried on the dimensions that matter (source, author, tags, dates,
@@ -488,7 +488,13 @@ export function validate(parsed: ParsedNote, _slug: string, dirType: CanonicalTy
 
   // per-type required (present AND non-empty)
   const effType = ((CANONICAL_TYPES as readonly string[]).includes(t ?? "") ? t : dirType) as CanonicalType;
+  // `source_kind: internal` means the note has no external origin — it IS the
+  // primary artifact (a LifeOS corpus, a design decision, an own-prose capture),
+  // so demanding a source_url of it asks for a URL that cannot exist. Externally
+  // sourced notes still must carry their provenance. (public PR #1684, @elhoim)
+  const isInternal = deq(get("source_kind")) === "internal";
   for (const key of PER_TYPE_REQUIRED[effType] ?? []) {
+    if (isInternal && key.startsWith("source_")) continue;
     if (missingOrEmpty(key)) v.push({ key, problem: `required for type ${effType}` });
   }
 

@@ -1,4 +1,10 @@
 #!/usr/bin/env bun
+// Normalize env path vars Claude Code may inject unexpanded — literal $HOME/${HOME}
+// in LIFEOS_DIR/LIFEOS_CONFIG_DIR/PROJECTS_DIR resolves to a shadow dir (#1404 / PR #1451, author jbmml).
+for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
+  const __v = process.env[__k];
+  if (__v && /^\$\{?HOME\}?(\/|$)/.test(__v)) process.env[__k] = __v.replace(/^\$\{?HOME\}?/, process.env.HOME ?? "~");
+}
 
 /**
  * ============================================================================
@@ -26,7 +32,8 @@
  *   --raw flag skips compression and returns raw excerpts.
  *
  * STORAGE:
- *   Reads MEMORY/KNOWLEDGE/{People,Companies,Ideas,Research}/*.md
+ *   Reads MEMORY/KNOWLEDGE/{People,Companies,Ideas,Research}/*.md  (class: knowledge)
+ *   Reads MEMORY/LEARNING/ ** /*.md recursively                    (class: learning)
  *   NEVER writes or modifies files — read-only tool.
  *
  * ============================================================================
@@ -36,19 +43,28 @@ import { parseArgs } from "util";
 import * as fs from "fs";
 import * as path from "path";
 import { spawnSync } from "child_process";
-import { resolveConfigRoot, resolveDataRoot, resolveHome, resolveLifeosRoot } from "../UNIVERSAL/platform";
+import { homedir } from "node:os";
 
+// Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
+for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
+  const v = process.env[k];
+  if (v && /^\$\{?HOME\}?(\/|$)/.test(v)) process.env[k] = v.replace(/^\$\{?HOME\}?/, process.env.HOME ?? "~");
+}
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-const HOME = resolveHome();
-const CONFIG_ROOT = resolveConfigRoot(process.env, "claude");
-const LIFEOS_DIR = resolveLifeosRoot(process.env, "claude");
-const USER_ROOT = path.join(resolveDataRoot(process.env), "USER");
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
+const LIFEOS_DIR = process.env.LIFEOS_DIR || path.join(HOME, ".claude", "LIFEOS");
 const KNOWLEDGE_DIR = path.join(LIFEOS_DIR, "MEMORY", "KNOWLEDGE");
 const DOMAINS = ["People", "Companies", "Ideas", "Research"];
+
+// The LEARNING tree — failures, incidents, algorithm reflections, system notes —
+// is a first-class part of the searchable corpus, not a write-only archive
+// (public issue #1776, @umair-a11y). It is walked recursively because entries
+// live in dated subdirs (FAILURES/2026-07/<slug>/CONTEXT.md).
+const LEARNING_DIR = path.join(LIFEOS_DIR, "MEMORY", "LEARNING");
 
 // BM25 parameters
 const BM25_K1 = 1.5;
@@ -58,6 +74,27 @@ const BM25_B = 0.75;
 const TITLE_MATCH_WEIGHT = 10;
 const TAG_MATCH_WEIGHT = 5;
 const RELATED_MATCH_WEIGHT = 3;
+
+// LEARNING notes are historical records of what happened, not curated statements
+// of what is true. They should surface, but never outrank a KNOWLEDGE note that
+// matches as well — hence a flat penalty on the final score.
+const LEARNING_SCORE_MULTIPLIER = 0.7;
+
+// getRelevantContext() runs synchronously on EVERY prompt (MemoryTurnStart
+// hook), so its cost is a tax on every turn of every session. LEARNING is ~12k
+// files / ~33MB and grows monotonically — roughly 8x the KNOWLEDGE corpus — so
+// the hot path takes a recency-bounded slice while the CLI (user-initiated and
+// latency-tolerant) searches the full tree.
+//
+// Measured on the live corpus, per fresh process (each hook run is one):
+// KNOWLEDGE alone ~138ms, +500 LEARNING ~207ms, +1500 LEARNING ~300ms. Once
+// the walk is bounded (see collectLearningPaths) the remaining cost is BM25
+// scoring, which scales with document COUNT — reads are only 31ms per 1,500
+// files. 500 holds the added tax at roughly half the existing baseline while
+// covering the most recent ~4 weeks, which is where "have we already hit this?"
+// retrieval pays off. Raising it is a one-constant change; ordering is by the
+// date embedded in each path, so the slice is always the newest entries.
+const HOT_PATH_LEARNING_LIMIT = 500;
 
 // Defaults
 const DEFAULT_TOP = 3;
@@ -77,11 +114,19 @@ interface Frontmatter {
   [key: string]: unknown;
 }
 
+/**
+ * Which corpus a note came from. Distinct from frontmatter `type` (which is a
+ * per-note authoring field and is often absent): the class is structural, known
+ * from the directory the note was discovered in, and always present.
+ */
+type NoteClass = "knowledge" | "learning" | "memory";
+
 interface KnowledgeNote {
   filePath: string;
   frontmatter: Frontmatter;
   body: string;
   wordCount: number;
+  noteClass: NoteClass;
 }
 
 interface ScoredNote {
@@ -165,26 +210,101 @@ function walkMarkdown(root: string): string[] {
   return out;
 }
 
-function discoverNotes(): KnowledgeNote[] {
+function readNotes(filePaths: string[], noteClass: NoteClass): KnowledgeNote[] {
   const notes: KnowledgeNote[] = [];
-
-  for (const domain of DOMAINS) {
-    const domainDir = path.join(KNOWLEDGE_DIR, domain);
-    const filePaths = walkMarkdown(domainDir);
-
-    for (const filePath of filePaths) {
-      try {
-        const content = fs.readFileSync(filePath, "utf-8");
-        const { frontmatter, body } = parseFrontmatter(content);
-        const wordCount = body.split(/\s+/).filter(Boolean).length;
-        notes.push({ filePath, frontmatter, body, wordCount });
-      } catch {
-        // Skip unreadable files
-      }
+  for (const filePath of filePaths) {
+    try {
+      const content = fs.readFileSync(filePath, "utf-8");
+      const { frontmatter, body } = parseFrontmatter(content);
+      const wordCount = body.split(/\s+/).filter(Boolean).length;
+      notes.push({ filePath, frontmatter, body, wordCount, noteClass });
+    } catch {
+      // Skip unreadable files
     }
   }
-
   return notes;
+}
+
+function discoverNotes(): KnowledgeNote[] {
+  const notes: KnowledgeNote[] = [];
+  for (const domain of DOMAINS) {
+    notes.push(...readNotes(walkMarkdown(path.join(KNOWLEDGE_DIR, domain)), "knowledge"));
+  }
+  return notes;
+}
+
+/**
+ * Recency rank for a LEARNING path segment, from the `YYYY-MM[-DD]` the tree
+ * embeds in its dated subdir names. stat()-ing for real mtimes would cost more
+ * than the reads this ordering exists to avoid.
+ *
+ * Undated segments sort FIRST: they are the small hand-curated set (README.md,
+ * ROOT_CAUSE_ANALYSIS.md, the top-level feedback_*.md notes), so a truncated
+ * hot-path slice keeps them rather than dropping them for churn.
+ */
+function learningRecencyKey(segment: string): string {
+  const dates = segment.match(/\d{4}-\d{2}(?:-\d{2})?/g);
+  if (!dates || dates.length === 0) return "￿"; // sorts above any date
+  return dates.reduce((a, b) => (b > a ? b : a));
+}
+
+/**
+ * Enumerate LEARNING note paths newest-first, descending into at most as many
+ * dated month-buckets as it takes to reach `limit`.
+ *
+ * Walking the whole tree and slicing afterwards does NOT bound the cost: the
+ * recursive walk alone measured 83-118ms over 3,540 dirs, dwarfing both the
+ * reads (31ms for 1,500 files) and the scoring it was meant to cap. So the
+ * bounded path reads only the top two levels (~9 readdirs) to find the
+ * `CATEGORY/YYYY-MM/` buckets, then recurses into them in date order.
+ *
+ * `limit === undefined` (the CLI) walks the whole tree, which is correct there.
+ */
+function collectLearningPaths(limit?: number): string[] {
+  if (!fs.existsSync(LEARNING_DIR)) return [];
+  if (limit === undefined) return walkMarkdown(LEARNING_DIR);
+
+  const direct: string[] = []; // undated, curated — always kept
+  const buckets: { key: string; dir: string }[] = [];
+
+  const scanLevel = (dir: string, depth: number): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith("_") || entry.name.startsWith(".")) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isFile() && entry.name.endsWith(".md")) direct.push(full);
+      else if (entry.isDirectory()) {
+        // depth 0 = LEARNING root, its dirs are categories (ALGORITHM, FAILURES…).
+        // depth 1 = a category, its dirs are the dated buckets we rank.
+        if (depth === 0) scanLevel(full, 1);
+        else buckets.push({ key: learningRecencyKey(entry.name), dir: full });
+      }
+    }
+  };
+  scanLevel(LEARNING_DIR, 0);
+
+  buckets.sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : 0));
+
+  const out = [...direct];
+  for (const bucket of buckets) {
+    if (out.length >= limit) break;
+    out.push(...walkMarkdown(bucket.dir));
+  }
+  return out.length > limit ? out.slice(0, limit) : out;
+}
+
+/**
+ * Discover LEARNING notes, newest-first. `limit` bounds the hot path; the CLI
+ * passes nothing and gets the whole tree. Absent LEARNING dir → empty array,
+ * never a throw (public issue #1776, @umair-a11y).
+ */
+function discoverLearningNotes(limit?: number): KnowledgeNote[] {
+  return readNotes(collectLearningPaths(limit), "learning");
 }
 
 // ============================================================================
@@ -279,6 +399,9 @@ function scoreNote(
       score += computeBM25(tf, note.wordCount, avgDocLength);
     }
   }
+
+  // Historical records rank below curated knowledge at equal match strength.
+  if (note.noteClass === "learning") score *= LEARNING_SCORE_MULTIPLIER;
 
   return score;
 }
@@ -409,7 +532,7 @@ function formatResults(
   if (results.length === 0) {
     lines.push("  No matching memories found.");
     lines.push("  " + "-".repeat(45));
-    lines.push(`  Searched ${totalSearched} notes across ${DOMAINS.join(", ")}.`);
+    lines.push(`  Searched ${totalSearched} notes across ${DOMAINS.join(", ")}, LEARNING.`);
     return lines.join("\n");
   }
 
@@ -420,7 +543,9 @@ function formatResults(
     const summary = summaries[i];
 
     lines.push("");
-    lines.push(`  [${title}] (type: ${type}, score: ${score.toFixed(1)})`);
+    // Class is shown ahead of type so a LEARNING hit reads as a historical
+    // record at a glance rather than as a curated fact (public issue #1776).
+    lines.push(`  [${note.noteClass}] [${title}] (type: ${type}, score: ${score.toFixed(1)})`);
 
     // Indent summary lines
     const summaryLines = summary.split("\n");
@@ -449,8 +574,8 @@ function formatResults(
 // dual-tier prefetch, no graph traversal on hot path).
 
 const MEMORY_FILES: ReadonlyArray<{ path: string; title: string }> = [
-  { path: path.join(USER_ROOT, "PRINCIPAL", "PRINCIPAL_MEMORY.md"), title: "Principal Memory" },
-  { path: path.join(USER_ROOT, "DIGITAL_ASSISTANT", "DA_MEMORY.md"), title: "DA Memory" },
+  { path: path.join(HOME, ".claude", "LIFEOS", "USER", "PRINCIPAL", "PRINCIPAL_MEMORY.md"), title: "Principal Memory" },
+  { path: path.join(HOME, ".claude", "LIFEOS", "USER", "DIGITAL_ASSISTANT", "DA_MEMORY.md"), title: "DA Memory" },
 ];
 
 const RELEVANT_CACHE_TTL_MS = 60_000;
@@ -467,6 +592,12 @@ const relevantCache = new Map<string, RelevantCacheEntry>();
 
 export interface RelevantResultItem {
   type: "memory" | "idea" | "knowledge" | "unknown";
+  /**
+   * Which corpus the hit came from. Additive alongside `type`, which stays
+   * bound to the MemoryTypeName union that MemorySystem.find() casts to — a
+   * "learning" value there would break that consumer (public issue #1776).
+   */
+  noteClass: NoteClass;
   path: string;
   title: string;
   score: number;
@@ -517,6 +648,7 @@ function loadMemoryFiles(): KnowledgeNote[] {
         },
         body: cleaned,
         wordCount,
+        noteClass: "memory",
       });
     } catch {
       // Skip unreadable
@@ -527,11 +659,13 @@ function loadMemoryFiles(): KnowledgeNote[] {
 }
 
 /**
- * Discover ALL items in the typed-item corpus — KNOWLEDGE notes + memory
- * hot-layer files. Used by getRelevantContext().
+ * Discover ALL items in the typed-item corpus — KNOWLEDGE notes + a
+ * recency-bounded LEARNING slice + memory hot-layer files. Used by
+ * getRelevantContext(). See HOT_PATH_LEARNING_LIMIT for why LEARNING is
+ * bounded here and unbounded on the CLI path.
  */
 function discoverAllItems(): KnowledgeNote[] {
-  return [...discoverNotes(), ...loadMemoryFiles()];
+  return [...discoverNotes(), ...discoverLearningNotes(HOT_PATH_LEARNING_LIMIT), ...loadMemoryFiles()];
 }
 
 /**
@@ -606,7 +740,7 @@ export function getRelevantContext(
       rawType === "memory" || rawType === "idea" || rawType === "knowledge" ? rawType : "unknown";
     const title = (note.frontmatter.title as string) || path.basename(note.filePath, ".md");
     const excerpt = extractExcerpt(note, queryTerms).slice(0, excerptChars);
-    return { type: knownType, path: note.filePath, title, score, excerpt };
+    return { type: knownType, noteClass: note.noteClass, path: note.filePath, title, score, excerpt };
   });
 
   const markdownBlock = formatRelevantBlock(results);
@@ -624,9 +758,13 @@ function formatRelevantBlock(results: RelevantResultItem[]): string {
   if (results.length === 0) return "";
   const lines: string[] = ["## RELEVANT MEMORY"];
   for (const r of results) {
-    const shortPath = r.path.replace(CONFIG_ROOT + path.sep, "");
+    const shortPath = r.path.replace(HOME + "/.claude/", "");
     lines.push("");
-    lines.push(`### [${r.type} · ${r.score.toFixed(1)}] ${r.title}`);
+    // A learning hit is labelled by class rather than by its (usually absent)
+    // frontmatter type, so the injected block reads as a historical record
+    // instead of an unlabelled "unknown" fact (public issue #1776, @umair-a11y).
+    const label = r.noteClass === "learning" ? "learning · historical" : r.type;
+    lines.push(`### [${label} · ${r.score.toFixed(1)}] ${r.title}`);
     lines.push(`<!-- ${shortPath} -->`);
     // Trim noisy whitespace and limit to roughly the excerpt budget
     const excerpt = r.excerpt.replace(/\n{3,}/g, "\n\n").trim();
@@ -663,7 +801,10 @@ OPTIONS:
 
 SEARCH:
   BM25-style keyword matching + tag co-occurrence scoring.
-  Searches MEMORY/KNOWLEDGE/{People,Companies,Ideas,Research}/*.md
+  Searches MEMORY/KNOWLEDGE/{People,Companies,Ideas,Research}/*.md  [knowledge]
+  and MEMORY/LEARNING/ recursively                                  [learning]
+  Each hit is tagged with its class. Learning notes are historical records
+  and score at ${LEARNING_SCORE_MULTIPLIER}x so curated knowledge outranks them on equal matches.
 
 COMPRESSION:
   Uses Inference.ts (low level) for LLM-powered compression.
@@ -718,14 +859,17 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Verify KNOWLEDGE directory exists
-  if (!fs.existsSync(KNOWLEDGE_DIR)) {
-    console.error(`Error: Knowledge directory not found: ${KNOWLEDGE_DIR}`);
+  // Either corpus alone is a working install: KNOWLEDGE-only is the common case,
+  // and LEARNING-only happens before the first knowledge note is written. Only
+  // the absence of BOTH is a real misconfiguration (public issue #1776).
+  if (!fs.existsSync(KNOWLEDGE_DIR) && !fs.existsSync(LEARNING_DIR)) {
+    console.error(`Error: no memory corpus found. Looked for:\n  ${KNOWLEDGE_DIR}\n  ${LEARNING_DIR}`);
     process.exit(1);
   }
 
-  // Discover all notes
-  const notes = discoverNotes();
+  // Discover all notes. The CLI searches the FULL LEARNING tree — unlike the
+  // per-turn hot path, it is user-initiated and can afford the read.
+  const notes = [...discoverNotes(), ...discoverLearningNotes()];
   if (notes.length === 0) {
     console.log(`No prior work found on "${query}" in the knowledge corpus.`);
     process.exit(0);

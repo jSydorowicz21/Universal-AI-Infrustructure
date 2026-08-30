@@ -35,6 +35,7 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
+import { homedir } from "node:os";
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
 for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
@@ -43,7 +44,7 @@ for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 }
 
 
-const HOME = process.env.HOME || "";
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
 const LIFEOS_DIR = process.env.LIFEOS_DIR || join(HOME, ".claude", "LIFEOS");
 const IDEAL_DIR = join(LIFEOS_DIR, "USER", "TELOS", "IDEAL_STATE");
 const CURRENT_DIR = join(LIFEOS_DIR, "USER", "TELOS", "CURRENT_STATE");
@@ -89,6 +90,20 @@ function computeFromCurrent(file: string): DimensionState | null {
   const have    = (content.match(/\bstatus:\s*have\b/g)    || []).length;
   const partial = (content.match(/\bstatus:\s*partial\b/g) || []).length;
   const missing = (content.match(/\bstatus:\s*missing\b/g) || []).length;
+  // Fail loud on unrecognized status keywords (public issue #1509): a synonym
+  // like `status: populated` used to silently count as nothing, so a fully
+  // populated file computed as 0% coverage with no signal anything was wrong.
+  const RECOGNIZED = new Set(["have", "partial", "missing"]);
+  const unrecognized = [...content.matchAll(/\bstatus:\s*([A-Za-z][\w-]*)/g)]
+    .map((m) => m[1]!.toLowerCase())
+    .filter((kw) => !RECOGNIZED.has(kw));
+  if (unrecognized.length > 0) {
+    const uniq = [...new Set(unrecognized)].join(", ");
+    process.stderr.write(
+      `[UpdateLifeosState] WARNING: ${file} has ${unrecognized.length} unrecognized status keyword(s) (${uniq}) — ` +
+      `only have/partial/missing count toward coverage, so the reported percentage is wrong until fixed.\n`,
+    );
+  }
   const total = have + partial + missing;
   if (total === 0) return null;
   const pct = Math.round(((have + 0.5 * partial) / total) * 100);

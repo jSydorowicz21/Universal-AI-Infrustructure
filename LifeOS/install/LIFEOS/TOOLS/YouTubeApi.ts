@@ -10,7 +10,11 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
  * YouTubeApi.ts - YouTube Data API v3 client
  *
  * Usage:
- *   bun ~/.claude/skills/YouTube/Tools/YouTubeApi.ts <command> [options]
+ *   bun ~/.claude/LIFEOS/TOOLS/YouTubeApi.ts <command> [options]
+ *
+ * (The YouTube skill was retired; this tool moved to LIFEOS/TOOLS and the old
+ * invocation line no longer resolved — ported from public PR #1707 (commit 1),
+ * @anikinsasha.)
  *
  * Commands:
  *   channel              Get channel statistics
@@ -51,7 +55,10 @@ const colors = {
 
 // Load environment
 function loadEnv(): Record<string, string> {
-  const envPath = process.env.LIFEOS_CONFIG_DIR ? join(process.env.LIFEOS_CONFIG_DIR, '.env') : join(homedir(), '.claude', '.env')
+  // Canonical .env is ~/.claude/.env. LIFEOS_CONFIG_DIR names the LIFEOS
+  // directory, NOT the dir holding .env — joining it produced the dead path
+  // ~/.claude/LIFEOS/.env that nothing creates (public issue #1490).
+  const envPath = join(homedir(), '.claude', '.env')
   const env: Record<string, string> = {}
   try {
     const content = readFileSync(envPath, 'utf-8')

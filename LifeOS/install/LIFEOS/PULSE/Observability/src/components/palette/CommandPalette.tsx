@@ -3,22 +3,26 @@
 // Pulse command palette (⌘K). Two lanes in P1:
 //   local  — pages from nav-manifest + frecency recents (no network)
 //   wiki   — /api/wiki/search (MiniSearch), debounced
-// Design: LIFEOS/MEMORY/WORK/20260710-pulse-cmdk-command-palette/DESIGN.md
 
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import {
   Search,
   FileText,
+  FlaskConical,
+  GraduationCap,
   Users,
   Building2,
   Lightbulb,
   BookOpen,
   Newspaper,
+  Sparkles,
+  Workflow,
   type LucideIcon,
 } from "lucide-react";
 import { wikiPageUrl } from "@/lib/wiki-links";
 import { paletteEntries, type NavItem } from "@/lib/palette/nav-manifest";
+import { useEnabledModules } from "@/lib/use-enabled-modules";
 import { fuzzyScore } from "@/lib/palette/fuzzy";
 import { recordSelection, frecencyBoost, topRecents, loadStore } from "@/lib/palette/frecency";
 import { PALETTE_OPEN_EVENT, type PaletteScope } from "@/lib/palette/events";
@@ -43,11 +47,15 @@ const WIKI_ICONS: Record<string, LucideIcon> = {
   idea: Lightbulb,
   blog: Newspaper,
   book: BookOpen,
+  research: FlaskConical,
+  isa: Workflow,
+  lesson: GraduationCap,
+  wisdom: Sparkles,
 };
 
 // Routes where ⌘K used to open the scoped WikiSearch — opening there pre-sets
 // the WIKI scope chip so the old muscle memory keeps working.
-const WIKI_SCOPED_PREFIXES = ["/docs", "/knowledge", "/system"];
+const WIKI_SCOPED_PREFIXES = ["/docs", "/memory/knowledge", "/system"];
 
 const font = { fontFamily: "'concourse-t3', sans-serif" };
 const mono = { fontFamily: "'triplicate-a-code', monospace" };
@@ -147,6 +155,12 @@ export default function CommandPalette() {
     };
   }, [open, query, scope]);
 
+  // Jumping to a page whose module is switched off lands on an empty view, so
+  // the palette searches the same filtered set the nav renders.
+  // ported from public PR #1749, @elhoim
+  const isEnabled = useEnabledModules();
+  const entries = useMemo(() => paletteEntries.filter(isEnabled), [isEnabled]);
+
   // Local lane + merge.
   const rows: Row[] = useMemo(() => {
     const out: Row[] = [];
@@ -154,15 +168,15 @@ export default function CommandPalette() {
     if (scope !== "wiki") {
       if (!q) {
         const recents = topRecents(6)
-          .map((id) => paletteEntries.find((e) => e.href === id))
+          .map((id) => entries.find((e) => e.href === id))
           .filter((e): e is NavItem => Boolean(e));
         recents.forEach((entry) => out.push({ kind: "page", entry, recent: true }));
-        paletteEntries
+        entries
           .filter((e) => !recents.includes(e))
           .forEach((entry) => out.push({ kind: "page", entry }));
       } else {
         const store = loadStore();
-        paletteEntries
+        entries
           .map((entry) => ({
             entry,
             score: fuzzyScore(q, entry.label, entry.keywords) + frecencyBoost(entry.href, store),
@@ -177,7 +191,7 @@ export default function CommandPalette() {
       wikiResults.forEach((result) => out.push({ kind: "wiki", result }));
     }
     return out;
-  }, [query, scope, wikiResults]);
+  }, [query, scope, wikiResults, entries]);
 
   useEffect(() => {
     setSelectedIndex(0);

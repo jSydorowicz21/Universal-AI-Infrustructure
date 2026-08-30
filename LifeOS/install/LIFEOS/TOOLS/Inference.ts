@@ -43,10 +43,11 @@
  *
  */
 
-import { spawn } from "child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
-import { join } from "path";
-import { homedir } from "os";
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
 
 /**
  * Resolve the claude binary explicitly. launchd jobs run with a minimal PATH
@@ -85,21 +86,27 @@ export function normalizeLevel(level: string | undefined): InferenceLevel {
 
 export type InferenceBackend = 'claude' | 'omp' | 'auto';
 
-const BACKEND_CONFIG_PATH = join(homedir(), '.claude', 'LIFEOS', 'USER', 'CONFIG', 'inference-backend');
+export function backendConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  const dataRoot = env.UAI_DATA_DIR?.trim() || env.PAI_DATA_DIR?.trim();
+  if (dataRoot) return join(dataRoot, "USER", "CONFIG", "inference-backend");
+  const lifeosRoot = env.LIFEOS_DIR?.trim() || join(homedir(), ".claude", "LIFEOS");
+  return join(lifeosRoot, "USER", "CONFIG", "inference-backend");
+}
 const VALID_BACKENDS: readonly InferenceBackend[] = ['claude', 'omp', 'auto'] as const;
 
-export function resolveBackend(): InferenceBackend {
-  const env = process.env.LIFEOS_INFERENCE_BACKEND?.trim().toLowerCase();
-  if ((VALID_BACKENDS as readonly string[]).includes(env ?? '')) return env as InferenceBackend;
-  if (env) console.error(`[Inference] ignoring invalid LIFEOS_INFERENCE_BACKEND='${env}' (use claude|omp|auto)`);
+export function resolveBackend(env: NodeJS.ProcessEnv = process.env): InferenceBackend {
+  const selected = env.LIFEOS_INFERENCE_BACKEND?.trim().toLowerCase();
+  if ((VALID_BACKENDS as readonly string[]).includes(selected ?? '')) return selected as InferenceBackend;
+  if (selected) console.error(`[Inference] ignoring invalid LIFEOS_INFERENCE_BACKEND='${selected}' (use claude|omp|auto)`);
+  const configPath = backendConfigPath(env);
   try {
-    if (existsSync(BACKEND_CONFIG_PATH)) {
-      const v = readFileSync(BACKEND_CONFIG_PATH, 'utf8').trim().toLowerCase();
-      if ((VALID_BACKENDS as readonly string[]).includes(v)) return v as InferenceBackend;
-      console.error(`[Inference] ignoring invalid backend config '${v}' in ${BACKEND_CONFIG_PATH} (use claude|omp|auto)`);
+    if (existsSync(configPath)) {
+      const value = readFileSync(configPath, 'utf8').trim().toLowerCase();
+      if ((VALID_BACKENDS as readonly string[]).includes(value)) return value as InferenceBackend;
+      console.error(`[Inference] ignoring invalid backend config '${value}' in ${configPath} (use claude|omp|auto)`);
     }
   } catch { /* unreadable config → harness default */ }
-  return process.env.LIFEOS_HARNESS?.trim().toLowerCase() === 'omp' ? 'omp' : 'claude';
+  return env.LIFEOS_HARNESS?.trim().toLowerCase() === 'omp' ? 'omp' : 'claude';
 }
 
 /** Extract-and-parse a JSON object/array from model output (markdown-tolerant).
@@ -160,18 +167,15 @@ export interface InferenceResult {
   modelDowngraded?: boolean;
 }
 
-import { modelForEffort, pinnedModelForEffort, EFFORT_MODEL, LEVEL_TO_HARNESS_EFFORT, type EffortLevel, type HarnessEffort } from './models';
+import { modelForEffort, pinnedModelForEffort, EFFORT_MODEL, UNIFORM_HARNESS_EFFORT, type EffortLevel, type HarnessEffort } from './models';
 
-// Level configurations — models resolve via models.ts EFFORT_MODEL (the single
-// edit point on a lineup change). No model names appear here. `effort` is the
-// REASONING-EFFORT axis (the CLI `--effort` flag), resolved through
-// models.ts LEVEL_TO_HARNESS_EFFORT — the one source of truth for the model-rung
-// → reasoning-effort mapping. Reasoning ceiling is `high` (max also resolves to
-// high, 2026-07-06). These are two distinct axes; see THREE LEVEL AXES in models.ts.
+// Model rung varies by intent; reasoning effort is uniformly high per models.ts.
+// Keeping those axes separate lets a low-cost model still reason fully while the
+// max→high fallback remains a real model downgrade.
 const LEVEL_CONFIG: Record<InferenceLevel, { model: string; defaultTimeout: number; effort: HarnessEffort }> = {
-  low: { model: modelForEffort('low'), defaultTimeout: 15000, effort: LEVEL_TO_HARNESS_EFFORT.low },
-  medium: { model: modelForEffort('medium'), defaultTimeout: 30000, effort: LEVEL_TO_HARNESS_EFFORT.medium },
-  high: { model: modelForEffort('high'), defaultTimeout: 90000, effort: LEVEL_TO_HARNESS_EFFORT.high },
+  low: { model: modelForEffort('low'), defaultTimeout: 15000, effort: UNIFORM_HARNESS_EFFORT },
+  medium: { model: modelForEffort('medium'), defaultTimeout: 30000, effort: UNIFORM_HARNESS_EFFORT },
+  high: { model: modelForEffort('high'), defaultTimeout: 90000, effort: UNIFORM_HARNESS_EFFORT },
   // max powers Algorithm E4/E5 +
   // Core-System dispatch. max is Fable (2026-07-01). The TheRouter classifier
   // moved OFF max to 'high' the same day — it fires on every prompt, so the
@@ -180,7 +184,7 @@ const LEVEL_CONFIG: Record<InferenceLevel, { model: string; defaultTimeout: numb
   // inference() adds a max→high fallback below (now fable→opus, a real degrade).
   // Reasoning effort caps at `high` (LEVEL_TO_HARNESS_EFFORT.max resolves to high,
   // 2026-07-06) — LifeOS never emits xhigh/max.
-  max: { model: pinnedModelForEffort('max'), defaultTimeout: 120000, effort: LEVEL_TO_HARNESS_EFFORT.max },
+  max: { model: pinnedModelForEffort('max'), defaultTimeout: 120000, effort: UNIFORM_HARNESS_EFFORT },
 };
 
 /** Determine which model actually produced the answer, and whether the requested
@@ -344,15 +348,27 @@ async function inferenceAttempt(options: InferenceOptions, modelOverride?: strin
     delete env.ANTHROPIC_BASE_URL;
 
     const hasImages = options.imagePaths && options.imagePaths.length > 0;
+    let systemPromptFile: string | null = null;
+    let systemPromptArgs = ['--system-prompt', options.systemPrompt];
+    if (Buffer.byteLength(options.systemPrompt, 'utf8') > 100_000) {
+      systemPromptFile = join(tmpdir(), `lifeos-sysprompt-${randomUUID()}.md`);
+      writeFileSync(systemPromptFile, options.systemPrompt, { mode: 0o600 });
+      systemPromptArgs = ['--system-prompt-file', systemPromptFile];
+    }
+    const cleanupSystemPromptFile = (): void => {
+      if (!systemPromptFile) return;
+      try { unlinkSync(systemPromptFile); } catch { /* already removed */ }
+      systemPromptFile = null;
+    };
     const args = [
       '--print',
       '--model', model,
-      '--effort', config.effort,  // Opus 4.8 respects effort strictly; tune intelligence vs. token spend per level
+      '--effort', config.effort,
       ...(hasImages ? ['--allowedTools', 'Read'] : ['--tools', '']),
       '--output-format', 'json',
-      '--exclude-dynamic-system-prompt-sections',  // v3.23 C2: cache-friendly prompt prefix (claude-code v2.1.98+)
+      '--exclude-dynamic-system-prompt-sections',
       '--setting-sources', '',
-      '--system-prompt', options.systemPrompt,
+      ...systemPromptArgs,
     ];
 
     const userPromptWithImages = hasImages
@@ -389,6 +405,7 @@ async function inferenceAttempt(options: InferenceOptions, modelOverride?: strin
 
     // Handle timeout
     const timeoutId = setTimeout(() => {
+      cleanupSystemPromptFile();
       proc.kill('SIGTERM');
       resolve({
         success: false,
@@ -399,7 +416,14 @@ async function inferenceAttempt(options: InferenceOptions, modelOverride?: strin
       });
     }, timeout);
 
+    proc.on('error', (error) => {
+      clearTimeout(timeoutId);
+      cleanupSystemPromptFile();
+      resolve({ success: false, output: stdout, error: error.message, latencyMs: Date.now() - startTime, level });
+    });
+
     proc.on('close', (code) => {
+      cleanupSystemPromptFile();
       clearTimeout(timeoutId);
       const latencyMs = Date.now() - startTime;
 

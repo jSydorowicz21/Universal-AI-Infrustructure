@@ -60,7 +60,7 @@ export interface EnvDetection {
   ssh: boolean;
   bun: ToolInfo;
   git: ToolInfo;
-  /** A prior LifeOS/PAI install is present (settings.json exists in the config root). */
+  /** A prior LifeOS install is present (the deployed VERSION marker exists). */
   existingInstall: boolean;
   /**
    * This IS a checked-out LifeOS source tree — refuse mutation. Legacy
@@ -287,7 +287,7 @@ export function detectEnv(env: NodeJS.ProcessEnv = process.env): EnvDetection {
     ssh,
     bun: detectTool("bun", "bun --version"),
     git: detectTool("git", "git --version"),
-    existingInstall: existsSync(settingsPath),
+    existingInstall: existsSync(join(roots.lifeosRoot, "VERSION")),
     isDevTree: detectDevTree(configRoot),
     settingsExists: existsSync(settingsPath),
     claudeMdExists: existsSync(claudeMdPath),
@@ -436,8 +436,15 @@ export function scanSettingsHooks(settingsPath: string): SettingsHookScan {
 
 import { closeSync, cpSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readlinkSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 
-const TEMPLATE_EXTENSIONS = new Set([".md", ".json", ".txt", ".ts", ".toml", ".yaml", ".yml", ".sh"]);
+const TEMPLATE_EXTENSIONS = new Set([
+  ".md", ".json", ".txt", ".ts", ".toml", ".yaml", ".yml", ".sh",
+  ".tsx", ".jsx", ".js", ".css",
+]);
 const SKIP_DIRS = new Set(["node_modules", ".git", "MEMORY"]);
+
+function fileExtension(filePath: string): string {
+  return extname(filePath).toLowerCase();
+}
 
 /**
  * Recursive, existsSync-GUARDED copy. Copies only files/dirs absent at dst —
@@ -528,11 +535,12 @@ export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: 
   let applied = 0;
   const entries = Object.entries(vars);
   const processFile = (filePath: string): void => {
-    if (!TEMPLATE_EXTENSIONS.has(filePath.slice(filePath.lastIndexOf(".")))) return;
+    if (!TEMPLATE_EXTENSIONS.has(fileExtension(filePath))) return;
     scanned++;
     const before = readFileSync(filePath, "utf-8");
     let after = before;
     for (const [placeholder, value] of entries) {
+      if (!/^\{\{[A-Z0-9_]+\}\}$/.test(placeholder)) continue;
       const parts = after.split(placeholder);
       applied += parts.length - 1;
       after = parts.join(value);
@@ -541,7 +549,7 @@ export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: 
       const temporary = join(dirname(filePath), `.${randomUUID()}.uai-tmp`);
       let descriptor: number | undefined;
       try {
-        descriptor = openSync(temporary, "wx", 0o600);
+        descriptor = openSync(temporary, "wx", lstatSync(filePath).mode & 0o7777);
         writeFileSync(descriptor, after, "utf8");
         fsyncSync(descriptor);
         closeSync(descriptor);
@@ -563,12 +571,52 @@ export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: 
     }
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       if (SKIP_DIRS.has(entry.name)) continue;
+      if (entry.name === "install" && directory.endsWith(join("skills", "LifeOS"))) continue;
       const child = join(directory, entry.name);
       if (entry.isDirectory() || entry.isFile()) walk(child);
     }
   };
   if (existsSync(rootDir)) walk(rootDir);
   return { scanned, modified, applied };
+}
+
+const IDENTITY_PLACEHOLDERS = [
+  "{{DA_NAME}}", "{{DA_FULL_NAME}}", "{{PRINCIPAL_NAME}}", "{{PRINCIPAL_FULL_NAME}}",
+  "{{PRIMARY_VOICE_ID}}", "{{SECONDARY_VOICE_ID}}", "{{LIFEOS_VERSION}}",
+] as const;
+
+export function checkSurvivingPlaceholders(rootDir: string): {
+  passed: boolean;
+  files: Array<{ file: string; placeholder: string; count: number }>;
+  total: number;
+} {
+  const files: Array<{ file: string; placeholder: string; count: number }> = [];
+  let total = 0;
+  const inspect = (filePath: string): void => {
+    if (!TEMPLATE_EXTENSIONS.has(fileExtension(filePath))) return;
+    let source: string;
+    try { source = readFileSync(filePath, "utf8"); } catch { return; }
+    for (const placeholder of IDENTITY_PLACEHOLDERS) {
+      const count = source.split(placeholder).length - 1;
+      if (count > 0) {
+        files.push({ file: filePath, placeholder, count });
+        total += count;
+      }
+    }
+  };
+  const walk = (path: string): void => {
+    const metadata = lstatSync(path);
+    if (metadata.isFile()) return inspect(path);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      if (entry.name === "install" && path.endsWith(join("skills", "LifeOS"))) continue;
+      const child = join(path, entry.name);
+      if (entry.isDirectory() || entry.isFile()) walk(child);
+    }
+  };
+  if (existsSync(rootDir)) walk(rootDir);
+  return { passed: total === 0, files, total };
 }
 
 /**
@@ -744,18 +792,28 @@ export function setupUserSeparation(
   const liveUserDir = join(configRoot, "LIFEOS", "USER");
   const dataUserDir = join(configDir, "USER");
 
+  if (resolve(liveUserDir) === resolve(dataUserDir)) {
+    return { action: "already-linked", target: dataUserDir, copied: 0 };
+  }
+
   // Branch (a): already a correct symlink → no-op. A relative link is correct
   // when it resolves to the selected data root, not merely when its raw text
-  // happens to match the absolute target.
-  if (existsSync(liveUserDir)) {
-    const st = lstatSync(liveUserDir);
-    if (st.isSymbolicLink()) {
+  // happens to match the absolute target. Dangling links are safe to remove;
+  // live foreign links are refused without mutation.
+  const liveLstat = lstatSync(liveUserDir, { throwIfNoEntry: false });
+  if (liveLstat?.isSymbolicLink()) {
+    if (existsSync(liveUserDir)) {
       try {
         const target = readlinkSync(liveUserDir);
         const resolvedTarget = isAbsolute(target) ? normalize(target) : resolve(dirname(liveUserDir), target);
         if (resolvedTarget === normalize(dataUserDir)) return { action: "already-linked", target: dataUserDir, copied: 0 };
       } catch { /* reject below without mutating a foreign link */ }
       return { action: "linked", target: dataUserDir, copied: 0, error: `live USER is linked to an unrecognized target: ${liveUserDir}` };
+    }
+    try {
+      unlinkSync(liveUserDir);
+    } catch (error) {
+      return { action: "linked", target: dataUserDir, copied: 0, error: `could not remove dangling USER link at ${liveUserDir}: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 

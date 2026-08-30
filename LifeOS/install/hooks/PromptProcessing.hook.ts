@@ -7,7 +7,7 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 }
 
 /**
- * @version 1.4.40
+ * @version 1.5.1
  * PromptProcessing.hook.ts - Tab Title + Session Naming (Haiku)
  *
  * PURPOSE:
@@ -16,12 +16,12 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
  *
  * TRIGGER: UserPromptSubmit
  *
- * NOTE: Mode/tier classification is NOT handled here — that lives in
- * TheRouter.hook.ts (which runs on the same UserPromptSubmit event,
- * before this hook, and emits MODE/TIER to additionalContext via
- * hookSpecificOutput). Satisfaction/rating capture is handled by the
- * dedicated SatisfactionCapture.hook.ts. This hook does only:
- * tab title + session naming.
+ * NOTE: Modes/tiers and the per-prompt classifier were retired 2026-07-11 —
+ * spend is discovered from the work, not predicted per prompt.
+ * The leading tab token below is now a vestigial cosmetic ("N" on light turns);
+ * with no classifier stamping it, stampWorkingTab just recovers whatever token
+ * is already on the tab. Satisfaction/rating capture is handled by the dedicated
+ * SatisfactionCapture.hook.ts. This hook does only: tab title + session naming.
  *
  * FLOW:
  * 1. Parse stdin
@@ -42,11 +42,12 @@ import { join, dirname } from 'path';
 import { inference } from '../LIFEOS/TOOLS/Inference';
 import { getIdentity, getPrincipal } from './lib/identity';
 import { isValidWorkingTitle, getWorkingFallback, trimToValidTitle } from './lib/output-validators';
-import { setTabState, getSessionOneWord, readTabState, extractModeToken, setPhaseTab } from './lib/tab-setter';
-import type { AlgorithmTabPhase } from './lib/tab-constants';
+import { getSessionOneWord, readTabState, setAscentTab } from './lib/tab-setter';
 import { paiPath } from './lib/paths';
 import { updateSessionNameInWorkJson, upsertSession } from './lib/isa-utils';
 import { isDesktopChannel, logSkippedVoice, getNotificationChannel } from './lib/notification-channel';
+import { PULSE_BASE } from '../LIFEOS/PULSE/endpoint';
+import { homedir } from "node:os";
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
 for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
@@ -81,7 +82,7 @@ function appendPromptProcessingTelemetry(entry: Record<string, unknown>): void {
 
 // ── Constants ──
 
-const BASE_DIR = process.env.LIFEOS_DIR || join(process.env.HOME!, '.claude', 'LIFEOS');
+const BASE_DIR = process.env.LIFEOS_DIR || join(homedir(), '.claude', 'LIFEOS');
 const SESSION_NAMES_PATH = paiPath('MEMORY', 'STATE', 'session-names.json');
 const LOCK_PATH = SESSION_NAMES_PATH + '.lock';
 const MIN_PROMPT_LENGTH = 3;
@@ -94,7 +95,11 @@ async function readStdinWithTimeout(timeout: number = 5000): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = '';
     const timer = setTimeout(() => resolve(data), timeout);
-    process.stdin.on('data', (chunk) => { data += chunk.toString(); });
+    // 10MB cap — unbounded buffering risked multi-GB allocation on a fast stream (public issue #1533, @christauff)
+    process.stdin.on('data', (chunk) => {
+      data += chunk.toString();
+      if (data.length > 10_000_000) { clearTimeout(timer); try { process.stdin.pause(); } catch {} resolve(data); }
+    });
     process.stdin.on('end', () => { clearTimeout(timer); resolve(data); });
     process.stdin.on('error', (err) => { clearTimeout(timer); reject(err); });
   });
@@ -168,6 +173,21 @@ function sessionNameToTabTitle(name: string): string | null {
   const cap = gerund.charAt(0).toUpperCase() + gerund.slice(1);
   const titleWords = [cap, ...words.slice(1, 4)];
   return trimToValidTitle(titleWords, isValidWorkingTitle);
+}
+
+/**
+ * Title for a follow-up prompt: the SESSION's identity, never the raw prompt.
+ * Mangling each follow-up into a fake gerund ("Researching tab title accurate.")
+ * replaced the session name with prompt debris on every turn after the first
+ * (found live 2026-08-12). Prefers the gerund derivation; falls back to the
+ * first four words of the stored session name verbatim.
+ */
+function followupTitleFromSessionName(sessionId: string): string | null {
+  try {
+    const name = readSessionNames()[sessionId];
+    if (typeof name !== 'string' || !name.trim()) return null;
+    return sessionNameToTabTitle(name) || name.trim().split(/\s+/).slice(0, 4).join(' ');
+  } catch { return null; }
 }
 
 /**
@@ -341,6 +361,9 @@ function stripPastedLetter(prompt: string): string {
 
 function sanitizePromptForNaming(prompt: string): string {
   return stripPastedLetter(prompt)
+    // Harness-inserted attachment markers are not user-typed words — strip
+    // before naming so "Image" never lands in a session name. (issue #1845)
+    .replace(/\[(?:image|screenshot|pasted)[^\]]*\]/gi, ' ')
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, ' ')
     .replace(/<task-notification>[\s\S]*?<\/task-notification>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
@@ -431,6 +454,13 @@ const META_VERBS = new Set([
   'complete', 'redo', 'grab', 'load', 'fetch', 'retrieve', 'access',
 ]);
 
+// Punctuation/symbol stripper that keeps letters from every script and digits.
+// An `[^a-zA-Z0-9\s]` class deletes accented letters along with the punctuation,
+// so a word ending in an accent loses it and a non-Latin prompt reduces to
+// nothing. `\p{L}` covers scripts nobody has thought to enumerate.
+// public issue #1774, @xmasyx
+const NON_WORD_CHARS = /[^\p{L}\p{N}\s]/gu;
+
 function titleCase(w: string): string {
   // Preserve acronyms (all uppercase, 2-8 chars, letters only)
   if (w.length >= 2 && w.length <= 8 && /^[A-Z]+$/.test(w)) return w;
@@ -517,44 +547,24 @@ function extractFallbackName(prompt: string): string | null {
     if (isValidSessionName(candidate)) return candidate;
   }
 
-  // Strategy 4: Last-resort — ANY content words, ALWAYS prepend "Review".
-  // Fires when prior strategies produce a name whose lead word isn't a recognized
-  // ACTION_VERB. Requires at least 4 distinct content picks so "Review" + picks = 5.
-  // If the prompt is too thin to produce 4 honest picks, return null and let inference
-  // handle it — no padding with filler that produces ungrammatical names.
-  if (contentWords.length >= 4) {
-    const properNouns = contentWords.filter(cw => /^[A-Z][a-z]/.test(cw.word));
-    const properSet = new Set(properNouns.map(p => p.word.toLowerCase()));
-    const otherContent = contentWords.filter(cw => {
-      const lc = cw.word.toLowerCase();
-      return !properSet.has(lc) && !META_VERBS.has(lc) && !NOISE_WORDS.has(lc);
-    });
-    const ordered = [...properNouns, ...otherContent];
-    const seen = new Set<string>();
-    const picks: string[] = [];
-    for (const cw of ordered) {
-      const tc = titleCase(cw.word);
-      const lc = tc.toLowerCase();
-      if (seen.has(lc) || NOISE_WORDS.has(lc)) continue;
-      seen.add(lc);
-      picks.push(tc);
-      if (picks.length >= 4) break;
-    }
-    if (picks.length >= 4) {
-      // 'Review' is in ACTION_VERBS and not in BANNED_SESSION_LEAD.
-      const candidate = ['Review', ...picks].slice(0, 5).join(' ');
-      if (isValidSessionName(candidate)) return candidate;
-    }
-  }
+  // Former Strategy 4 (prepend "Review" + any 4 content words) DELETED
+  // (public issue #1845, @xmasyx): planting an ACTION_VERB lead let word-salad
+  // self-certify through isValidSessionName — non-English prompts became
+  // "Review Questa Sezione Vorrei Mettere". An unnamed session just retries
+  // naming on the next prompt; that beats a confident wrong name.
 
   // Truly nothing usable — let inference handle it (or accept the unnamed session).
   return null;
 }
 
-// Lead verbs banned from session names — meta-instructions, not task descriptions
+// Lead verbs banned from session names. Ban criterion (public issue #1845,
+// @xmasyx): banned verbs take the ASSISTANT as their object ("show me",
+// "continue where we left off") — meta-instructions about the conversation.
+// Verbs whose object is THE WORK ("Complete Api Migration", "Finish Payment
+// Retry Logic") are legitimate task descriptions and stay allowed.
 const BANNED_SESSION_LEAD = new Set([
   'pull', 'show', 'see', 'look', 'view', 'display', 'bring', 'give', 'tell', 'help',
-  'continue', 'resume', 'recall', 'remember', 'repeat', 'finish', 'complete', 'redo',
+  'continue', 'resume', 'recall', 'remember', 'repeat',
   'grab', 'load', 'retrieve', 'access', 'list',
 ]);
 
@@ -582,6 +592,38 @@ function isValidSessionName(name: string): boolean {
   }
 
   return true;
+}
+
+/**
+ * Validate an INFERENCE-produced name for SHAPE, not vocabulary.
+ * `isValidSessionName` exists to discipline `extractFallbackName`, which scrapes
+ * words out of the prompt and needs a lexical whitelist to avoid word salad.
+ * Applied to the model it inverted its purpose: it rejected good names ("Decide
+ * Icon Placement In Statusline", "Refine Dashboard Layout Spacing") because the
+ * lead verb is absent from the hand-maintained ACTION_VERBS set, while Strategy
+ * 4 of the fallback passes by construction — it prepends the literal 'Review'.
+ * So: keep the guards that carry information (length, fragment punctuation,
+ * meta-instruction lead, substance) and drop the whitelist.
+ * public issue #1718, @xmasyx
+ *
+ * Deviation from the reported fix: no per-word `length >= 2` floor. This file
+ * deliberately dropped that floor because single-char words are legitimate in
+ * real names ("Command K Palette", "Add A Record"). Short words instead just
+ * fail to count toward the meaningful-word requirement below.
+ */
+function isValidInferredSessionName(name: string): boolean {
+  const words = name.split(/\s+/).filter(w => w.length > 0);
+  if (words.length < 2 || words.length > 5) return false;
+
+  // Same fragment-punctuation guard as the strict validator
+  if (/[,;:/\\]/.test(name)) return false;
+
+  if (BANNED_SESSION_LEAD.has(words[0].toLowerCase())) return false;
+
+  // At least two words that actually say something (acronyms always count)
+  const meaningful = words.filter(w =>
+    /^[A-Z]{2,8}$/.test(w) || (w.length >= 2 && !NOISE_WORDS.has(w.toLowerCase())));
+  return meaningful.length >= 2;
 }
 
 /**
@@ -670,8 +712,6 @@ function syncNameToJsonl(sessionId: string, title: string): void {
 // Narrow algorithm-verb detector: these 8 verbs signal explicit multi-phase
 // (ISC-gated) algorithm work. Everything else that passes the trivia gates
 // upstream (length, praise, system-text) is treated as native mode.
-const ALGO_ACTION_RE = /\b(implement|build|create|architect|design|migrate|deploy|refactor)\b/i;
-function isNativeMode(prompt: string): boolean { return !ALGO_ACTION_RE.test(prompt.trim()); }
 
 // ══════════════════════════════════════════════════
 // COMBINED INFERENCE
@@ -699,11 +739,11 @@ The session name is a HANDLE. ${PRINCIPAL_NAME} should be able to scan it in a t
 
 If the name doesn't answer all three, it's a keyword label and it's wrong. Re-read the prompt and find the goal.
 
-THINK FIRST: What is ${PRINCIPAL_NAME} actually trying to ACCOMPLISH? Not what words appear, not how he asked, not what surface tokens are present — what is the GOAL?
+THINK FIRST: What is ${PRINCIPAL_NAME} actually trying to ACCOMPLISH? Not what words appear, not how they asked, not what surface tokens are present — what is the GOAL?
 - Words appearing in the prompt are EVIDENCE, not the answer. The goal lives in ${PRINCIPAL_NAME}'s actual question or instruction.
 - Ignore HOW they asked (pull up, show me, continue with, look at, hey, thanks) — those are interaction tokens, not work.
 - Focus on the GOAL (what outcome is being pursued: a decision, a fix, a build, a piece of research, an evaluation).
-- The name should be a complete imperative phrase. Read it aloud — it should sound like "{{PRINCIPAL_NAME}} needs to ___" filled in coherently.
+- The name should be a complete imperative phrase. Read it aloud — it should sound like "${PRINCIPAL_NAME} needs to ___" filled in coherently.
 - **Pasted content rule:** If the user pastes an email, letter, message, quote, document, or any block of text that someone ELSE wrote (signs like "Hey [Name],", a closing like "Thanks,/Best,/Cheers,/Regards,", quoted reviews, copied tweets, forwarded messages), the GOAL is ${PRINCIPAL_NAME}'s question or instruction WRAPPED AROUND that content — NOT words from the pasted content itself. Words like "Thanks", "Hey", "Dear", "Regards", "Agenda", "Accurate", recipient names, sender names, subject lines, and other email/letter tokens are NEVER subjects of work. Find ${PRINCIPAL_NAME}'s actual question ("research...", "is X fair?", "what should I do about...", "help me decide...", "evaluate...") and name the session from THAT.
 - **Decision rule:** If the prompt is "Should I X or Y?" or "Is 20% fair?" the goal is a DECISION. Name it: "Decide [Subject] [Aspect]" or "Evaluate [Subject] [Aspect]".
 - **Question rule:** If the prompt is "What is X?" / "How does X work?" the goal is RESEARCH. Name it: "Research [Subject] [Aspect]".
@@ -716,7 +756,7 @@ Rules:
 - Start with a base-form action verb (Fix, Build, Debug, Refactor, Migrate, Research, Analyze — NOT Fixing, Building).
 - Preserve acronyms in ALL CAPS (LifeOS, TUI, API, UL, CLI, ISC, ISA, BPE).
 - Every word must carry meaning. No filler adverbs (seriously, really, properly), no lone conjunctions, no fragment scraps.
-- Reads as a grammatical phrase: imagine "{{PRINCIPAL_NAME}} needs to ___" — the name fills the blank as a coherent action.
+- Reads as a grammatical phrase: imagine "${PRINCIPAL_NAME} needs to ___" — the name fills the blank as a coherent action.
 
 Examples of separating instruction from subject:
 - "Pull up the LifeOS TUI work and continue" → subject is LifeOS TUI → "Build LifeOS TUI Dashboard Interface"
@@ -803,7 +843,31 @@ function extractSlashCommandName(rawPrompt: string): string | null {
   if (tagged) return tagged[1];
   const firstTok = rawPrompt.trim().split(/\s+/)[0] || '';
   if (/^\/[A-Za-z][A-Za-z0-9_-]*$/.test(firstTok)) return firstTok.slice(1);
+  // Skill-routed commands arrive SLASHLESS: typing "/rc" reaches this hook as
+  // the bare prompt "rc" (verified in a live transcript, 2026-08-12), so both
+  // branches above miss it and the 2-char prompt then dies at MIN_PROMPT_LENGTH —
+  // the session stays unnamed. Accept a bare single-token prompt only when it
+  // matches the on-disk roster (commands/*.md or skills/<name>/), so ordinary
+  // one-word replies ("yes", "ok") can never read as skill runs.
+  const bare = rawPrompt.trim();
+  if (/^[A-Za-z][A-Za-z0-9_-]*$/.test(bare) && isKnownCommandOrSkill(bare)) return bare;
   return null;
+}
+
+/** Case-insensitive membership test against ~/.claude/commands/*.md and ~/.claude/skills/<dir>/. */
+function isKnownCommandOrSkill(token: string): boolean {
+  const lower = token.toLowerCase();
+  try {
+    const { readdirSync } = require('fs') as typeof import('fs');
+    const claudeDir = join(homedir(), '.claude');
+    for (const f of readdirSync(join(claudeDir, 'commands'))) {
+      if (f.toLowerCase() === `${lower}.md`) return true;
+    }
+    for (const d of readdirSync(join(claudeDir, 'skills'))) {
+      if (d.toLowerCase() === lower) return true;
+    }
+  } catch {}
+  return false;
 }
 
 /** "create-storyexplanation" → "Create Storyexplanation". */
@@ -830,25 +894,6 @@ async function main() {
     const isFirstPrompt = !existingNames[sessionId];
     const sanitizedPrompt = sanitizePromptForNaming(prompt);
 
-    // ── Detect current mode for tracking ──
-    const trimmedLower = prompt.trim().toLowerCase().replace(/[.!?,'"]/g, '');
-    const trimmedWords = trimmedLower.split(/\s+/);
-    const isMinimalInteraction = isExplicitRating(prompt) || (
-      trimmedWords.length <= 2 && (
-        POSITIVE_PRAISE_WORDS.has(trimmedLower) || POSITIVE_PHRASES.has(trimmedLower) ||
-        (trimmedWords.length === 2 && trimmedWords.every(w => POSITIVE_PRAISE_WORDS.has(w)))
-      )
-    );
-    const detectedCurrentMode: 'minimal' | 'native' | 'algorithm' =
-      isMinimalInteraction ? 'minimal' :
-      !isNativeMode(prompt) ? 'algorithm' : 'native';
-
-    // The tab's mode/tier token is OWNED by TheRouter (the authoritative
-    // classifier), not derived here. PromptProcessing used to stamp "N" from its
-    // own 8-verb isNativeMode() shadow-classifier, which diverged from TheRouter
-    // and showed "N" on ALGORITHM turns. Now PromptProcessing only sets the working
-    // DESCRIPTION and recovers whatever token TheRouter stamped (see stampWorkingTab).
-
     // ── Slash-command / skill invocation: name deterministically from the command ──
     // A command name (e.g. "/Upgrade") can never satisfy the natural-language
     // naming path (extractFallbackName + inference both want a 5-word action-verb
@@ -860,11 +905,12 @@ async function main() {
       const label = commandNameToLabel(slashCmd);
       const slashName = `${label} Skill Run`;
       storeName(sessionId, slashName, 'slash-command');
-      const sessionMode = isNativeMode(prompt) ? 'native' : 'starting';
-      upsertSession(sessionId, slashName, sanitizedPrompt.slice(0, 120), sessionMode, detectedCurrentMode);
+      upsertSession(sessionId, slashName, sanitizedPrompt.slice(0, 120));
       const slashLabel = getSessionOneWord(sessionId);
       const slashPrefix = slashLabel ? `${slashLabel} | ` : '';
-      setTabState({ title: `⚙️ ${slashPrefix}${label}`, state: 'working', sessionId });
+      // Skill runs are live work with no ISA declared yet — that is exactly
+      // the traverse state, not the pre-Algorithm gear.
+      setAscentTab('traverse', sessionId, `${slashPrefix}${label}`);
       process.exit(0);
     }
 
@@ -877,19 +923,17 @@ async function main() {
         console.error(`[PromptProcessing] Rejected invalid fallback name: "${pendingFallbackName}"`);
         pendingFallbackName = null;
       }
-      const sessionMode = isNativeMode(prompt) ? 'native' : 'starting';
       // Upsert both native and starting. Native shows in the Native tab
       // (no phase strip); starting shows in Algorithm with phase progression.
       // Trivial prompts are already filtered by the fast-path gates above
       // (praise words, system text, length < MIN_PROMPT_LENGTH).
-      upsertSession(sessionId, pendingFallbackName || '', sanitizedPrompt.slice(0, 120), sessionMode, detectedCurrentMode);
+      upsertSession(sessionId, pendingFallbackName || '', sanitizedPrompt.slice(0, 120));
     } else {
       const customTitle = getCustomTitle(sessionId);
       if (customTitle && existingNames[sessionId] !== customTitle) {
         storeName(sessionId, customTitle, 'custom-title');
       }
-      const sessionMode = isNativeMode(prompt) ? 'native' : 'starting';
-      upsertSession(sessionId, existingNames[sessionId] || '', '', sessionMode, detectedCurrentMode);
+      upsertSession(sessionId, existingNames[sessionId] || '', '');
     }
 
     // ── Skip Haiku inference on trivial prompts (naming/title not useful) ──
@@ -914,39 +958,37 @@ async function main() {
       process.exit(0);
     }
 
-    // ── Preserve an active Algorithm session's tier+phase across iterations ──
-    // On a follow-up prompt mid-Algorithm-run the prior tab already carries an
-    // "E1".."E5" token and a phase. Re-stamp that phase (updating only the
-    // summary) instead of reverting to the generic working gear — which is the
-    // regression where the orange ⚙️ reappeared and wiped the phase tab.
-    const ALGO_PHASES = new Set(['OBSERVE', 'THINK', 'PLAN', 'BUILD', 'EXECUTE', 'VERIFY', 'LEARN']);
+    // ── Preserve an active run's ascent state across iterations ──
+    // On a follow-up prompt mid-run the prior tab already carries a state;
+    // re-stamp it (updating only the summary) instead of reverting to the
+    // generic working gear — the regression where the orange ⚙️ reappeared
+    // and wiped the run's tab. The old hand-listed station set here went stale
+    // when the vocabulary moved, so every current run hit the wipe path
+    // (found 2026-07-27); the check is now "is this a live run state?".
     const priorTab = !isFirstPrompt ? readTabState(sessionId) : null;
-    const priorToken = priorTab?.title ? extractModeToken(priorTab.title) : null;
-    const priorPhase = (priorTab?.phase || '').toUpperCase();
-    const algoIteration = !!priorToken && /^E[1-5]$/.test(priorToken) && ALGO_PHASES.has(priorPhase);
+    const priorAscent = priorTab?.ascent;
+    const algoIteration = !!priorAscent && !['idle', 'cairn', 'traverse'].includes(priorAscent);
 
-    /** Set the working/thinking tab, preserving Algorithm phase+tier on iterations. */
-    const stampWorkingTab = (rawTitle: string, thinking: boolean): void => {
-      if (algoIteration) {
-        setPhaseTab(priorPhase as AlgorithmTabPhase, sessionId, rawTitle, priorToken!);
+    /** Set the working tab, preserving the run's ascent state on iterations.
+     * Tab colors are ONLY the six ascent-state colors ({{PRINCIPAL_NAME}}, 2026-08-12) —
+     * the transient 🧠 thinking-purple stamp is retired; the ⚡ activity glyph
+     * (setAscentTab default for live states) carries "working" instead. */
+    const stampWorkingTab = (rawTitle: string, _thinking: boolean): void => {
+      if (algoIteration && priorAscent) {
+        setAscentTab(priorAscent, sessionId, rawTitle);
       } else {
-        // Do NOT self-classify the mode token — TheRouter owns it. Recover the
-        // token already on the tab, but ONLY when the tab shows live work; a stale
-        // completion/idle token from the prior turn is dropped so it can't leak into
-        // this turn (TheRouter stamps the authoritative token ~concurrently).
-        const cur = readTabState(sessionId);
-        const liveToken = cur && cur.state !== 'completed' && cur.state !== 'idle'
-          ? (extractModeToken(cur.title) || undefined)
-          : undefined;
-        const icon = thinking ? '🧠' : '⚙️';
-        const stampState = thinking ? 'thinking' : (liveToken === 'N' ? 'native' : 'working');
-        setTabState({ title: `${icon} ${rawTitle}`, state: stampState, sessionId, modeToken: liveToken });
+        // Un-ISA'd live work is traverse (🥾) — on the hill without a declared
+        // route, not the retired pre-Algorithm working gear.
+        setAscentTab('traverse', sessionId, rawTitle);
       }
     };
 
     // ── DETERMINISTIC TAB TITLE (immediate, purple/thinking) ──
+    // Follow-ups keep the session's identity on the tab; the raw prompt is
+    // only a title source on the first prompt, before a session name exists.
+    const sessionTitle = !isFirstPrompt ? followupTitleFromSessionName(sessionId) : null;
     const deterministicTitle = quickTitle(prompt);
-    const thinkingTitle = deterministicTitle || getWorkingFallback();
+    const thinkingTitle = sessionTitle || deterministicTitle || getWorkingFallback();
     stampWorkingTab(thinkingTitle, true);
 
     // ── 7.0.0 BPE: inference is FIRST-PROMPT-ONLY ──
@@ -955,8 +997,8 @@ async function main() {
     // quickTitle path already produced a good tab title, so re-running the LLM per prompt
     // was ~6s of per-turn latency for tab cosmetics. Finalize the deterministic tab and exit.
     if (!isFirstPrompt) {
-      const followupTitle = deterministicTitle && isValidWorkingTitle(deterministicTitle)
-        ? deterministicTitle : getWorkingFallback();
+      const followupTitle = sessionTitle
+        || (deterministicTitle && isValidWorkingTitle(deterministicTitle) ? deterministicTitle : getWorkingFallback());
       stampWorkingTab(followupTitle, false);
       appendPromptProcessingTelemetry({
         timestamp: new Date().toISOString(),
@@ -1017,15 +1059,15 @@ async function main() {
         stampWorkingTab(finalTitle, false);
 
         // ── Voice announcement (desktop channel only) ──
-        // Remote channels (Telegram, iMessage) do not surface the tab-title
+        // Remote channels (iMessage, Siri) do not surface the tab-title
         // announcement audibly — it would leak desktop voice for a
-        // Telegram-originated turn. Tab title is set regardless above.
+        // remote-originated turn. Tab title is set regardless above.
         const voiceContent = finalTitle && isValidWorkingTitle(finalTitle) ? finalTitle : null;
         if (voiceContent) {
           if (isDesktopChannel()) {
             const identity = getIdentity();
             try {
-              await fetch('http://localhost:31337/notify', {
+              await fetch(`${PULSE_BASE}/notify`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1053,7 +1095,13 @@ async function main() {
             const nameWords = r.session_name.trim().split(/\s+/).slice(0, 5);
             const label = nameWords.map(w => titleCase(w)).join(' ');
             const hasProfanity = nameWords.some(w => PROFANITY_WORDS.has(w.toLowerCase()));
-            if (label && nameWords.length >= 2 && nameWords.every(w => w.length >= 2) && !hasProfanity && isValidSessionName(label)) {
+            // No per-word length floor: single-char words are legitimate in real
+            // names ("Command K Palette", "Add A Record") — a ≥2-char rule here
+            // silently discarded valid inference names.
+            // Shape-only validation here — the strict verb-whitelist validator
+            // is for the word-scraping fallback, not for the model.
+            // public issue #1718, @xmasyx
+            if (label && !hasProfanity && isValidInferredSessionName(label)) {
               storeName(sessionId, label, 'inference-haiku');
               inferenceNameStored = true;
             } else if (label) {
@@ -1106,6 +1154,38 @@ async function main() {
         source: 'inference-error',
         error: String(err).slice(0, 80),
         latency_ms: Date.now() - inferenceStart,
+      });
+    }
+
+    // ── Last-resort naming backstop (first prompt only) ──
+    // Every path above can reject: inference name fails validation, fallback is
+    // null. This block scrapes top content words off the prompt as a final
+    // attempt — but it must clear the same validator every other stored name
+    // clears. It used to bypass it, which made the stored name a raw prompt
+    // slice; NOISE_WORDS is English-only, so on a non-English prompt the
+    // "content words" are the articles and prepositions and the fragment
+    // becomes that session's permanent statusline label. An unnamed session
+    // (naming retries on the next prompt) beats a name we can't vouch for.
+    // public issue #1774, @xmasyx
+    if (isFirstPrompt && !readSessionNames()[sessionId]) {
+      const contentWords = sanitizedPrompt
+        .replace(NON_WORD_CHARS, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 0 && !NOISE_WORDS.has(w.toLowerCase()))
+        .slice(0, 5);
+      const lastResort = contentWords.length >= 2
+        ? contentWords.map(w => titleCase(w)).join(' ')
+        : `Session ${new Date().toISOString().slice(0, 10)}`;
+      const accepted = isValidSessionName(lastResort);
+      if (accepted) storeName(sessionId, lastResort, 'last-resort');
+      else console.error(`[PromptProcessing] Rejected last-resort name: "${lastResort}"`);
+      appendPromptProcessingTelemetry({
+        timestamp: new Date().toISOString(),
+        session_id: sessionId,
+        prompt_excerpt: cleanPrompt.slice(0, 120),
+        session_name: accepted ? lastResort : null,
+        source: accepted ? 'last-resort-name' : 'last-resort-rejected',
+        latency_ms: 0,
       });
     }
 

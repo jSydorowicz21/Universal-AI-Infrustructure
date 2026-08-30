@@ -23,9 +23,19 @@
 
 import { existsSync, readFileSync, appendFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { parseMemoryContent, read as memoryRead, BEGIN_MARKER, END_MARKER } from "./MemoryWriter";
+import { assessCortexEvidence, collectCortexEvidence } from "./CortexHealth";
+import { atomicWriteJSON } from "../PULSE/lib/atomic-write";
+import { homedir } from "node:os";
 
-const HOME = process.env.HOME || "";
-const CLAUDE = join(HOME, ".claude");
+// CLI script, not a library: the checks below run at module top level and end in
+// process.exit. Spawn it (MemoryHealthGate does); never import it.
+if (!import.meta.main) {
+  throw new Error("MemoryHealthCheck.ts is a CLI script with top-level side effects — spawn it via bun, never import it.");
+}
+
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
+const CLAUDE = process.env.CORTEX_HEALTH_ROOT || join(HOME, ".claude");
 const HOOKS_DIR = join(CLAUDE, "hooks");
 const TOOLS_DIR = join(CLAUDE, "LIFEOS/TOOLS");
 const OBS_DIR = join(CLAUDE, "LIFEOS/MEMORY/OBSERVABILITY");
@@ -246,13 +256,66 @@ else add("principal-memory-present", "ok", "PRINCIPAL_MEMORY.md present.");
 if (!existsSync(DA_MEM)) add("da-memory-missing", "critical", "DA_MEMORY.md missing.");
 else add("da-memory-present", "ok", "DA_MEMORY.md present.");
 
+// CHECK 7.5: marker structural sanity — exactly one BEGIN and one END, in order.
+// The corruption this catches (END-before-BEGIN plus a duplicate-END stack growing
+// +1 per write) blinded every strict reader to 0 entries while cap-pressure kept
+// reporting green headroom. Structural damage must be a RED signal, not silence;
+// the next canonical MemoryWriter write heals it. (public PR #1593, @anikinsasha)
+for (const [label, path] of [["principal", PRINCIPAL_MEM], ["da", DA_MEM]] as const) {
+  if (!existsSync(path)) continue;
+  try {
+    const lines = readFileSync(path, "utf-8").split("\n").map(l => l.trim());
+    const begins = lines.filter(l => l === BEGIN_MARKER).length;
+    const ends = lines.filter(l => l === END_MARKER).length;
+    const beginAt = lines.indexOf(BEGIN_MARKER);
+    const endAt = lines.indexOf(END_MARKER);
+    const inverted = beginAt !== -1 && endAt !== -1 && endAt < beginAt;
+    if (begins === 1 && ends === 1 && !inverted) {
+      add(`markers-ok:${label}`, "ok", `${label} memory markers well-formed (1 BEGIN, 1 END, in order).`);
+    } else {
+      add(
+        `markers-corrupt:${label}`,
+        "critical",
+        `${label} memory markers malformed (${begins} BEGIN, ${ends} END${inverted ? ", END before BEGIN" : ""}) — readers may load nothing. The next MemoryWriter curation write heals it.`,
+        { begins, ends, inverted },
+      );
+    }
+  } catch (e) {
+    add(`markers-unreadable:${label}`, "warn", `Could not read ${label} memory for marker check: ${(e as Error)?.message}`);
+  }
+}
+
+// CHECK 7.6: pending silent loss — entries on disk that read() excludes as invalid.
+// The reviewer's set-overwrite submits read()'s `entries`, so anything excluded here
+// is erased by the next write with no trace in any log. Surface it while it still exists.
+for (const [label, path] of [["principal", PRINCIPAL_MEM], ["da", DA_MEM]] as const) {
+  if (!existsSync(path)) continue;
+  try {
+    const r = memoryRead(path);
+    if ("code" in r) continue;
+    if (r.dropped_invalid.length > 0) {
+      add(
+        `pending-silent-loss:${label}`,
+        "warn",
+        `${label} memory has ${r.dropped_invalid.length} on-disk entr${r.dropped_invalid.length === 1 ? "y" : "ies"} that read() excludes as invalid — the next curation write erases them silently.`,
+        { dropped: r.dropped_invalid },
+      );
+    }
+  } catch { /* probe IO errors are recorded by CHECK 7.5, never crash the run */ }
+}
+
 // CHECK 8: cap-pressure — the exact failure class that sat silent for two weeks.
 // A file AT cap can't accept new memory; near-cap means the next curation must
 // consolidate or it jams. (Eviction now works, so this is a warning not a freeze.)
+// Counts via the shared lenient parser: the old regex returned 0 on a corrupted
+// file, which reported full headroom on a file nobody could read.
 function entryCount(path: string): number {
   if (!existsSync(path)) return 0;
-  const m = readFileSync(path, "utf-8").match(/<!-- BEGIN ENTRIES -->([\s\S]*?)<!-- END ENTRIES -->/);
-  return m ? m[1].split("\n").map(l => l.trim()).filter(l => l.length > 0).length : 0;
+  try {
+    return parseMemoryContent(readFileSync(path, "utf-8")).entries.length;
+  } catch {
+    return 0;
+  }
 }
 for (const [label, path] of [["principal", PRINCIPAL_MEM], ["da", DA_MEM]] as const) {
   const n = entryCount(path);
@@ -268,7 +331,11 @@ if (existsSync(REVIEWER_RUNS)) {
   try {
     const recent = readFileSync(REVIEWER_RUNS, "utf-8").trim().split("\n").slice(-5)
       .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    const failed = recent.filter((r: any) => r.ok === false || r.parse_ok === false);
+    const skips = recent.filter((r: any) => r.skipped === true);
+    const failed = recent.filter((r: any) => (r.ok === false || r.parse_ok === false) && r.skipped !== true);
+    // Skips are healthy no-ops individually, but an unbroken streak means the
+    // reviewer never finds anything to curate — that's an extractor problem.
+    if (recent.length >= 5 && skips.length === recent.length) add("reviewer-all-skips", "warn", `All last ${recent.length} reviewer runs skipped (nothing extracted) — check the exchange extractor.`, { skips: skips.length });
     const capDrops = recent.filter((r: any) =>
       Array.isArray(r?.dispatch_summary?.failures) &&
       r.dispatch_summary.failures.some((f: any) => String(f?.error || "").includes("EAT_CAP")));
@@ -277,6 +344,23 @@ if (existsSync(REVIEWER_RUNS)) {
     else if (failed.length === 0 && capDrops.length === 0) add("reviewer-healthy", "ok", "Recent reviewer runs completed cleanly.");
   } catch { /* non-fatal */ }
 }
+
+// F5: evidence-driven Cortex health. Paths and clock are injectable so tests never touch live state.
+function cortexThresholdEnv(name: string): number | undefined {
+  const raw = process.env[name]; if (raw === undefined || raw === "") return undefined;
+  const value = Number(raw); if (!Number.isFinite(value) || value <= 0) { add("cortex-threshold-invalid", "critical", `${name} must be finite and greater than zero.`, { name, value: raw }); return undefined; }
+  return value;
+}
+const retrievalStaleMs = cortexThresholdEnv("CORTEX_RETRIEVAL_STALE_MS");
+const proposalBacklog = cortexThresholdEnv("CORTEX_PROPOSAL_BACKLOG");
+const observabilityMaxBytes = cortexThresholdEnv("CORTEX_OBSERVABILITY_MAX_BYTES");
+const observabilityMaxAgeMs = cortexThresholdEnv("CORTEX_OBSERVABILITY_MAX_AGE_MS");
+const cortexEvidence = collectCortexEvidence({ root: CLAUDE, nowMs: process.env.CORTEX_HEALTH_NOW ? Date.parse(process.env.CORTEX_HEALTH_NOW) : Date.now(), thresholds: {
+  ...(retrievalStaleMs === undefined ? {} : { retrievalStaleMs }), ...(proposalBacklog === undefined ? {} : { proposalBacklog }),
+  ...(observabilityMaxBytes === undefined ? {} : { observabilityMaxBytes }), ...(observabilityMaxAgeMs === undefined ? {} : { observabilityMaxAgeMs }),
+}, indexManifest: process.env.CORTEX_INDEX_MANIFEST });
+const cortexAssessment = assessCortexEvidence(cortexEvidence);
+for (const finding of cortexAssessment.findings) add(finding.id, finding.severity, finding.message, finding.evidence);
 
 // SUMMARY
 const criticals = findings.filter(f => f.severity === "critical");
@@ -289,19 +373,33 @@ const report = {
   ts: new Date().toISOString(),
   overall,
   counts: { critical: criticals.length, warn: warns.length, ok: oks.length },
+  thresholds: cortexAssessment.thresholds,
+  evidence: cortexEvidence,
   findings: findings.filter(f => f.severity !== "ok"),
   ok_summary: oks.map(o => o.id),
 };
 
 // Append to observability log
 try {
+  if (process.env.CORTEX_HEALTH_NO_WRITE === "1") throw new Error("health log write disabled");
   if (!existsSync(OBS_DIR)) mkdirSync(OBS_DIR, { recursive: true });
   appendFileSync(HEALTH_LOG, JSON.stringify(report) + "\n");
 } catch (err) {
   // non-fatal
 }
 
-console.log(JSON.stringify(report, null, 2));
+// Optional machine-readable report for fixture/automation consumers. Keep this
+// separate from the append-only health log so CORTEX_HEALTH_NO_WRITE can disable
+// live observability writes without suppressing an explicitly requested report.
+try {
+  if (process.env.CORTEX_HEALTH_REPORT_PATH) {
+    atomicWriteJSON(process.env.CORTEX_HEALTH_REPORT_PATH, report);
+  }
+} catch {
+  // Preserve the CLI existing stdout, stderr, and health-derived exit semantics.
+}
+
+await Bun.write(Bun.stdout, JSON.stringify(report, null, 2) + "\n");
 
 if (overall === "critical") process.exit(2);
 if (overall === "warn") process.exit(1);

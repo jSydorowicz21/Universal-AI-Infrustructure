@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
 /**
- * Conduit launchd installer. Registers `com.lifeos.conduit` to run `conduit capture`
- * on a fixed interval — the stable pattern (stateless one-shot polls restarted by
- * launchd, no long-lived daemon). Mirrors InstallWorkSweep / InstallDerivedSync.
+ * Conduit service installer. Registers `com.lifeos.conduit` to run `conduit capture`
+ * on a fixed interval — stateless one-shot polls restarted by the native scheduler,
+ * with no long-lived daemon. Mirrors InstallWorkSweep / InstallDerivedSync.
  *
- *   bun InstallConduit.ts            install + load
- *   bun InstallConduit.ts --uninstall  unload + remove
- *   bun InstallConduit.ts --status     show launchd state
+ *   bun InstallConduit.ts              install + enable
+ *   bun InstallConduit.ts --uninstall  disable + remove
+ *   bun InstallConduit.ts --status     show native scheduler state
  */
 import { execFileSync } from "node:child_process"
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
@@ -14,7 +14,8 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { loadConfig } from "./config.ts"
 import { DATA_ROOT } from "./paths.ts"
-
+import * as systemd from "../../TOOLS/lib/SystemdUser"
+import { planWindowsScheduledTask } from "../../UNIVERSAL/services"
 const LABEL = "com.lifeos.conduit"
 const PLIST = join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`)
 const CONDUIT = join(import.meta.dir, "conduit.ts")
@@ -84,7 +85,63 @@ function status(): void {
   }
 }
 
-const arg = process.argv[2]
-if (arg === "--uninstall") uninstall()
-else if (arg === "--status") status()
-else install()
+/* ── systemd --user backend (Linux only) ────────────────────────────────────
+ * Strictly additive: every line above is the launchd path and is unchanged.
+ * launchd keeps owning the job on darwin and systemd owns it on linux, so no
+ * install ever has two schedulers for one job.
+ * Translation rules live in ../../TOOLS/lib/SystemdUser.ts.
+ * ported from public PR #1698, @elhoim
+ * ------------------------------------------------------------------------- */
+
+async function linuxSpec(): Promise<systemd.UnitSpec> {
+  return {
+    label: LABEL,
+    description: "LifeOS Conduit capture",
+    // BUN is process.execPath, already absolute — no `which` lookup needed.
+    exec: [BUN, CONDUIT, "capture"],
+    logPath: join(LOG_DIR, "conduit.out.log"),
+    errLogPath: join(LOG_DIR, "conduit.err.log"),
+    // Reads the same config key the plist does, so one setting drives both.
+    schedule: { kind: "interval", seconds: loadConfig().pollIntervalSec },
+  }
+}
+
+async function linuxMain(a: string | undefined): Promise<void> {
+  const spec = await linuxSpec()
+  const log = (m: string) => console.log(`[InstallConduit] ${m}`)
+  if (a === "--uninstall") { await systemd.uninstall(spec, log); return }
+  if (a === "--status") { if (!(await systemd.status(spec, log))) process.exit(1); return }
+  if (!(await systemd.install(spec, log))) process.exit(1)
+}
+
+async function main(a: string | undefined): Promise<void> {
+  if (systemd.isLinux()) { await linuxMain(a); return }
+  if (process.platform === "win32") {
+    const intervalSec = loadConfig().pollIntervalSec
+    const plan = planWindowsScheduledTask({ taskName: LABEL, executable: BUN, args: [CONDUIT, "capture"], intervalSeconds: intervalSec })
+    if (a === "--uninstall") {
+      try { execFileSync(plan.executable, plan.deleteArgs, { stdio: "ignore", windowsHide: true }) } catch { /* already absent */ }
+      console.log("Uninstalled " + LABEL)
+      return
+    }
+    if (a === "--status") {
+      try {
+        execFileSync(plan.executable, plan.queryArgs, { stdio: "inherit", windowsHide: true })
+      } catch {
+        console.log(LABEL + " not installed")
+        process.exitCode = 1
+      }
+      return
+    }
+    mkdirSync(LOG_DIR, { recursive: true })
+    execFileSync(plan.executable, plan.createArgs, { stdio: "inherit", windowsHide: true })
+    console.log("Installed " + LABEL + " → polls every " + intervalSec + "s")
+    return
+  }
+  if (process.platform !== "darwin") throw new Error("Unsupported service platform: " + process.platform)
+  if (a === "--uninstall") uninstall()
+  else if (a === "--status") status()
+  else install()
+}
+
+if (import.meta.main) await main(process.argv[2])

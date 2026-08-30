@@ -28,20 +28,22 @@ import {
   statSync,
 } from "node:fs";
 import { join } from "node:path";
-import { resolveDataRoot, resolveLifeosRoot } from "../../UNIVERSAL/platform";
+import { parseMemoryContent } from "../../TOOLS/MemoryWriter";
+import { isTerminalStatus } from "../lib/memory-proposals";
+import { homedir } from "node:os";
 
-const LIFEOS_ROOT = resolveLifeosRoot(process.env, "claude");
-const USER_ROOT = join(resolveDataRoot(process.env), "USER");
-const OBS_DIR = join(LIFEOS_ROOT, "MEMORY", "OBSERVABILITY");
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
+const CLAUDE = join(HOME, ".claude");
+const OBS_DIR = join(CLAUDE, "LIFEOS/MEMORY/OBSERVABILITY");
 
 const REVIEW_STATE = join(OBS_DIR, "review-state.json");
 const HEALTH_LOG = join(OBS_DIR, "memory-health.jsonl");
 const FIRES_LOG = join(OBS_DIR, "reviewer-fires.jsonl");
 const PROPOSALS_LOG = join(OBS_DIR, "pending-proposals.jsonl");
 const REVIEWER_RUNS = join(OBS_DIR, "reviewer-runs");
-const PRINCIPAL_MEMORY = join(USER_ROOT, "PRINCIPAL", "PRINCIPAL_MEMORY.md");
-const DA_MEMORY = join(USER_ROOT, "DIGITAL_ASSISTANT", "DA_MEMORY.md");
-const CADENCE_CONFIG = join(USER_ROOT, "CONFIG", "memory-review.json");
+const PRINCIPAL_MEMORY = join(CLAUDE, "LIFEOS/USER/PRINCIPAL/PRINCIPAL_MEMORY.md");
+const DA_MEMORY = join(CLAUDE, "LIFEOS/USER/DIGITAL_ASSISTANT/DA_MEMORY.md");
+const CADENCE_CONFIG = join(CLAUDE, "LIFEOS/USER/CONFIG/memory-review.json");
 
 interface ModuleState {
   running: boolean;
@@ -110,13 +112,10 @@ function safeReadJsonLines(path: string, lastN: number = 50): any[] {
 function readMemoryFile(path: string): { entries: string[]; count: number; charsUsed: number } {
   if (!existsSync(path)) return { entries: [], count: 0, charsUsed: 0 };
   try {
-    const raw = readFileSync(path, "utf-8");
-    const start = raw.indexOf("<!-- BEGIN ENTRIES -->");
-    const end = raw.indexOf("<!-- END ENTRIES -->");
-    if (start === -1 || end === -1 || end < start) return { entries: [], count: 0, charsUsed: 0 };
-    const block = raw.slice(start + "<!-- BEGIN ENTRIES -->".length, end).trim();
-    if (!block) return { entries: [], count: 0, charsUsed: 0 };
-    const entries = block.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+    // Shared lenient parser (MemoryWriter owns it) — the old strict indexOf slice
+    // showed an EMPTY panel on marker-corrupted files, which is how weeks of
+    // zero-memory sessions went unnoticed. (public PR #1593, @anikinsasha)
+    const { entries } = parseMemoryContent(readFileSync(path, "utf-8"));
     const charsUsed = entries.reduce((s, e) => s + e.length, 0);
     return { entries, count: entries.length, charsUsed };
   } catch {
@@ -236,7 +235,13 @@ function buildSnapshot() {
     health,
     lastFireCount: firesAll.length,
     recentFires: firesAll.slice(-5),
-    pendingProposals: proposals.filter((p: any) => p.status !== "auto-applied").length,
+    // Terminal statuses come from lib/memory-proposals.ts — the old inline list
+    // counted rejected/accepted/edited rows as pending forever (public issue
+    // #1610, @xmasyx) and then drifted from the union again once
+    // "applied-elsewhere" existed (public issue #1805, @catchingknives).
+    // "sent" stays counted: surfaced, awaiting a decision. So does any status
+    // the union hasn't caught up with — unknown means open, not invisible.
+    pendingProposals: proposals.filter((p: any) => !isTerminalStatus(p.status)).length,
     autoAppliedProposals: proposals.filter((p: any) => p.status === "auto-applied").length,
     proposalsRecent: proposals.slice(-5),
     principalMemory: principal,

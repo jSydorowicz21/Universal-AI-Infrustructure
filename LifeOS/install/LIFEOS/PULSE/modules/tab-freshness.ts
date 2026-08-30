@@ -28,8 +28,9 @@
 
 import { existsSync, statSync, readdirSync, readFileSync } from "fs"
 import { join } from "path"
+import { homedir } from "node:os";
 
-const HOME = process.env.HOME ?? "~"
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir()
 const LIFEOS_DIR = join(HOME, ".claude", "LIFEOS")
 const USER_DIR = join(LIFEOS_DIR, "USER")
 const TELOS_DIR = join(USER_DIR, "TELOS")
@@ -85,6 +86,12 @@ const REGISTRY: Record<string, SourceSpec[]> = {
     { name: "hooks/", path: join(HOME, ".claude", "hooks"), expand: true },
     { name: "settings.json", path: join(HOME, ".claude", "settings.json") },
   ],
+  algorithm: [
+    { name: "ALGORITHM/", path: join(LIFEOS_DIR, "ALGORITHM"), expand: true },
+    { name: "RULES/", path: join(LIFEOS_DIR, "RULES"), expand: true },
+    { name: "LIFEOS_SYSTEM_PROMPT.md", path: join(LIFEOS_DIR, "LIFEOS_SYSTEM_PROMPT.md") },
+    { name: "OPERATIONAL_RULES.md", path: join(USER_DIR, "CONFIG", "OPERATIONAL_RULES.md") },
+  ],
   skills: [
     { name: "skills/", path: join(HOME, ".claude", "skills"), expand: true },
   ],
@@ -103,13 +110,26 @@ const REGISTRY: Record<string, SourceSpec[]> = {
   performance: [
     { name: "MEMORY/OBSERVABILITY/", path: join(LIFEOS_DIR, "MEMORY", "OBSERVABILITY"), expand: true },
   ],
-  amber: [
+  synapse: [
     { name: "KNOWLEDGE/Ideas/", path: join(LIFEOS_DIR, "MEMORY", "KNOWLEDGE", "Ideas"), expand: true },
     { name: "_X/State/", path: join(HOME, ".claude", "skills", "_X", "State") },
+  ],
+  ledger: [
+    { name: "SYSTEMUPDATES/index.json", path: join(LIFEOS_DIR, "MEMORY", "SYSTEMUPDATES", "index.json") },
+    { name: "SYSTEMUPDATES/deploys.jsonl", path: join(LIFEOS_DIR, "MEMORY", "SYSTEMUPDATES", "deploys.jsonl") },
+    { name: "VERSION", path: join(LIFEOS_DIR, "VERSION") },
+    { name: "STATE/integrity/", path: join(LIFEOS_DIR, "MEMORY", "STATE", "integrity"), expand: true },
   ],
   assistant: [
     { name: "DA_IDENTITY.md", path: join(USER_DIR, "DIGITAL_ASSISTANT", "DA_IDENTITY.md") },
     { name: "PRINCIPAL_IDENTITY.md", path: join(USER_DIR, "PRINCIPAL", "PRINCIPAL_IDENTITY.md") },
+  ],
+  gear: [
+    { name: "GEAR.md", path: join(USER_DIR, "GEAR.md") },
+  ],
+  atlas: [
+    { name: "atlas/snapshot.json", path: join(HOME, ".local", "state", "lifeos", "atlas", "snapshot.json") },
+    { name: "atlas/atlas.db", path: join(HOME, ".local", "state", "lifeos", "atlas", "atlas.db") },
   ],
 }
 
@@ -149,7 +169,8 @@ function resolveSpec(spec: SourceSpec): ResolvedSource[] {
     const out: ResolvedSource[] = []
     let entries: string[] = []
     try {
-      entries = readdirSync(spec.path).filter((e) => e.endsWith(".md") || e.endsWith(".json") || e.endsWith(".yaml"))
+      // ported from public PR #1741, @elhoim — `.yml` is as valid a YAML suffix as `.yaml`
+      entries = readdirSync(spec.path).filter((e) => e.endsWith(".md") || e.endsWith(".json") || e.endsWith(".yaml") || e.endsWith(".yml"))
     } catch {
       // unreadable dir — record as missing
       return [{ name: spec.name, path: spec.path, exists: false, mtime: null }]

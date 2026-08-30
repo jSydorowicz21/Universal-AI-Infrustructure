@@ -1,26 +1,31 @@
 /**
- * tab-constants.ts - Single source of truth for tab title colors and states.
+ * tab-constants.ts - Tab title colors and states for Kitty/cmux.
  *
- * All hooks that touch tab titles import from here.
- * No more independent color definitions across 6 files.
- *
- * Phase-aware tabs: Each Algorithm phase gets a distinct background color
- * and symbol, so multiple Kitty tabs show at-a-glance where each session
- * is in the Algorithm.
+ * Algorithm run states (icon, label, color, tab background) are NOT defined
+ * here — they live in `LIFEOS/TOOLS/ascent.ts`, the one table every surface
+ * reads (Kitty, cmux, work.json, the status line, Pulse, the ISA mirror).
+ * This file owns only the non-Algorithm tab states: the plain working/thinking/
+ * question colors used before a run has an ISA behind it.
  */
+
+import { ASCENT, ASCENT_STATES, type AscentState } from '../../LIFEOS/TOOLS/ascent';
 
 // Each state carries its inactive-tab background AND text color. Dark backgrounds
 // use light gray text (#A0A0A0); light/bright backgrounds need dark text or the
 // gray washes out (the native-orange case — gray on #C2660A was ~1.5:1).
+// Since 2026-08-12 every LIVE stamp routes through setAscentTab, so painted
+// tabs only ever wear the six run-state colors from the ascent table ({{PRINCIPAL_NAME}}:
+// "tab colors the same as the color of the task in the phase list"). The
+// thinking/working/native/question/blocked entries below are RETIRED from all
+// hook paths — kept only so setTabState stays total over TabState for any
+// stale state file or out-of-tree caller; do not reintroduce them as stamps.
 export const TAB_COLORS = {
-  thinking:  { inactiveBg: '#1E0A3C', inactiveFg: '#A0A0A0', label: 'purple' },
-  working:   { inactiveBg: '#804000', inactiveFg: '#A0A0A0', label: 'orange' },
-  // NATIVE-mode working state — a lighter, brighter orange so native turns are
-  // visually distinct from Algorithm's darker build/execute oranges. Dark text
-  // for legibility on the bright fill (~5:1 vs the gray's ~1.5:1).
-  native:    { inactiveBg: '#C2660A', inactiveFg: '#1A1206', label: 'native-orange' },
-  question:  { inactiveBg: '#0D4F4F', inactiveFg: '#A0A0A0', label: 'teal' },
-  completed: { inactiveBg: '#022800', inactiveFg: '#A0A0A0', label: 'green' },
+  thinking:  { inactiveBg: '#1E0A3C', inactiveFg: '#A0A0A0', label: 'purple' },        // RETIRED 2026-08-12
+  working:   { inactiveBg: '#804000', inactiveFg: '#A0A0A0', label: 'orange' },        // RETIRED 2026-08-12
+  native:    { inactiveBg: '#C2660A', inactiveFg: '#1A1206', label: 'native-orange' }, // RETIRED 2026-07-28
+  question:  { inactiveBg: '#0D4F4F', inactiveFg: '#A0A0A0', label: 'teal' },          // RETIRED 2026-08-12 (⏳ glyph carries it)
+  blocked:   { inactiveBg: '#B58900', inactiveFg: '#1A1206', label: 'amber' },         // RETIRED 2026-08-12 (⏳ glyph carries it)
+  completed: { inactiveBg: ASCENT.cairn.tabBg, inactiveFg: ASCENT.cairn.tabFg, label: 'green' },
   error:     { inactiveBg: '#804000', inactiveFg: '#A0A0A0', label: 'orange' },
   idle:      { inactiveBg: 'none',    inactiveFg: 'none',    label: 'default' },
 } as const;
@@ -31,21 +36,5 @@ export const INACTIVE_TAB_FG = '#A0A0A0';
 
 export type TabState = keyof typeof TAB_COLORS;
 
-/**
- * Phase-specific tab configuration.
- * Each Algorithm phase has a unique symbol and dark background color
- * optimized for readability with light text on Kitty tab bar.
- */
-export const PHASE_TAB_CONFIG: Record<string, { symbol: string; inactiveBg: string; label: string; gerund: string }> = {
-  OBSERVE:  { symbol: '👁️', inactiveBg: '#0C2D48', label: 'observe',  gerund: 'Observing.' },
-  THINK:    { symbol: '🧠', inactiveBg: '#2D1B69', label: 'think',    gerund: 'Thinking.' },
-  PLAN:     { symbol: '📋', inactiveBg: '#1E1B4B', label: 'plan',     gerund: 'Planning.' },
-  BUILD:    { symbol: '🔨', inactiveBg: '#78350F', label: 'build',    gerund: 'Building.' },
-  EXECUTE:  { symbol: '⚡', inactiveBg: '#713F12', label: 'execute',  gerund: 'Executing.' },
-  VERIFY:   { symbol: '✅', inactiveBg: '#14532D', label: 'verify',   gerund: 'Verifying.' },
-  LEARN:    { symbol: '📚', inactiveBg: '#134E4A', label: 'learn',    gerund: 'Learning.' },
-  COMPLETE: { symbol: '✅', inactiveBg: '#022800', label: 'complete', gerund: 'Complete.' },
-  IDLE:     { symbol: '',   inactiveBg: 'none',    label: 'idle',     gerund: '' },
-};
-
-export type AlgorithmTabPhase = keyof typeof PHASE_TAB_CONFIG;
+export { ASCENT, ASCENT_STATES };
+export type { AscentState };

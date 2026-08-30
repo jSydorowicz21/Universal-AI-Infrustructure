@@ -29,10 +29,11 @@ for (const __k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
  *   bun ~/.claude/LIFEOS/TOOLS/TelosFreshness.ts --bump <slug>   → mark a section fresh
  */
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, statSync, readdirSync } from "fs";
 import { getDAName } from "../../hooks/lib/identity"
 
 import { basename, join } from "path";
+import { homedir } from "node:os";
 
 // Normalize env path vars that Claude Code injects without shell expansion (LifeOS#1404)
 for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
@@ -41,7 +42,7 @@ for (const k of ["LIFEOS_DIR", "LIFEOS_CONFIG_DIR", "PROJECTS_DIR"]) {
 }
 
 
-const HOME = process.env.HOME || "";
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
 const LIFEOS_DIR = process.env.LIFEOS_DIR || join(HOME, ".claude", "LIFEOS");
 const TELOS_PATH = join(LIFEOS_DIR, "USER", "TELOS", "TELOS.md");
 const DA_IDENTITY_PATH = join(LIFEOS_DIR, "USER", "DIGITAL_ASSISTANT", "DA_IDENTITY.md");
@@ -105,12 +106,12 @@ export const STALENESS_THRESHOLDS: Record<string, number> = {
   da_identity: 180,
   principal_identity: 90,
   projects: 30,
-  pai_system_prompt: 90,
+  lifeos_system_prompt: 90,
   principal_telos: 30,
   architecture_summary: 30,
 
   // Source / authored docs that derivatives inherit from
-  pai_system_architecture: 90,
+  lifeos_system_architecture: 90,
 };
 
 const DEFAULT_THRESHOLD_DAYS = 180;
@@ -166,11 +167,57 @@ export const CONTEXT_FRESHNESS_REGISTRY: ContextFile[] = [
   { slug: "da_identity", path: DA_IDENTITY_PATH, threshold_days: 180, is_auto_generated: false },
   { slug: "principal_identity", path: PRINCIPAL_IDENTITY_PATH, threshold_days: 90, is_auto_generated: false },
   { slug: "projects", path: PROJECTS_PATH, threshold_days: 30, is_auto_generated: false },
-  { slug: "pai_system_prompt", path: LIFEOS_SYSTEM_PROMPT_PATH, threshold_days: 90, is_auto_generated: false },
+  { slug: "lifeos_system_prompt", path: LIFEOS_SYSTEM_PROMPT_PATH, threshold_days: 90, is_auto_generated: false },
   { slug: "principal_telos", path: PRINCIPAL_TELOS_PATH, threshold_days: 30, derived_from: TELOS_PATH, is_auto_generated: true },
   { slug: "architecture_summary", path: ARCHITECTURE_SUMMARY_PATH, threshold_days: 30, derived_from: LIFEOS_ARCHITECTURE_PATH, is_auto_generated: true },
-  { slug: "pai_system_architecture", path: LIFEOS_SYSTEM_ARCHITECTURE_PATH, threshold_days: 90, is_auto_generated: false },
+  { slug: "lifeos_system_architecture", path: LIFEOS_SYSTEM_ARCHITECTURE_PATH, threshold_days: 90, is_auto_generated: false },
 ];
+
+// ─── State-file registry (CURRENT_STATE / IDEAL_STATE dimension files) ────
+//
+// Built dynamically so new dimension files join the freshness surface without
+// a code change. Per-file `review_cadence:` frontmatter (e.g. "30d") overrides
+// the directory default. README/INDEX docs are excluded — they are structure,
+// not claims.
+
+const CURRENT_STATE_DIR = join(LIFEOS_DIR, "USER", "TELOS", "CURRENT_STATE");
+const IDEAL_STATE_DIR = join(LIFEOS_DIR, "USER", "TELOS", "IDEAL_STATE");
+const CURRENT_STATE_DEFAULT_THRESHOLD_DAYS = 30;
+const IDEAL_STATE_DEFAULT_THRESHOLD_DAYS = 90;
+const STATE_DOC_FILES = new Set(["README.md", "INDEX.md"]);
+
+function reviewCadenceDays(path: string): number | null {
+  const { fm } = fileFrontmatter(path);
+  const raw = fm?.review_cadence;
+  if (!raw) return null;
+  const m = raw.match(/^(\d+)\s*d?$/i);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/** Dimension files under CURRENT_STATE/ and IDEAL_STATE/ as freshness entries. */
+export function stateFreshnessRegistry(): ContextFile[] {
+  const entries: ContextFile[] = [];
+  const dirs: Array<[string, string, number]> = [
+    [CURRENT_STATE_DIR, "current_state", CURRENT_STATE_DEFAULT_THRESHOLD_DAYS],
+    [IDEAL_STATE_DIR, "ideal_state", IDEAL_STATE_DEFAULT_THRESHOLD_DAYS],
+  ];
+  for (const [dir, prefix, defaultThreshold] of dirs) {
+    if (!existsSync(dir)) continue;
+    const files = readdirSync(dir)
+      .filter((f) => f.endsWith(".md") && !STATE_DOC_FILES.has(f))
+      .sort();
+    for (const f of files) {
+      const path = join(dir, f);
+      entries.push({
+        slug: `${prefix}_${f.replace(/\.md$/, "").toLowerCase()}`,
+        path,
+        threshold_days: reviewCadenceDays(path) ?? defaultThreshold,
+        is_auto_generated: false,
+      });
+    }
+  }
+  return entries;
+}
 
 /** A-F letter grade. F covers both "overdue" and "never reviewed". */
 export type FreshnessGrade = "A" | "B" | "C" | "D" | "F";
@@ -254,6 +301,75 @@ export function aggregateGrade(grades: FreshnessGrade[]): FreshnessGrade {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
+// Slug → legacy per-topic filename. Inverse of GenerateTelosSummary.ts's
+// LEGACY_FILE_TO_SECTION: the summary reads the legacy file FIRST when it
+// exists, so freshness must honor the same effective source or the two tools
+// disagree — the summary shows real content while every section reports
+// stale/never (public issue #1477). Keep the two maps in sync.
+const LEGACY_SECTION_FILES: Record<string, string> = {
+  mission:     "MISSION.md",
+  goals:       "GOALS.md",
+  problems:    "PROBLEMS.md",
+  strategies:  "STRATEGIES.md",
+  challenges:  "CHALLENGES.md",
+  narratives:  "NARRATIVES.md",
+  traumas:     "TRAUMAS.md",
+  wrong:       "WRONG.md",
+  models:      "MODELS.md",
+  beliefs:     "BELIEFS.md",
+  frames:      "FRAMES.md",
+  wisdom:      "WISDOM.md",
+  predictions: "PREDICTIONS.md",
+
+  // Read-tolerance only (public PR #1587, @asdf8675309). On a split-file TELOS
+  // these sections live in their own sibling files, and freshness scored every
+  // one of them "never" because it only knew the thirteen above. Consolidating
+  // into TELOS.md remains the correct direction — this is not an endorsement of
+  // the split layout, just a refusal to misreport an install that has one.
+  //
+  // Deliberately NOT mirrored into GenerateTelosSummary's LEGACY_FILE_TO_SECTION:
+  // that map governs what the summary RENDERS, and widening it would grow the
+  // generated artifact. These twelve are read for freshness only.
+  ideas:              "IDEAS.md",
+  sparks:             "SPARKS.md",
+  books:              "BOOKS.md",
+  authors:            "AUTHORS.md",
+  bands:              "BANDS.md",
+  movies:             "MOVIES.md",
+  restaurants:        "RESTAURANTS.md",
+  food:               "FOOD_PREFERENCES.md",
+  meetups:            "MEETUPS.md",
+  civic:              "CIVIC.md",
+  learning_interests: "LEARNING.md",
+  team:               "TEAM.md",
+};
+
+/**
+ * Freshness date of a section's legacy per-topic file, when that file exists
+ * (frontmatter `last_updated` first, file mtime as fallback). null when the
+ * install has no legacy file for the slug — the unified-TELOS.md marker is
+ * then the only source, exactly as before.
+ */
+export function legacyTelosFilePath(slug: string, telosPath: string = TELOS_PATH): string | null {
+  const filename = LEGACY_SECTION_FILES[slug];
+  if (!filename) return null;
+  const path = join(telosPath, "..", filename);
+  return existsSync(path) ? path : null;
+}
+
+export function legacyTelosFileDate(slug: string, telosPath: string = TELOS_PATH): Date | null {
+  const path = legacyTelosFilePath(slug, telosPath);
+  if (!path) return null;
+  const { fm } = fileFrontmatter(path);
+  const fromFm = fm ? parseDate(fm.last_updated) : null;
+  if (fromFm) return fromFm;
+  try {
+    return statSync(path).mtime;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Normalize a heading to a stable slug for the threshold map.
  * "Current State" → "current_state"
@@ -262,9 +378,19 @@ export function aggregateGrade(grades: FreshnessGrade[]): FreshnessGrade {
  * "2036 — A Day in the Life..." → "2036"
  */
 export function sectionSlug(heading: string): string {
-  return heading
+  // Drop ALL parenthetical groups BEFORE the dash rule: a dash inside a
+  // parenthetical (e.g. "Current State (The CURRENT -> IDEAL State)") used to
+  // truncate mid-group, leaving an unclosed paren the trailing-paren regex
+  // could not match — which made the Current/Ideal State sections invisible
+  // to their threshold keys (found 2026-08-11, interview-evidence upgrade).
+  let h = heading;
+  // Innermost-out so nested groups ("Wisdom (My ... Aphorisms (from others) ...)")
+  // strip completely; bounded to keep pathological input from spinning.
+  for (let i = 0; i < 8 && /\([^()]*\)/.test(h); i++) {
+    h = h.replace(/\s*\([^()]*\)/g, "");
+  }
+  return h
     .replace(/\s*[—–-].*$/, "")
-    .replace(/\s*\(.*\)\s*$/, "")
     .trim()
     .toLowerCase()
     .replace(/[^\w\d]+/g, "_")
@@ -382,7 +508,18 @@ export function readTelosFreshness(path: string = TELOS_PATH): TelosFreshness {
 
   const raw = readFileSync(path, "utf-8");
   const { fm } = parseFrontmatter(raw);
-  const fileUpdated = parseDate(fm.last_updated);
+  let fileUpdated = parseDate(fm.last_updated);
+  // Template TELOS.md with no frontmatter but real legacy per-topic files:
+  // the newest legacy file dates the corpus (issue #1477). Installs whose
+  // TELOS.md carries frontmatter are untouched by this fallback.
+  if (!fileUpdated) {
+    const legacyDates = Object.keys(LEGACY_SECTION_FILES)
+      .map((slug) => legacyTelosFileDate(slug, path))
+      .filter((d): d is Date => d !== null);
+    if (legacyDates.length) {
+      fileUpdated = new Date(Math.max(...legacyDates.map((d) => d.getTime())));
+    }
+  }
   const now = new Date();
   const fileAgeDays = fileUpdated ? daysBetween(fileUpdated, now) : null;
 
@@ -406,6 +543,11 @@ export function readTelosFreshness(path: string = TELOS_PATH): TelosFreshness {
         break;
       }
     }
+
+    // No marker → effective-source fallback: if this install still authors the
+    // section in a legacy per-topic file (the file GenerateTelosSummary reads
+    // FIRST), that file's freshness IS the section's freshness (issue #1477).
+    if (!updated) updated = legacyTelosFileDate(slug, path);
 
     // First substantive line of the section body, for preview.
     let preview = "";
@@ -441,9 +583,38 @@ export function readTelosFreshness(path: string = TELOS_PATH): TelosFreshness {
   };
 }
 
-export function readContextFreshness(): ContextFreshness {
-  const now = new Date();
-  const files: FileFreshness[] = CONTEXT_FRESHNESS_REGISTRY.map((entry) => {
+/**
+ * Pick the single file to surface as "most stale".
+ *
+ * Ordering is most-overdue first. On a tie, a hand-authored file beats an
+ * auto-generated one, and a derived winner is redirected to the source it
+ * inherits its freshness from — reviewing the derivative is a no-op, since
+ * the generator overwrites it from the source anyway.
+ *
+ * A derived file and its source tie by construction (the derivative inherits
+ * both the source's review marker and its threshold), so registry order alone
+ * decided the winner and pointed the principal at a file they cannot fix.
+ * public issue #1780, @jacobo-ortiz
+ */
+export function pickMostStale(
+  all: FileFreshness[],
+  stale: FileFreshness[],
+): FileFreshness | null {
+  const winner =
+    stale
+      .slice()
+      .sort((a, b) => {
+        const aOver = (a.effective_reviewed_age_days ?? 9999) - a.effective_threshold_days;
+        const bOver = (b.effective_reviewed_age_days ?? 9999) - b.effective_threshold_days;
+        if (bOver !== aOver) return bOver - aOver;
+        return Number(a.is_auto_generated) - Number(b.is_auto_generated);
+      })[0] ?? null;
+
+  if (!winner?.derived_from) return winner;
+  return all.find((file) => file.path === winner.derived_from) ?? winner;
+}
+
+function fileFreshnessFor(entry: ContextFile, now: Date): FileFreshness {
     const own = fileFrontmatter(entry.path);
     const updated = own.fm ? parseDate(own.fm.last_updated) : null;
     const age_days = freshnessAge(updated, now);
@@ -508,16 +679,11 @@ export function readContextFreshness(): ContextFreshness {
       pct: freshnessPct(effective_reviewed_age_days, effective_threshold_days),
       grade: freshnessGrade(effective_reviewed_age_days, effective_threshold_days),
     };
-  });
+}
 
+function assembleContextFreshness(files: FileFreshness[], now: Date): ContextFreshness {
   const staleFiles = files.filter((file) => file.stale);
-  const most_stale = staleFiles
-    .slice()
-    .sort((a, b) => {
-      const aOver = (a.effective_reviewed_age_days ?? 9999) - a.effective_threshold_days;
-      const bOver = (b.effective_reviewed_age_days ?? 9999) - b.effective_threshold_days;
-      return bOver - aOver;
-    })[0] ?? null;
+  const most_stale = pickMostStale(files, staleFiles);
 
   const overall_pct = files.length
     ? Math.round(files.reduce((sum, f) => sum + f.pct, 0) / files.length)
@@ -534,6 +700,23 @@ export function readContextFreshness(): ContextFreshness {
     overall_pct,
     overall_grade,
   };
+}
+
+export function readContextFreshness(): ContextFreshness {
+  const now = new Date();
+  const files = CONTEXT_FRESHNESS_REGISTRY.map((entry) => fileFreshnessFor(entry, now));
+  return assembleContextFreshness(files, now);
+}
+
+/**
+ * Freshness across the CURRENT_STATE/ and IDEAL_STATE/ dimension files —
+ * the same ContextFreshness shape as readContextFreshness(), over the
+ * dynamic state registry. Never reviewed → stale + grade F, honestly.
+ */
+export function readStateFreshness(): ContextFreshness {
+  const now = new Date();
+  const files = stateFreshnessRegistry().map((entry) => fileFreshnessFor(entry, now));
+  return assembleContextFreshness(files, now);
 }
 
 // ─── Writer ───────────────────────────────────────────────────────────────
@@ -680,6 +863,64 @@ export function bumpReviewedTimestamp(filePath: string, by: string = "user"): { 
   return { changed: true };
 }
 
+/**
+ * Stamp a context file after a PROGRAMMATIC write — the memory reviewer applying a
+ * proposal, ProposalGC removing one, any automated appender to an always-loaded file.
+ *
+ * Does two things in one read-modify-write:
+ *   1. `last_updated` / `last_updated_by` → now / `by` (the freshness write clock).
+ *   2. `provenance: template` → `customized`, and ONLY that transition.
+ *
+ * Why (2) matters: `PULSE/Tools/ReleaseAudit.ts` treats `provenance: template` as the
+ * ship permit for anything under `LIFEOS/USER/` — "only template may ship". A file the
+ * memory loop has written principal content into is no longer a template, and saying so
+ * in the header is what keeps the release audit honest. The key is never invented: a file
+ * carrying no `provenance` keeps none, because the audit's missing-key case is already a
+ * violation and inventing one would paper over it. `customized` (not `mixed`) matches
+ * every existing writer of this transition — MarkCustomized.ts, provenance-watcher.ts.
+ *
+ * `last_reviewed` is deliberately untouched — only a principal review bumps that
+ * (see `bumpReviewedTimestamp`), and a machine write is not a review.
+ *
+ * Best-effort by contract: returns `{ changed: false }` rather than throwing, so a
+ * stamping failure can never cost the caller the write it just made.
+ *
+ * Ported from public PR #1667, @elhoim.
+ */
+export function stampContextWrite(
+  filePath: string,
+  by: string,
+): { changed: boolean; provenanceFlipped: boolean } {
+  try {
+    if (!existsSync(filePath)) return { changed: false, provenanceFlipped: false };
+
+    const raw = readFileSync(filePath, "utf-8");
+    let next = bumpFileFrontmatter(raw, new Date().toISOString(), by);
+
+    let provenanceFlipped = false;
+    const end = next.indexOf("\n---\n", 4);
+    if (next.startsWith("---\n") && end !== -1) {
+      const fmBlock = next.slice(4, end);
+      if (/^provenance:[ \t]*template[ \t]*$/m.test(fmBlock)) {
+        next =
+          "---\n" +
+          fmBlock.replace(/^provenance:[ \t]*template[ \t]*$/m, "provenance: customized") +
+          "\n---\n" +
+          next.slice(end + 5);
+        provenanceFlipped = true;
+      }
+    }
+
+    if (next === raw) return { changed: false, provenanceFlipped: false };
+    writeFileSync(filePath, next);
+    refreshFreshnessCache();
+    return { changed: true, provenanceFlipped };
+  } catch {
+    // Never fail a caller's write because the header could not be stamped.
+    return { changed: false, provenanceFlipped: false };
+  }
+}
+
 // ─── CLI ──────────────────────────────────────────────────────────────────
 
 function formatHuman(f: TelosFreshness): string {
@@ -729,6 +970,8 @@ if (import.meta.main) {
   const f = readTelosFreshness();
   if (args.includes("--context")) {
     console.log(JSON.stringify(readContextFreshness(), null, 2));
+  } else if (args.includes("--state")) {
+    console.log(JSON.stringify(readStateFreshness(), null, 2));
   } else if (args.includes("--json")) {
     console.log(JSON.stringify(f, null, 2));
   } else {

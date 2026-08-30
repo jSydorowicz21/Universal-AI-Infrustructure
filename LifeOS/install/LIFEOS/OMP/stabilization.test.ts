@@ -11,7 +11,8 @@ import { deployCoreTransactional, deployDependencies } from "../../../Tools/Depl
 import { getOmpSessionIdentity, resetOmpSessionIdentitiesForTests } from "./session";
 import { pulseAvailable, resetPulseAvailabilityForTests, runProcessWithTimeout, startDetachedProcess } from "./extensions/lifeos-hooks/index";
 import { reviewerArgs, reviewLockIsStale } from "../../hooks/MemoryReviewFire.hook";
-import { resolveServiceRoots, runBoundedServiceCommand, runServiceUninstallCommands, serviceCommandExitCode, servicePlatformSupport, shellQuote } from "../TOOLS/Services";
+import { parseWindowsScheduledTaskLabels, resolveServiceRoots, runBoundedServiceCommand, runServiceUninstallCommands, serviceCommandExitCode, servicePlatformSupport, shellQuote } from "../TOOLS/Services";
+import { resolveBackend } from "../TOOLS/Inference";
 import { ADAPTERS } from "../UNIVERSAL/adapters";
 import { createFixtureHarnessExecutor, runAdapterConformance } from "../UNIVERSAL/conformance";
 import { frameworkSessionIdentity } from "../../hooks/FrameworkHookAdapter";
@@ -1435,20 +1436,38 @@ describe("setup tool HOME fallback", () => {
 	});
 
 
-	test("launchd mechanics are gated by the universal service plan", () => {
+	test("native service managers are selected on every supported desktop OS", () => {
 		const mac = servicePlatformSupport("darwin");
 		expect(mac).toMatchObject({ supported: true, backend: "launchd" });
 		expect(mac.plan).toMatchObject({ backend: "launchd", supported: true, dryRun: true });
 
+		const linux = servicePlatformSupport("linux");
+		expect(linux).toMatchObject({ supported: true, backend: "systemd-user" });
+		expect(linux.plan.command).toMatchObject({ executable: "systemctl" });
+
 		const windows = servicePlatformSupport("win32");
-		expect(windows).toMatchObject({ supported: false, backend: "foreground" });
+		expect(windows).toMatchObject({ supported: true, backend: "windows-scheduled-task" });
 		expect(windows.plan).toMatchObject({
-			backend: "foreground",
+			backend: "windows-scheduled-task",
 			supported: true,
 			dryRun: true,
-			losses: ["no autostart; process must be supervised externally"],
+			losses: ["desktop session behavior requires native smoke evidence"],
 		});
-	});
+  });
+
+  test("normalizes native Windows task paths to service labels", () => {
+    const labels = parseWindowsScheduledTaskLabels(String.raw`"\com.lifeos.conduit","N/A","Ready"
+"\Microsoft\Windows\Maintenance","N/A","Ready"`);
+    expect(labels).toEqual(new Set(["com.lifeos.conduit", "Microsoft\Windows\Maintenance"]));
+  });
+
+  test("native Windows status distinguishes unsupported services from missing services", () => {
+    if (process.platform !== "win32") return;
+    const result = Bun.spawnSync([process.execPath, join(lifeosRoot, "TOOLS", "Services.ts"), "status"]);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    const menuBar = result.stdout.toString().split(/\r?\n/).find((line) => line.includes("Pulse menu-bar app"));
+    expect(menuBar).toContain("unsupported");
+  });
 });
 
 
@@ -1527,6 +1546,9 @@ describe("OMP inference preference ownership", () => {
 		const preference = join(dataRoot, "USER", "CONFIG", "inference-backend");
 		expect(readFileSync(preference, "utf8")).toBe("omp\n");
 		expect(existsSync(join(home, ".claude", "LIFEOS", "USER", "CONFIG", "inference-backend"))).toBe(false);
+		process.env.UAI_DATA_DIR = dataRoot;
+		process.env.PAI_DATA_DIR = dataRoot;
+		expect(resolveBackend()).toBe("omp");
 
 		writeFileSync(preference, "foreign-provider\n");
 		const remove = Bun.spawnSync([process.execPath, managePath, "inference", "default"], { env, stdout: "pipe", stderr: "pipe" });

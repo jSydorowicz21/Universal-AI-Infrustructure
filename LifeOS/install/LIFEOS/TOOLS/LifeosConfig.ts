@@ -38,6 +38,11 @@ export interface LifeosPrincipal {
   timezone: string;
   hometown?: string;
   voiceCloneId?: string;
+  // ISO 4217 code (e.g. "JPY", "EUR"). Optional — consumers (currently just
+  // Pulse's Finances tab) default to "USD" when unset, so existing TOML files
+  // need no edit.
+  // ported from public PR #1777, @takanorinishida
+  currency?: string;
 }
 
 export interface LifeosVoiceSettings {
@@ -58,20 +63,21 @@ export interface LifeosDa {
   color?: string;
   voices: {
     main: LifeosVoiceSettings;
-    algorithm?: LifeosVoiceSettings;
   };
 }
 
 export interface LifeosIntegrations {
   google?: { credentialsFile?: string };
   cloudflare?: { accountId?: string; tokenEnvVar?: string };
-  telegram?: { allowlist?: number[] };
   [key: string]: unknown;
 }
 
 export interface LifeosPaths {
   userDir: string;
-  memoryDir: string;
+  // memoryDir was removed 2026-07-18 (public issue #1526, @christauff): declared
+  // since inception but never consumed — the memory root is derived by
+  // hooks/lib/paths.ts getMemoryDir(), and a dead config knob that LOOKS live
+  // is worse than no knob.
   projectsDir: string;
 }
 
@@ -169,6 +175,7 @@ function validateAndNormalize(raw: unknown, path: string): LifeosConfig {
       timezone: principal.timezone,
       hometown: principal.hometown,
       voiceCloneId: principal.voice_clone_id ?? principal.voiceCloneId,
+      currency: principal.currency,
     },
     da: {
       name: da.name,
@@ -177,21 +184,25 @@ function validateAndNormalize(raw: unknown, path: string): LifeosConfig {
       color: da.color,
       voices: {
         main: normalizeVoice(daVoices.main),
-        algorithm: daVoices.algorithm ? normalizeVoice(daVoices.algorithm) : undefined,
       },
     },
     integrations: {
-      google: root.integrations?.google,
-      cloudflare: root.integrations?.cloudflare,
-      telegram: root.integrations?.telegram,
       ...root.integrations,
+      // Normalize snake_case TOML keys like the principal/da fields above. The
+      // spread stays FIRST — spreading after would clobber the normalized shape
+      // with the raw TOML object (credentials_file vs credentialsFile).
+      google: root.integrations?.google
+        ? {
+            ...root.integrations.google,
+            credentialsFile:
+              root.integrations.google.credentials_file ?? root.integrations.google.credentialsFile,
+          }
+        : undefined,
+      cloudflare: root.integrations?.cloudflare,
     },
     paths: {
       userDir: expandHome(
         root.paths?.userDir ?? root.paths?.user_dir ?? resolve(DEFAULT_HOME, ".claude/LIFEOS/USER"),
-      ),
-      memoryDir: expandHome(
-        root.paths?.memoryDir ?? root.paths?.memory_dir ?? resolve(DEFAULT_HOME, ".claude/LIFEOS/MEMORY"),
       ),
       projectsDir: expandHome(
         root.paths?.projectsDir ?? root.paths?.projects_dir ?? resolve(DEFAULT_HOME, "Projects"),

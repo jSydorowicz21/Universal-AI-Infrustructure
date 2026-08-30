@@ -64,25 +64,28 @@ Surfaces anything already sitting in the target directories. Show your human. No
 ### 4. Drop the skill and runtime (additive)
 
 ```
-bun Tools/DeployCore.ts
+bun Tools/DeployCore.ts            # dry run — prints the plan, writes nothing
+bun Tools/DeployCore.ts --apply    # performs the copy
 ```
 
 Copies the LifeOS skill and runtime into the harness's config tree. Existing files are never overwritten — only missing ones are added.
 
+**These tools are dry-run by default.** Without `--apply` they print a plan and change nothing, so an install that omits the flag reports success while copying zero files. Run the dry run first, show your human, then re-run with `--apply`.
+
 ### 5. Scaffold the personal (USER) tree
 
 ```
-bun Tools/ScaffoldUser.ts
-bun Tools/LinkUser.ts
+bun Tools/ScaffoldUser.ts --apply
+bun Tools/LinkUser.ts --apply
 ```
 
-Creates the personal config tree from templates and links it in. This is empty structure — no personal content yet. That comes in the interview.
+Both are dry-run without `--apply`, same as the previous step. Creates the personal config tree from templates and links it in. This is empty structure — no personal content yet. That comes in the interview.
 
 ### 6. Wire the integration — HARNESS-SPECIFIC, WITH PERMISSION
 
 This is the one place harnesses genuinely differ. Show the exact change and get a yes.
 
-- **Claude Code** — run `bun Tools/InstallHooks.ts` (merges the hook set into `settings.json`, backing it up first) and `bun Tools/ActivateImports.ts` (turns on the identity context imports). This is what lights up the always-on behavior: the LifeOS response format, the memory loop, and per-turn context injection.
+- **Claude Code** — run `bun Tools/InstallHooks.ts --apply` (merges the hook set into `settings.json`, backing it up first) and `bun Tools/ActivateImports.ts --apply` (turns on the identity context imports). **Both need `--apply`** — without it they print a plan and write nothing. This is what lights up the always-on behavior: the LifeOS response format, the memory loop, and per-turn context injection.
 
 - **Any other harness (Cursor / Cline / Codex / Gemini / other)** — LifeOS's always-on behavior is enforced by Claude Code *hooks*, which are a Claude Code mechanism. They don't auto-wire on other harnesses **yet**. So instead:
   1. Write an `AGENTS.md` (or the harness's own context file — e.g. `.cursor/rules`) that points the harness at the LifeOS tree, so it loads the LifeOS context every session.
@@ -100,6 +103,8 @@ The payload ships the launcher — `install/LIFEOS/TOOLS/lifeos.ts` — which sp
   alias lifeos='bun <configRoot>/LIFEOS/TOOLS/lifeos.ts -s <configRoot>/LIFEOS/LIFEOS_SYSTEM_PROMPT.md'
   ```
   fish: `alias lifeos "bun <configRoot>/LIFEOS/TOOLS/lifeos.ts -s <configRoot>/LIFEOS/LIFEOS_SYSTEM_PROMPT.md"; funcsave lifeos`. After this, **`lifeos` launches Claude WITH the constitution**; plain `claude` stays vanilla (which is fine — the user opts in by launching `lifeos`).
+
+  **Upgrade path — migrate stale pre-7.x aliases.** Pre-7.x installs wired a `pai` launch alias (`cd ~/.claude && claude`, or `bun ~/.claude/PAI/ACTIONS/pai.ts`). The `PAI/` tree no longer exists and the bare-`claude` form launches without the constitution, so check the rc for these, and (with permission, rc backed up) comment them out and repoint the SAME alias name at the launcher above — the human's muscle-memory `pai` keeps working. `install.sh` does this automatically at bootstrap; do it here when the human ran setup without the bootstrap script. Never touch an alias containing `LIFEOS_SYSTEM_PROMPT` (current) or `ARBOL/Actions/lifeos.ts` (the maintainer-side Arbol CLI alias — that tree does not ship in the public payload, so if the string appears in an rc, leave it alone).
 
 - **Any other harness** — use that harness's own system-prompt flag against the same file. e.g. pi: `pi --append-system-prompt <configRoot>/LIFEOS/LIFEOS_SYSTEM_PROMPT.md`. If a harness has no system-prompt flag, load `LIFEOS_SYSTEM_PROMPT.md` through its context file (AGENTS.md / rules) as the closest equivalent, and tell your human plainly that the constitution is loading as context, not as a true system-prompt layer.
 
@@ -126,7 +131,7 @@ LifeOS installs in **two layers**, and you present them that way.
 | **Pulse** | the Life Dashboard — menu-bar app + `launchd` service on `:31337` | optional |
 | **worksweep / derivedsync** | background `launchd` jobs (work capture, derived-file sync) | optional |
 
-The `launchd` components (Pulse, worksweep, derivedsync) are macOS-only — skip them cleanly on Linux/Windows. Show your human this menu, take their picks, and deploy only those. The **Setup** workflow (step 9) drives the actual deployment of the chosen set and verifies each with real evidence (e.g. Pulse → `curl :31337/healthz` = 200). Everything ships in the payload; nothing activates without its matching yes.
+Pulse, worksweep, and derivedsync install as **launchd** agents on macOS and as **systemd --user** units on Linux — their installers dispatch on platform, so offer them on both (Windows has neither: skip cleanly there). The macOS menu-bar app is genuinely macOS-only. Show your human this menu, take their picks, and deploy only those. The **Setup** workflow (step 9) drives the actual deployment of the chosen set and verifies each with real evidence (e.g. Pulse → `curl :31337/healthz` = 200). Everything ships in the payload; nothing activates without its matching yes.
 
 ### 8.5 Capability check — probe what doctrine assumes (Doctor)
 
@@ -155,7 +160,7 @@ Run the **Setup** workflow (`Workflows/Setup.md`) to finish integration and veri
 | Harness / OS | Skill + USER data + Pulse | Always-on behavior (response format, memory loop, context injection) |
 |---|---|---|
 | **Claude Code — macOS / Linux** | ✅ | ✅ full (native hooks) |
-| **Claude Code — Windows** | ✅ (copy fallback where symlinks need admin) | ✅ full |
+| **Claude Code — Windows** | ✅ (USER tree links as a directory junction — no admin needed) | ✅ full |
 | **Cursor / Cline / Codex / Gemini / other** | ✅ | ⚠️ context loads every session via `AGENTS.md`; workflows run on request; always-on hooks not wired yet (roadmap) |
 | **Chat-only assistants (no files / no commands)** | ❌ | ❌ — install stops at the capability gate |
 
@@ -164,7 +169,7 @@ Full-doctrine features additionally depend on the external tools in step 8.5 (co
 ## Rules you must follow
 
 - **Additive, never clobbering.** Only add what's missing; never overwrite or delete a populated dir or a file you didn't create.
-- **Permission before every mutation.** Show the exact change; back up `settings.json` before editing it; wait for a yes.
+- **Permission before every mutation.** Show the exact change; back up `settings.json` before editing it; wait for a yes. One documented exception: the `install.sh` bootstrap, by invocation, migrates stale pre-7.x launch aliases (rc backed up first; skip with `LIFEOS_SKIP_ALIAS=1`) and appends capture rules to the config-root `.gitignore` — running the bootstrap is the consent for those two bounded setup mutations. AI-led setup steps after the bootstrap always ask.
 - **Never write a harness's config that it won't read.** Honest degrade beats an inert install.
 - **The launch command loads the constitution — don't skip it.** A plain `claude` session gets CLAUDE.md but not `LIFEOS_SYSTEM_PROMPT.md`. The `lifeos` command (step 7), or the harness's system-prompt flag, is what turns the operating contract on. Wire it, or the install is missing its whole constitutional layer.
 - **Refuse to run inside the LifeOS source repo** (detected via source-repo markers). Never mutate a maintainer's live system.

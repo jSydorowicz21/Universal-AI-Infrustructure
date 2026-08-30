@@ -3,17 +3,23 @@
  * AirGradient Poller — Script-type job
  *
  * Polls the AirGradient cloud API for current readings across all monitors
- * registered on {{PRINCIPAL_NAME}}'s place ({{PRINCIPAL_LOCATION}}, ID {{AIRGRADIENT_DEVICE_ID}}). Writes the full payload
- * to latest.json (cache) and appends per-monitor rows to history.jsonl
- * (rolling history). Zero AI cost.
+ * registered on the principal's account (AIRGRADIENT_TOKEN in .env). Writes
+ * the full payload to latest.json (cache) and appends per-monitor rows to
+ * history.jsonl (rolling history). Zero AI cost.
+ *
+ * The cron entry for this lives in LIFEOS/USER/CONFIG/PULSE.user.toml, not
+ * PULSE.toml — it only makes sense on installs that own AirGradient sensors
+ * (public issue #1504, @tzioup: it shipped default-on and polled forever on
+ * installs with nothing to poll).
  *
  * Output: NO_ACTION on success, or a one-line error message.
  */
 
 import { join } from "node:path"
 import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs"
+import { homedir } from "node:os";
 
-const HOME = process.env.HOME ?? ""
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir()
 const CACHE_DIR = join(HOME, ".claude", "LIFEOS", "MEMORY", "_AIRGRADIENT")
 const LATEST = join(CACHE_DIR, "latest.json")
 const HISTORY = join(CACHE_DIR, "history.jsonl")

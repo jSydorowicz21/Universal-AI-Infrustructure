@@ -43,6 +43,11 @@ const BLOCKED_CREDENTIAL_PATTERNS = [
 
 const BLOCKED_INTERNAL_PATTERNS = [
   /localhost:\d{4,5}/g,
+  // Loopback by literal IP: LifeOS source now builds internal URLs from
+  // PULSE_BASE (127.0.0.1) rather than "localhost", so redacting only the
+  // hostname form would let the same endpoint through.
+  // public issue #1618, @asdf8675309
+  /127\.0\.0\.1:\d{4,5}/g,
   /\.hook\.ts/g,
   /hooks\/\w+/g,
   /PAI\/Algorithm\/v[\d.]+\.md/g,
@@ -240,7 +245,7 @@ export function loadContactNames(contactsPath: string): string[] {
 }
 
 /**
- * Load security overrides from SKILLCUSTOMIZATIONS.
+ * Load security overrides from CUSTOMIZATIONS/SKILLS.
  */
 export function loadSecurityOverrides(overridesPath: string): FilterOptions {
   if (!existsSync(overridesPath)) return {};

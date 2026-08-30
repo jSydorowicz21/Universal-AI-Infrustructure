@@ -8,7 +8,7 @@ import { atomicWriteJson, boundedAuditRow, createSessionIdentity, parseTranscrip
 import { createFixtureHarnessExecutor, runAdapterConformance } from "../conformance";
 import { evaluateCommand } from "../policy";
 import { discoverHarness, HarnessRegistry } from "../registry";
-import { planService, renderStatusline } from "../services";
+import { planService, planWindowsScheduledTask, renderStatusline } from "../services";
 import { assertEvidenceClaims, assertPromptDrift, generatePromptOverlay, generateSupportReport, promptDigest } from "../reporting";
 
 const roots: string[] = [];
@@ -161,6 +161,19 @@ describe("portable capability lowerers and platform models", () => {
     expect(planService({ os: "linux", headless: true, managers: [] })).toMatchObject({ backend: "foreground", supported: true });
     expect(planService({ os: "unknown", headless: true, managers: [] })).toMatchObject({ backend: "unsupported", supported: false });
     expect(renderStatusline({ adapterId: "codex", certification: "C1", degraded: ["hooks"] })).toContain("codex C1 degraded:hooks");
+  });
+
+  test("plans quoted recurring Windows tasks without a shell", () => {
+    const task = planWindowsScheduledTask({
+      taskName: "com.lifeos.conduit",
+      executable: String.raw`C:\Program Files\Bun\bun.exe`,
+      args: [String.raw`C:\Life OS\Conduit\conduit.ts`, "capture"],
+      intervalSeconds: 120,
+    });
+    expect(task.createArgs).toContain("2");
+    expect(task.createArgs.at(-1)).toBe("/F");
+    expect(task.commandLine).toBe(String.raw`"C:\Program Files\Bun\bun.exe" "C:\Life OS\Conduit\conduit.ts" capture`);
+    expect(task.deleteArgs).toEqual(["/Delete", "/TN", "com.lifeos.conduit", "/F"]);
   });
 
   test("classifies unparsed command variants as advisory and blocks known dangerous variants", () => {

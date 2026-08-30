@@ -10,7 +10,7 @@
  * Called by TabState.hook.ts (Stop branch; formerly ResponseTabReset.hook.ts).
  */
 
-import { setTabState, readTabState, stripPrefix, setPhaseTab } from '../lib/tab-setter';
+import { setTabState, readTabState, stripPrefix, setAscentTab, isDegenerateDesc } from '../lib/tab-setter';
 import { isValidCompletionTitle, gerundToPastTense, getWorkingFallback, trimToValidTitle } from '../lib/output-validators';
 import { getDAName } from '../lib/identity';
 
@@ -125,7 +125,7 @@ export async function handleTabState(parsed: ParsedTranscript, sessionId?: strin
       if (pipeIdx !== -1) {
         rawTitle = rawTitle.slice(pipeIdx + 3);
       }
-      if (rawTitle && rawTitle !== 'Done.' && rawTitle !== 'Processing.' && rawTitle !== 'Processing request.' && rawTitle !== getWorkingFallback() && !rawTitle.endsWith('ready\u2026')) {
+      if (rawTitle && !isDegenerateDesc(rawTitle) && rawTitle !== 'Done.' && rawTitle !== 'Processing.' && rawTitle !== 'Processing request.' && rawTitle !== getWorkingFallback() && !rawTitle.endsWith('ready\u2026')) {
         const words = rawTitle.replace(/\.$/, '').split(/\s+/);
         if (words.length >= 2 && words[0].toLowerCase().endsWith('ing')) {
           words[0] = gerundToPastTense(words[0]);
@@ -150,7 +150,7 @@ export async function handleTabState(parsed: ParsedTranscript, sessionId?: strin
       }
     }
 
-    // FALLBACK 3: Pass null — let setPhaseTab use session name
+    // FALLBACK 3: Pass null — let setAscentTab use session name
     // "Task complete." is meaningless; the session name at least identifies the work
     if (!shortTitle) {
       console.error(`[TabState] All extraction strategies failed, deferring to session name`);
@@ -158,7 +158,7 @@ export async function handleTabState(parsed: ParsedTranscript, sessionId?: strin
 
     if (sessionId) {
       // Completion with session prefix: "NAME | summary"
-      setPhaseTab('COMPLETE', sessionId, shortTitle?.replace(/\.$/, '') || undefined);
+      setAscentTab('cairn', sessionId, shortTitle?.replace(/\.$/, '') || undefined);
 
       console.error(`[TabState] Completion: "${shortTitle || '(session name fallback)'}"`);
     } else {

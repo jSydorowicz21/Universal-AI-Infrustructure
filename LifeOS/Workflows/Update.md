@@ -9,10 +9,8 @@ curl -s -X POST http://localhost:31337/notify -H "Content-Type: application/json
   -d '{"message": "Running the Update workflow in the LifeOS skill to update your install"}' > /dev/null 2>&1 &
 ```
 
-> **`--apply` is not optional on any of these.** All three tools default to a
-> dry-run that prints a JSON plan and writes nothing. Documented without the flag
-> (2026-07-08 → 2026-07-31), the entire update path was a silent no-op: a user
-> following these steps saw success-shaped output and got no changes.
+> **`--apply` is not optional on any mutating tool below.** Every listed mutation defaults to a dry-run that prints a JSON plan and writes nothing.
+> Before the 2026-07-31 correction, the documented update path omitted the flag and produced success-shaped no-ops. Treat a dry run as a plan, never as installation evidence.
 
 ## Steps
 
@@ -26,10 +24,11 @@ curl -s -X POST http://localhost:31337/notify -H "Content-Type: application/json
 
    Never diff the on-disk payload's version against the install marker — the payload is what wrote the marker, so that comparison always says "already current" and the update never fetches anything.
 3. **Re-overlay system** — refresh every system-owned file that changed (which `copyMissing` cannot do — it only writes files that are absent, so an update otherwise leaves most of the machinery stale while `VERSION` bumps). Run `bun Tools/OverlaySystem.ts --config-root <configRoot>` first to preview, then `--apply`. It overwrites only system-owned paths (hooks, skills, agents, LIFEOS/{TOOLS,DOCUMENTATION,ALGORITHM,RULES,PULSE}, CLAUDE.md, the system prompt), never touches `USER/`, `LIFEOS/MEMORY/`, or `settings.json`, never deletes, skips symlinks, and writes `VERSION` last (only on a fully successful apply, so a partial update can't claim the new version). It backs up an existing CLAUDE.md and system prompt to a timestamped `.pre-overlay-*.bak` before overwriting — read the tool's `backups`/`note` output and reconcile any local edits from those, since step 6's `ActivateImports.ts --apply` then re-activates the identity imports the fresh CLAUDE.md ships commented.
-4. **Re-merge hooks** — `bun Tools/InstallHooks.ts --apply` (idempotent): adds new hook entries, leaves existing ones, never duplicates (normalized-command dedup). Backs up `settings.json` first.
+4. **Re-merge hooks** — `bun Tools/InstallHooks.ts --apply` (idempotent): adds new hook entries, leaves existing ones, never duplicates equivalent Windows/POSIX profile paths. Backs up `settings.json` first.
 5. **Scaffold new USER templates only** — `bun Tools/ScaffoldUser.ts --apply` copyMissing: adds any NEW template files introduced by the version, never overwrites the user's existing files.
 6. **Re-activate imports** — `bun Tools/ActivateImports.ts --apply` for any newly-shipped identity import lines.
-7. **Verify** — two evidence classes (hooks fire + imports resolve), same as Setup step 9.
+7. **Render identity** — preview `bun Tools/RenderIdentity.ts --config-root <configRoot> --config-dir <dataRoot>`, then run it with `--apply`. It derives names and voice IDs from the installed settings + USER identity sources, substitutes the owned model-facing surfaces, and exits non-zero if any identity/version placeholder survives there.
+8. **Verify** — two evidence classes (hooks fire + imports resolve), same as Setup step 9.
 
 ## Rule
 Update is **additive and non-destructive**. It never removes user customizations, never overwrites user data, never deletes hooks the user added. The only files it overwrites are system-owned templates.

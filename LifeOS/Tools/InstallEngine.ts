@@ -528,8 +528,11 @@ export interface TemplateVars {
  * (Simplified from engine actions.ts substituteTemplates.)
  */
 export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: number; modified: number; applied: number } {
-  const failure = physicalTreeFailure(rootDir, "template source");
-  if (failure) throw new Error(failure);
+  if (!existsSync(rootDir)) return { scanned: 0, modified: 0, applied: 0 };
+  const rootMetadata = lstatSync(rootDir);
+  if (rootMetadata.isSymbolicLink() || (!rootMetadata.isDirectory() && !rootMetadata.isFile())) {
+    throw new Error(`template source must be a physical file or directory: ${rootDir}`);
+  }
   let scanned = 0;
   let modified = 0;
   let applied = 0;
@@ -571,7 +574,7 @@ export function substituteTree(rootDir: string, vars: TemplateVars): { scanned: 
     }
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       if (SKIP_DIRS.has(entry.name)) continue;
-      if (entry.name === "install" && directory.endsWith(join("skills", "LifeOS"))) continue;
+      if ((entry.name === "install" || entry.name === "Tools") && directory.endsWith(join("skills", "LifeOS"))) continue;
       const child = join(directory, entry.name);
       if (entry.isDirectory() || entry.isFile()) walk(child);
     }
@@ -585,11 +588,13 @@ const IDENTITY_PLACEHOLDERS = [
   "{{PRIMARY_VOICE_ID}}", "{{SECONDARY_VOICE_ID}}", "{{LIFEOS_VERSION}}",
 ] as const;
 
-export function checkSurvivingPlaceholders(rootDir: string): {
+export interface IdentityPlaceholderVerification {
   passed: boolean;
   files: Array<{ file: string; placeholder: string; count: number }>;
   total: number;
-} {
+}
+
+export function checkSurvivingPlaceholders(rootDir: string): IdentityPlaceholderVerification {
   const files: Array<{ file: string; placeholder: string; count: number }> = [];
   let total = 0;
   const inspect = (filePath: string): void => {
@@ -610,7 +615,7 @@ export function checkSurvivingPlaceholders(rootDir: string): {
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       if (SKIP_DIRS.has(entry.name)) continue;
-      if (entry.name === "install" && path.endsWith(join("skills", "LifeOS"))) continue;
+      if ((entry.name === "install" || entry.name === "Tools") && path.endsWith(join("skills", "LifeOS"))) continue;
       const child = join(path, entry.name);
       if (entry.isDirectory() || entry.isFile()) walk(child);
     }
@@ -742,13 +747,13 @@ export function mergeFile(src: string, dst: string, stamp: string, options: Merg
     return { action: "overwritten", destination: dst, failure: `${src} → ${dst}: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
-export function mergeTree(src: string, dst: string, stamp: string): { copied: number; overwritten: number; preserved: number; failures: string[] } {
+export function mergeTree(src: string, dst: string, stamp: string, zoneName = "USER"): { copied: number; overwritten: number; preserved: number; failures: string[] } {
   let copied = 0;
   let overwritten = 0;
   let preserved = 0;
   const failures: string[] = [];
-  const sourceFailure = physicalTreeFailure(src, "live USER source");
-  const destinationFailure = physicalTreeFailure(dst, "data USER destination");
+  const sourceFailure = physicalTreeFailure(src, `live ${zoneName} source`);
+  const destinationFailure = physicalTreeFailure(dst, `data ${zoneName} destination`);
   if (sourceFailure) failures.push(sourceFailure);
   if (destinationFailure) failures.push(destinationFailure);
   if (failures.length > 0) return { copied, overwritten, preserved, failures };
@@ -769,7 +774,7 @@ export function mergeTree(src: string, dst: string, stamp: string): { copied: nu
       const metadata = lstatSync(sp);
       if (metadata.isDirectory()) {
         if (existsSync(dp) && lstatSync(dp).isSymbolicLink()) {
-          failures.push(`data USER destination links are not allowed: ${dp}`);
+          failures.push(`data ${zoneName} destination links are not allowed: ${dp}`);
           continue;
         }
         if (!existsSync(dp)) mkdirSync(dp, { recursive: true });
@@ -777,7 +782,7 @@ export function mergeTree(src: string, dst: string, stamp: string): { copied: nu
       } else if (metadata.isFile()) {
         walk(sp, dp);
       } else {
-        failures.push(`live USER source contains an unsupported artifact: ${sp}`);
+        failures.push(`live ${zoneName} source contains an unsupported artifact: ${sp}`);
       }
     }
   };
@@ -785,115 +790,125 @@ export function mergeTree(src: string, dst: string, stamp: string): { copied: nu
   return { copied, overwritten, preserved, failures };
 }
 
-export function setupUserSeparation(
-  configRoot: string,
-  configDir: string,
-): { action: "already-linked" | "linked" | "scaffolded-linked"; target: string; copied: number; overwritten?: number; preserved?: number; backup?: string; error?: string } {
-  const liveUserDir = join(configRoot, "LIFEOS", "USER");
-  const dataUserDir = join(configDir, "USER");
+export interface DirectorySeparationResult {
+  action: "already-linked" | "linked" | "scaffolded-linked";
+  target: string;
+  copied: number;
+  overwritten?: number;
+  preserved?: number;
+  backup?: string;
+  error?: string;
+}
 
-  if (resolve(liveUserDir) === resolve(dataUserDir)) {
-    return { action: "already-linked", target: dataUserDir, copied: 0 };
+function setupDirectorySeparation(configRoot: string, configDir: string, directoryName: "USER" | "MEMORY"): DirectorySeparationResult {
+  const liveDir = join(configRoot, "LIFEOS", directoryName);
+  const dataDir = join(configDir, directoryName);
+
+  if (resolve(liveDir) === resolve(dataDir)) {
+    return { action: "already-linked", target: dataDir, copied: 0 };
   }
 
-  // Branch (a): already a correct symlink → no-op. A relative link is correct
-  // when it resolves to the selected data root, not merely when its raw text
-  // happens to match the absolute target. Dangling links are safe to remove;
-  // live foreign links are refused without mutation.
-  const liveLstat = lstatSync(liveUserDir, { throwIfNoEntry: false });
+  const liveLstat = lstatSync(liveDir, { throwIfNoEntry: false });
   if (liveLstat?.isSymbolicLink()) {
-    if (existsSync(liveUserDir)) {
+    if (existsSync(liveDir)) {
       try {
-        const target = readlinkSync(liveUserDir);
-        const resolvedTarget = isAbsolute(target) ? normalize(target) : resolve(dirname(liveUserDir), target);
-        if (resolvedTarget === normalize(dataUserDir)) return { action: "already-linked", target: dataUserDir, copied: 0 };
+        const target = readlinkSync(liveDir);
+        const resolvedTarget = isAbsolute(target) ? normalize(target) : resolve(dirname(liveDir), target);
+        if (resolvedTarget === normalize(dataDir)) return { action: "already-linked", target: dataDir, copied: 0 };
       } catch { /* reject below without mutating a foreign link */ }
-      return { action: "linked", target: dataUserDir, copied: 0, error: `live USER is linked to an unrecognized target: ${liveUserDir}` };
+      return { action: "linked", target: dataDir, copied: 0, error: `live ${directoryName} is linked to an unrecognized target: ${liveDir}` };
     }
     try {
-      unlinkSync(liveUserDir);
+      unlinkSync(liveDir);
     } catch (error) {
-      return { action: "linked", target: dataUserDir, copied: 0, error: `could not remove dangling USER link at ${liveUserDir}: ${error instanceof Error ? error.message : String(error)}` };
+      return { action: "linked", target: dataDir, copied: 0, error: `could not remove dangling ${directoryName} link at ${liveDir}: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 
-  // No mutation (including mkdir/rename) is allowed until both physical trees
-  // have been walked with lstat. This prevents a destination link/junction from
-  // redirecting merge copies outside the selected user-data root.
-  const destinationFailure = physicalTreeFailure(dataUserDir, "data USER destination");
-  if (destinationFailure) return { action: "linked", target: dataUserDir, copied: 0, error: destinationFailure };
-  if (existsSync(liveUserDir)) {
-    const liveMetadata = lstatSync(liveUserDir);
+  const destinationFailure = physicalTreeFailure(dataDir, `data ${directoryName} destination`);
+  if (destinationFailure) return { action: "linked", target: dataDir, copied: 0, error: destinationFailure };
+  if (existsSync(liveDir)) {
+    const liveMetadata = lstatSync(liveDir);
     if (!liveMetadata.isDirectory()) {
-      return { action: "linked", target: dataUserDir, copied: 0, error: `live USER is not a physical directory: ${liveUserDir}` };
+      return { action: "linked", target: dataDir, copied: 0, error: `live ${directoryName} is not a physical directory: ${liveDir}` };
     }
-    const sourceFailure = physicalTreeFailure(liveUserDir, "live USER source");
-    if (sourceFailure) return { action: "linked", target: dataUserDir, copied: 0, error: sourceFailure };
+    const sourceFailure = physicalTreeFailure(liveDir, `live ${directoryName} source`);
+    if (sourceFailure) return { action: "linked", target: dataDir, copied: 0, error: sourceFailure };
   }
 
-  mkdirSync(dataUserDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
   let copied = 0;
 
-  // Branch (b): move the verified live tree aside, then merge it losslessly.
-  if (existsSync(liveUserDir) && lstatSync(liveUserDir).isDirectory()) {
+  if (existsSync(liveDir) && lstatSync(liveDir).isDirectory()) {
     const stamp = String(Date.now());
-    const backupDir = `${liveUserDir}.pre-link-backup-${stamp}`;
+    const backupDir = `${liveDir}.pre-link-backup-${stamp}`;
     try {
-      renameSync(liveUserDir, backupDir);
-    } catch (err) {
-      return { action: "linked", target: dataUserDir, copied: 0, error: `could not move live USER aside before symlink: ${err instanceof Error ? err.message : String(err)}` };
+      renameSync(liveDir, backupDir);
+    } catch (error) {
+      return { action: "linked", target: dataDir, copied: 0, error: `could not move live ${directoryName} aside before symlink: ${error instanceof Error ? error.message : String(error)}` };
     }
-    const merged = mergeTree(backupDir, dataUserDir, stamp);
+    const merged = mergeTree(backupDir, dataDir, stamp, directoryName);
     copied = merged.copied;
     if (merged.failures.length > 0) {
       return {
         action: "linked",
-        target: dataUserDir,
+        target: dataDir,
         copied,
         overwritten: merged.overwritten,
         preserved: merged.preserved,
         backup: backupDir,
-        error: `USER migration failed; live USER preserved at ${backupDir}: ${merged.failures.join("; ")}`,
+        error: `${directoryName} migration failed; live ${directoryName} preserved at ${backupDir}: ${merged.failures.join("; ")}`,
       };
     }
     try {
-      mkdirSync(dirname(liveUserDir), { recursive: true });
-      symlinkSync(dataUserDir, liveUserDir, process.platform === "win32" ? "junction" : "dir");
-      return { action: "linked", target: dataUserDir, copied, overwritten: merged.overwritten, preserved: merged.preserved, backup: backupDir };
-    } catch (err) {
-      return { action: "linked", target: dataUserDir, copied, overwritten: merged.overwritten, preserved: merged.preserved, backup: backupDir, error: `symlink creation failed (live USER preserved at ${backupDir}): ${err instanceof Error ? err.message : String(err)}` };
+      mkdirSync(dirname(liveDir), { recursive: true });
+      symlinkSync(dataDir, liveDir, process.platform === "win32" ? "junction" : "dir");
+      return { action: "linked", target: dataDir, copied, overwritten: merged.overwritten, preserved: merged.preserved, backup: backupDir };
+    } catch (error) {
+      return { action: "linked", target: dataDir, copied, overwritten: merged.overwritten, preserved: merged.preserved, backup: backupDir, error: `symlink creation failed (live ${directoryName} preserved at ${backupDir}): ${error instanceof Error ? error.message : String(error)}` };
     }
   }
 
-  // Branch (c): fresh install — scaffold the data home (if empty) + symlink.
   try {
-    mkdirSync(dirname(liveUserDir), { recursive: true });
-    symlinkSync(dataUserDir, liveUserDir, process.platform === "win32" ? "junction" : "dir");
-    return { action: "scaffolded-linked", target: dataUserDir, copied };
-  } catch (err) {
-    return { action: "scaffolded-linked", target: dataUserDir, copied, error: `symlink creation failed: ${err instanceof Error ? err.message : String(err)}` };
+    mkdirSync(dirname(liveDir), { recursive: true });
+    symlinkSync(dataDir, liveDir, process.platform === "win32" ? "junction" : "dir");
+    return { action: "scaffolded-linked", target: dataDir, copied };
+  } catch (error) {
+    return { action: "scaffolded-linked", target: dataDir, copied, error: `symlink creation failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
-/**
- * Validate the symlink contract: `<configRoot>/LIFEOS/USER` is a symlink → `<configDir>/USER`.
- * (Ported from engine validate.ts runSymlinkContractCheck.)
- */
-export function checkSymlinkContract(configRoot: string, configDir: string): { passed: boolean; detail: string } {
-  const liveUserDir = join(configRoot, "LIFEOS", "USER");
-  const expected = join(configDir, "USER");
-  if (!existsSync(liveUserDir)) return { passed: false, detail: `missing: ${liveUserDir}` };
-  const st = lstatSync(liveUserDir);
-  if (!st.isSymbolicLink()) return { passed: false, detail: `${liveUserDir} is not a symlink (system/user separation broken)` };
+export function setupUserSeparation(configRoot: string, configDir: string): DirectorySeparationResult {
+  return setupDirectorySeparation(configRoot, configDir, "USER");
+}
+
+export function setupMemorySeparation(configRoot: string, configDir: string): DirectorySeparationResult {
+  return setupDirectorySeparation(configRoot, configDir, "MEMORY");
+}
+
+function checkDirectorySymlinkContract(configRoot: string, configDir: string, directoryName: "USER" | "MEMORY"): { passed: boolean; detail: string } {
+  const liveDir = join(configRoot, "LIFEOS", directoryName);
+  const expected = join(configDir, directoryName);
+  if (!existsSync(liveDir)) return { passed: false, detail: `missing: ${liveDir}` };
+  const metadata = lstatSync(liveDir);
+  if (!metadata.isSymbolicLink()) return { passed: false, detail: `${liveDir} is not a symlink (system/data separation broken)` };
   let target: string;
   try {
-    target = readlinkSync(liveUserDir);
-  } catch (err) {
-    return { passed: false, detail: `readlink failed: ${err instanceof Error ? err.message : String(err)}` };
+    target = readlinkSync(liveDir);
+  } catch (error) {
+    return { passed: false, detail: `readlink failed: ${error instanceof Error ? error.message : String(error)}` };
   }
-  const resolvedTarget = isAbsolute(target) ? normalize(target) : resolve(dirname(liveUserDir), target);
+  const resolvedTarget = isAbsolute(target) ? normalize(target) : resolve(dirname(liveDir), target);
   if (resolvedTarget !== normalize(expected)) return { passed: false, detail: `link points to ${resolvedTarget}, expected ${normalize(expected)}` };
-  return { passed: true, detail: `${liveUserDir} → ${expected}` };
+  return { passed: true, detail: `${liveDir} → ${expected}` };
+}
+
+export function checkSymlinkContract(configRoot: string, configDir: string): { passed: boolean; detail: string } {
+  return checkDirectorySymlinkContract(configRoot, configDir, "USER");
+}
+
+export function checkMemorySymlinkContract(configRoot: string, configDir: string): { passed: boolean; detail: string } {
+  return checkDirectorySymlinkContract(configRoot, configDir, "MEMORY");
 }
 
 // ── Hooks merge (InstallHooks core — the one genuinely-new piece) ──
@@ -966,7 +981,11 @@ type HooksMap = Record<string, MatcherGroup[]>;
 
 function normalizeCommand(cmd: string): string {
   return cmd
-    .replace(/\$\{?LIFEOS_DIR\}?|\$\{?CLAUDE_PROJECT_DIR\}?|\$\{?CLAUDE_PLUGIN_ROOT\}?|~\/\.claude|\$HOME\/\.claude|\$\{HOME\}\/\.claude/g, "§ROOT§")
+    .replaceAll("\\", "/")
+    .replace(/\$\{?(?:LIFEOS_DIR|CLAUDE_PROJECT_DIR|CLAUDE_PLUGIN_ROOT)\}?|~\/\.claude|\$\{?(?:HOME|USERPROFILE)\}?\/\.claude|%(?:HOME|USERPROFILE)%\/\.claude/gi, "§ROOT§")
+    .replace(/(["'])(?:[A-Za-z]:)?\/[^"']*?\/\.claude(?=\/)/gi, "$1§ROOT§")
+    .replace(/(?:[A-Za-z]:)?(?:\/[^\s"'\/]+)+\/\.claude(?=\/)/gi, "§ROOT§")
+    .replace(/^["'](§ROOT§[^"']*)["'](?=\s|$)/, "$1")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -1012,13 +1031,15 @@ export function mergeHooks(existing: HooksMap, incoming: HooksMap): { merged: Ho
     for (const inGroup of incomingGroups) {
       const matcher = inGroup.matcher ?? "";
       const inHooks = inGroup.hooks!;
-      let target = eventBucket.find((group) => (group.matcher ?? "") === matcher);
+      const matchingGroups = eventBucket.filter((group) => (group.matcher ?? "") === matcher);
+      let target = matchingGroups[0];
       if (!target) {
         target = { matcher, hooks: [] };
         eventBucket.push(target);
+        matchingGroups.push(target);
       }
       const targetHooks = target.hooks!;
-      const present = new Set(targetHooks.map(hookKey));
+      const present = new Set(matchingGroups.flatMap((group) => group.hooks!).map(hookKey));
       for (const hook of inHooks) {
         const key = hookKey(hook);
         if (present.has(key)) skipped++;

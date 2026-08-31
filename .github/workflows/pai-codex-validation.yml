@@ -106,7 +106,7 @@ jobs:
           PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
           UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
           PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
-        run: bun build LifeOS/install/LIFEOS/TOOLS/Services.ts LifeOS/install/LIFEOS/TOOLS/Inference.ts LifeOS/install/LIFEOS/PULSE/Conduit/InstallConduit.ts LifeOS/install/LIFEOS/PULSE/Conduit/InstallConduitInsight.ts LifeOS/install/hooks/MemoryReviewFire.hook.ts --outdir "${{ runner.temp }}/lifeos-integration-build" --target bun
+        run: bun build LifeOS/Tools/RenderIdentity.ts LifeOS/install/LIFEOS/TOOLS/Doctor.ts LifeOS/install/LIFEOS/TOOLS/Services.ts LifeOS/install/LIFEOS/TOOLS/Inference.ts LifeOS/install/LIFEOS/PULSE/Conduit/InstallConduit.ts LifeOS/install/LIFEOS/PULSE/Conduit/InstallConduitInsight.ts LifeOS/install/hooks/MemoryReviewFire.hook.ts --outdir "${{ runner.temp }}/lifeos-integration-build" --target bun
 
   unit:
     name: unit (${{ matrix.os }})
@@ -137,7 +137,7 @@ jobs:
           PAI_DATA_DIR: ${{ runner.temp }}/uai-ci/data
           UAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
           PAI_CONFIG_DIR: ${{ runner.temp }}/uai-ci/config
-        run: bun test LifeOS/Tools/HarnessInstallerRouting.test.ts LifeOS/install/LIFEOS/OMP/stabilization.test.ts LifeOS/install/LIFEOS/OMP/extensions/lifeos-hooks/index.test.ts LifeOS/install/LIFEOS/OMP/extensions/lifeos-observability/index.test.ts
+        run: bun test LifeOS/Tools/HarnessInstallerRouting.test.ts LifeOS/Tools/RenderIdentity.test.ts LifeOS/install/LIFEOS/TOOLS/DoctorPlatform.test.ts LifeOS/install/LIFEOS/OMP/stabilization.test.ts LifeOS/install/LIFEOS/OMP/extensions/lifeos-hooks/index.test.ts LifeOS/install/LIFEOS/OMP/extensions/lifeos-observability/index.test.ts
 
   fixtures:
     name: fixtures (${{ matrix.os }})

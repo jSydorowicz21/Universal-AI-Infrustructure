@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 
 /**
- * LinkUser — Setup step 6. Establishes the system/user separation contract:
- * `<configRoot>/LIFEOS/USER` becomes a SYMLINK to `<configDir>/USER` (the private
- * data home). Migrates any live USER content into the data home first
- * (existsSync-guarded), then symlinks. Idempotent. Verifies the contract after.
+ * LinkUser - Setup step 6. Establishes the system/private-data separation contract:
+ * `<configRoot>/LIFEOS/USER` and `<configRoot>/LIFEOS/MEMORY` become symlinks
+ * to their canonical homes under `<configDir>`. Migrates either live tree first,
+ * preserving displaced destination files, then verifies both links. Idempotent.
  * Refuses on a dev tree unless --allow-dev.
  *
  * Usage:
@@ -12,7 +12,7 @@
  */
 
 import { join } from "node:path";
-import { checkSymlinkContract, detectDevTree, resolveInstallRoots, setupUserSeparation } from "./InstallEngine";
+import { checkMemorySymlinkContract, checkSymlinkContract, detectDevTree, resolveInstallRoots, setupMemorySeparation, setupUserSeparation } from "./InstallEngine";
 
 
 
@@ -35,14 +35,24 @@ function main(): void {
 
   if (!apply) {
     const contract = checkSymlinkContract(configRoot, configDir);
-    console.log(JSON.stringify({ ok: true, dryRun: true, currentContract: contract, willLink: `${join(configRoot, "LIFEOS", "USER")} → ${join(configDir, "USER")}` }, null, 2));
+    const memoryContract = checkMemorySymlinkContract(configRoot, configDir);
+    console.log(JSON.stringify({
+      ok: true,
+      dryRun: true,
+      currentContract: contract,
+      currentMemoryContract: memoryContract,
+      willLink: `${join(configRoot, "LIFEOS", "USER")} → ${join(configDir, "USER")}`,
+      willLinkMemory: `${join(configRoot, "LIFEOS", "MEMORY")} → ${join(configDir, "MEMORY")}`,
+    }, null, 2));
     process.exit(0);
   }
 
   const result = setupUserSeparation(configRoot, configDir);
+  const memory = setupMemorySeparation(configRoot, configDir);
   const contract = checkSymlinkContract(configRoot, configDir);
-  const ok = contract.passed && !result.error;
-  console.log(JSON.stringify({ ok, written: true, ...result, contract }, null, 2));
+  const memoryContract = checkMemorySymlinkContract(configRoot, configDir);
+  const ok = contract.passed && memoryContract.passed && !result.error && !memory.error;
+  console.log(JSON.stringify({ ok, written: true, ...result, contract, memory, memoryContract }, null, 2));
   process.exit(ok ? 0 : 1);
 }
 

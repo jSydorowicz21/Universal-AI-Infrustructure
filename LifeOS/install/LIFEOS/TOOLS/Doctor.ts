@@ -41,6 +41,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, readdirS
 import { join, basename } from 'path';
 import { createHash, randomBytes } from 'crypto';
 import { homedir } from "node:os";
+import { bareCommandProblem, firstCommandToken, resolveExecutable } from "./DoctorPlatform";
 
 const HOME = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
 const CONFIG_ROOT = process.env.CLAUDE_CONFIG_DIR || join(HOME, '.claude');
@@ -107,8 +108,7 @@ async function run(cmd: string[], timeoutMs = PROBE_TIMEOUT_MS): Promise<{ code:
 }
 
 function which(bin: string): boolean {
-  const paths = (process.env.PATH || '').split(':');
-  return paths.some(p => p && existsSync(join(p, bin)));
+  return resolveExecutable(bin) !== null;
 }
 
 /**
@@ -117,11 +117,7 @@ function which(bin: string): boolean {
  * '/', so the fallback must yield a real path (public PR #1567, @vibecrypto).
  */
 function whichPath(bin: string): string | null {
-  const paths = (process.env.PATH || '').split(':');
-  for (const p of paths) {
-    if (p && existsSync(join(p, bin))) return join(p, bin);
-  }
-  return null;
+  return resolveExecutable(bin);
 }
 
 function envKey(name: string): string | null {
@@ -274,13 +270,12 @@ function chromeBinary(): string | null {
 
 const CAPS: CapSpec[] = [
   {
-    // Identity substitution has no programmatic caller — the install is
-    // AI-driven and Setup.md instructs the agent to run substituteTree, so a
-    // skipped step ships a system addressing its owner by a raw
-    // PRINCIPAL_NAME-style token with nothing failing. This probe makes that
-    // state permanently detectable post-install (public issues #1813, @tzioup;
-    // #1817, @catchingknives — G23 covers the release side, this covers the
-    // install side). Scope is the MODEL-FACING runtime surfaces only:
+    // RenderIdentity is the setup/update caller for this invariant. Keep the
+    // independent probe here so interrupted or legacy installs remain visibly
+    // broken instead of addressing their owner with raw identity tokens.
+    // This remains independently detectable post-install (public issues #1813,
+    // @tzioup; #1817, @catchingknives; G23 covers the release side). Scope is
+    // the MODEL-FACING runtime surfaces only:
     // transcripts (projects/), release staging, and install templates all
     // carry tokens legitimately and must not be scanned.
     id: 'identity-placeholders',
@@ -310,7 +305,7 @@ const CAPS: CapSpec[] = [
         return { ok: true, detail: `check unavailable (${String(e).split('\n')[0]}) — InstallEngine not present on this tree` };
       }
     },
-    fixCmd: 'bun -e \'import {substituteTree} from "<configRoot>/skills/LifeOS/Tools/InstallEngine.ts"; ...\' — re-run Setup.md step 9d substitution',
+    fixCmd: 'bun <configRoot>/skills/LifeOS/Tools/RenderIdentity.ts --config-root <configRoot> --config-dir <dataRoot> --apply',
   },
   {
     id: 'shadow-home',
@@ -610,8 +605,7 @@ function hookInterpreterProblems(): string[] {
   const problems: string[] = [];
   const seen = new Set<string>();
   for (const raw of commands) {
-    // First token wins: `bun x.ts` → bun; `/path/x.hook.ts` → the script itself.
-    const first = raw.trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, '') ?? '';
+    const first = firstCommandToken(raw);
     if (!first || seen.has(first)) continue;
     seen.add(first);
     const resolved = expandPath(first);
@@ -629,11 +623,12 @@ function hookInterpreterProblems(): string[] {
     let mode = 0;
     try { mode = statSync(resolved).mode; } catch {}
     const name = basename(resolved);
-    if (!(mode & 0o111)) { problems.push(`${name}: not executable (chmod +x)`); continue; }
     let head = '';
     try { head = readFileSync(resolved, 'utf8').slice(0, 200).split('\n')[0]; } catch {}
-    if (!head.startsWith('#!')) { problems.push(`${name}: no #! shebang`); continue; }
-    // `#!/usr/bin/env bun` → the interpreter env will look up is the 2nd word.
+    const bareProblem = bareCommandProblem(resolved, mode, head);
+    if (bareProblem) { problems.push(bareProblem); continue; }
+    if (process.platform === 'win32') continue;
+    // On POSIX, validate the interpreter named by the required shebang.
     const shebang = head.slice(2).trim().split(/\s+/);
     const interp = shebang[0].endsWith('/env') ? shebang[1] : shebang[0];
     if (!interp) continue;
